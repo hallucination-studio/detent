@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Dead code check (knip)
+        run: npm run deadcode
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build workspaces
+        run: npm run build
+
+      - name: Verify ESM package exports
+        run: node --input-type=module -e "import '@detent/core'; import '@detent/delivery'"
+
+  ocr-review:
+    name: OpenCodeReview
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      vars.OCR_REVIEW_ENABLED == 'true'
+    continue-on-error: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install OpenCodeReview CLI
+        run: npm install -g @alibaba-group/open-code-review@1
+
+      - name: Run OpenCodeReview on PR diff
+        shell: bash
+        env:
+          OCR_LLM_URL: ${{ vars.OCR_LLM_URL || 'https://api.anthropic.com/v1/messages' }}
+          OCR_LLM_AUTH_TOKEN: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          OCR_LLM_MODEL: ${{ vars.OCR_LLM_MODEL || 'claude-sonnet-4-20250514' }}
+          OCR_LLM_USE_ANTHROPIC: ${{ vars.OCR_LLM_USE_ANTHROPIC || 'true' }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -z "$OCR_LLM_AUTH_TOKEN" ]; then
+            echo "OCR_LLM_AUTH_TOKEN secret is not configured; skipping OpenCodeReview."
+            exit 0
+          fi
+          ocr config set llm.url "$OCR_LLM_URL"
+          ocr config set llm.auth_token "$OCR_LLM_AUTH_TOKEN"
+          ocr config set llm.model "$OCR_LLM_MODEL"
+          ocr config set llm.use_anthropic "$OCR_LLM_USE_ANTHROPIC"
+          ocr review --audience agent --from "$PR_BASE_SHA" --to "$PR_HEAD_SHA" --background-file AGENT.md

@@ -53,9 +53,10 @@ function safeCommand(command: unknown, prefixes: string[], plan: boolean) {
 function allowedPath(root: string, target: string, write: boolean) {
   const rel = path.relative(root, target);
   if (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) return false;
-  return !write || !rel.split(path.sep).some(
-    (part) => ['.git', '.claude', '.mcp.json'].includes(part.toLowerCase()),
-  );
+  if (!write) return true;
+  const parts = rel.toLowerCase().split(path.sep);
+  return !['claude.md', 'workflows'].includes(parts[0]) &&
+    !parts.some(part => ['.git', '.claude', '.mcp.json'].includes(part));
 }
 
 async function contained(root: string, value: unknown, write: boolean) {
@@ -80,7 +81,8 @@ async function contained(root: string, value: unknown, write: boolean) {
     }
   }
   try {
-    return allowedPath(root, await realpath(prefix), write);
+    const suffix = path.relative(prefix, path.resolve(root, value));
+    return allowedPath(root, path.join(await realpath(prefix), suffix), write);
   } catch {
     return false;
   }

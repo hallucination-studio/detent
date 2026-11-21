@@ -15,12 +15,12 @@ const text = (value: string): Text => ({ type: 'text', text: value });
 const contents = (value: string | Text[]) => typeof value === 'string' ? value : value.map(b => b.text).join('\n');
 const plan = 'Inspect web01, review the nginx reload playbook, then verify service health after execution.';
 const review = 'Please review and merge the nginx reload MR.';
-const branch = 'change/issue-1', project = 'ops/ansible-infra', playbook = 'deploy/nginx-reload.yml';
+const project = 'ops/ansible-infra', playbook = 'deploy/nginx-reload.yml';
 const inspect = { asset_ids: ['web01'], command: 'systemctl status nginx' };
 
 function next(body: Messages): Text | Use {
   // The CLI also sends small auxiliary requests without the workspace tools.
-  if (!body.tools?.length) return text('Nginx reload');
+  if (!body.tools?.length) return text('Delivery request');
   const blocks = body.messages.flatMap(m => typeof m.content === 'string' ? [text(m.content)] : m.content);
   const prefix = 'mcp__detent__';
   const toolName = (name: string) => name === 'Write' ? name : prefix + name;
@@ -41,6 +41,33 @@ function next(body: Messages): Text | Use {
     return value;
   }
   const approved = blocks.findIndex(b => b.type === 'text' && b.text.includes('实施方案已获批准'));
+  const system = contents(body.system ?? '');
+  if (system.includes('workflows/release.md')) {
+    assert.ok(system.includes('CUSTOM_RELEASE_TAG_PREFIX: rel-'), 'Missing live Hub SOP in the SDK system prompt');
+    const issue = blocks.find((b): b is Text => b.type === 'text' && b.text.includes('apps/web') && /\b[a-f0-9]{40}\b/.test(b.text));
+    const sha = issue?.text.match(/\b[a-f0-9]{40}\b/)?.[0];
+    assert.ok(sha, 'Missing target commit in the Issue prompt');
+    const tags = result('detent_list_tags');
+    if (!tags) return use('detent_list_tags', { project: 'apps/web' });
+    const existing = JSON.parse(success(tags));
+    assert.ok(Array.isArray(existing));
+    for (const tag of existing) {
+      assert.match(tag.commitSha, /^[a-f0-9]{40}$/);
+      assert.notEqual(tag.name, 'rel-1.0.0');
+    }
+    if (approved < 0) return text('Publish rel-1.0.0 for apps/web at ' + sha + ' after approval.');
+    const release = result('detent_create_release');
+    if (!release) return use('detent_create_release', { project: 'apps/web', tag_name: 'rel-1.0.0', commit_sha: sha,
+      release_name: 'Release rel-1.0.0', release_notes: 'Live customized release workflow verified.' });
+    const published = JSON.parse(success(release));
+    assert.equal(published.tagName, 'rel-1.0.0');
+    assert.match(published.releaseUrl, /\/apps\/web\/-\/releases\/rel-1\.0\.0$/);
+    return text('Release rel-1.0.0 published for apps/web.');
+  }
+  assert.ok(system.includes('workflows/env-change.md'), 'Missing environment change SOP');
+  const issue = /Issue #(\d+)\b/.exec(system);
+  assert.ok(issue, 'Missing Hub Issue number in the SDK system prompt');
+  const branch = 'change/issue-' + issue[1];
   const merged = blocks.findIndex(b => b.type === 'text' && /合并提交 SHA：[a-f0-9]{40}/.test(b.text));
   if (approved < 0 && merged < 0) {
     const assets = result('jms_list_assets');
@@ -60,7 +87,7 @@ function next(body: Messages): Text | Use {
   assert.match(directory, /^ansible-infra__[\w-]+$/);
   const write = result('Write');
   if (!write) {
-    const context = contents(body.system ?? '') + '\n' + blocks.filter((b): b is Text => b.type === 'text').map(b => b.text).join('\n');
+    const context = system + '\n' + blocks.filter((b): b is Text => b.type === 'text').map(b => b.text).join('\n');
     const cwd = /Working directory: ([^\n]+\/workspace)\s*\n/.exec(context)?.[1];
     assert.ok(cwd, 'Missing workspace in the SDK prompt');
     return use('Write', { file_path: join(cwd, 'projects', directory, playbook),
@@ -100,9 +127,7 @@ function next(body: Messages): Text | Use {
   return text('Reload verified on web01. The approved job succeeded and nginx is active.');
 }
 
-export async function offlineAnthropic(req: Request) {
-  if (req.method !== 'POST' || new URL(req.url).pathname !== '/v1/messages') return new Response(null, { status: 404 });
-  const body: Messages = await req.json();
+function respond(body: Messages) {
   const block = next(body);
   const reason = block.type === 'text' ? 'end_turn' : 'tool_use';
   const usage = { input_tokens: 100, output_tokens: 30, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
@@ -123,4 +148,17 @@ export async function offlineAnthropic(req: Request) {
   ];
   return new Response(events.map(e => 'event: ' + e.type + '\ndata: ' + JSON.stringify(e) + '\n\n').join(''),
     { headers: { 'Content-Type': 'text/event-stream' } });
+}
+
+export function createOfflineAnthropic() {
+  let requests = 0;
+  return {
+    async handle(req: Request) {
+      requests++;
+      if (req.method !== 'POST' || new URL(req.url).pathname !== '/v1/messages') return new Response(null, { status: 404 });
+      return respond(await req.json());
+    },
+    getRequests: () => requests,
+    resetRequests() { requests = 0; },
+  };
 }

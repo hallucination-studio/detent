@@ -12,10 +12,20 @@ interface MR { iid: number; source_project_id: number; title: string; web_url: s
 interface Project {
   id: number; path_with_namespace: string; http_url_to_repo: string; default_branch: string;
 }
+interface Issue {
+  id: number; iid: number; project_id: number; state: string; title: string; description: string; labels: string[];
+}
+interface Release {
+  tag_name: string; name: string; description: string; commit: { id: string }; _links: { self: string };
+}
 const absent = () => new Response(null, { status: 404 });
 const forbidden = () => new Response(null, { status: 403 });
 const reply = (data: unknown) => data === undefined ? absent() : Response.json(data);
 const safePart = /^[\w-][\w.-]*$/;
+function safePath(path: string) {
+  if (path.includes('..') || /[\\\p{Cc}]/u.test(path)) return false;
+  return path.split('/').every(part => part && part !== '.' && part.toLowerCase() !== '.git');
+}
 const gitEnv = { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
   GIT_AUTHOR_NAME: 'GitLab', GIT_AUTHOR_EMAIL: 'gitlab@localhost', GIT_COMMITTER_NAME: 'GitLab',
   GIT_COMMITTER_EMAIL: 'gitlab@localhost' };
@@ -32,27 +42,42 @@ export function offlineGitLab(root: string) {
   const labels = new Map<number, { name: string; color: string }[]>();
   const hooks = new Map<number, Hook[]>();
   const mrs = new Map<number, MR[]>();
-  const notes = new Map<number, string>();
-  const issue = { id: 1, iid: 1, project_id: 0, title: 'Reload nginx on web01', state: 'opened',
-    description: 'Prepare and verify a reviewed nginx reload.', labels: ['delivery::env-change'] };
+  const issues = new Map<number, Issue>();
+  const notes = new Map<number, { issueIid: number; body: string }>();
+  const releases = new Map<number, Release[]>();
   const find = (ref: string | number) => projects.find(p => String(p.id) === String(ref) || p.path_with_namespace === ref);
   const repo = (p: Project) => join(root, p.path_with_namespace + '.git');
   const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args],
     { cwd, env: gitEnv, stdio: ['ignore', 'pipe', 'pipe'] });
   const backend = join(git(root, '--exec-path').toString().trim(), 'git-http-backend');
 
-  async function commitFile(p: Project, file: string, content: string, message: string) {
+  function commitSha(p: Project, ref: string) {
+    try { return git(repo(p), 'rev-parse', '--verify', '--quiet', '--end-of-options', ref + '^{commit}').toString().trim(); }
+    catch { return null; }
+  }
+  function tag(p: Project, name: string) {
+    const ref = 'refs/tags/' + name;
+    try { git(repo(p), 'check-ref-format', ref); } catch { return; }
+    const id = commitSha(p, ref);
+    if (!id) return;
+    const annotated = git(repo(p), 'cat-file', '-t', ref).toString().trim() === 'tag';
+    const message = annotated ? git(repo(p), 'tag', '--list', '--format=%(contents)', '--', name).toString().trimEnd() : null;
+    return { name, message, commit: { id } };
+  }
+  async function commitFile(p: Project, file: string, content: string | Buffer, message: string) {
+    assert.ok(safePath(file), 'Expected a relative repository file path');
     const work = await mkdtemp(join(root, 'seed-'));
     try {
-      git(root, 'clone', '--', repo(p), work);
+      git(root, 'clone', '-c', 'core.symlinks=false', '--', repo(p), work);
+      await mkdir(dirname(join(work, file)), { recursive: true });
       await writeFile(join(work, file), content);
-      git(work, 'add', '--', file);
+      git(work, '--literal-pathspecs', 'add', '--', file);
       git(work, 'commit', '-m', message);
       git(work, 'push', 'origin', 'HEAD:refs/heads/' + p.default_branch);
     } finally { await rm(work, { recursive: true, force: true }); }
   }
 
-  async function dispatch(project: Project, kind: string, enabled: keyof Hook, user: User, attrs: object) {
+  async function dispatch(project: Project, kind: string, enabled: keyof Hook, user: User, attrs: object, issue?: Issue) {
     for (const hook of hooks.get(project.id)!.filter(h => h[enabled])) {
       const response = await fetch(hook.url, { method: 'POST', signal: AbortSignal.timeout(10000),
         headers: { 'Content-Type': 'application/json', 'X-Gitlab-Token': hook.token,
@@ -62,10 +87,10 @@ export function offlineGitLab(root: string) {
       assert.ok(response.ok, kind + ' webhook HTTP ' + response.status);
     }
   }
-  async function note(project: Project, actor: User, body: string) {
+  async function note(issue: Issue, actor: User, body: string) {
     const id = notes.size + 1;
-    notes.set(id, body);
-    await dispatch(project, 'note', 'note_events', actor, { id, noteable_type: 'Issue', action: 'create', note: body });
+    notes.set(id, { issueIid: issue.iid, body });
+    await dispatch(find(issue.project_id)!, 'note', 'note_events', actor, { id, noteable_type: 'Issue', action: 'create', note: body }, issue);
     return { id, body };
   }
 
@@ -158,6 +183,7 @@ export function offlineGitLab(root: string) {
       git(repo(p), 'config', 'http.receivepack', 'true');
       await commitFile(p, 'README.md', '# ' + body.name + '\n', 'Initialize repository');
       projects.push(p);
+      releases.set(p.id, []);
       labels.set(p.id, []); hooks.set(p.id, []); mrs.set(p.id, []);
       return reply(p);
     }
@@ -185,17 +211,73 @@ export function offlineGitLab(root: string) {
       if (hook && put) Object.assign(hook, body);
       return reply(hook);
     }
-    if (section === 'repository' && item === 'files' && safePart.test(sub)) {
+    if (section === 'repository' && (item === 'files' || item === 'tree')) {
+      if (child !== undefined || (item === 'files' && !sub)) return absent();
+      const path = item === 'files' ? sub : url.searchParams.get('path') ?? '';
+      if (path && !safePath(path)) return absent();
       if (get) {
-        const ref = url.searchParams.get('ref');
-        if (!git(repo(p), 'ls-tree', '--name-only', ref!, '--', sub).length) return absent();
-        return reply({ file_path: sub, encoding: 'base64', content: git(repo(p), 'show', ref + ':' + sub).toString('base64') });
+        const sha = commitSha(p, url.searchParams.get('ref') ?? p.default_branch);
+        if (!sha) return absent();
+        const object = sha + ':' + path;
+        let type: string;
+        try { type = git(repo(p), 'cat-file', '-t', object).toString().trim(); } catch { return absent(); }
+        if (item === 'files') {
+          if (type !== 'blob') return absent();
+          return reply({ file_path: path, encoding: 'base64', content: git(repo(p), 'cat-file', 'blob', object).toString('base64') });
+        }
+        if (type !== 'tree') return absent();
+        const entries = git(repo(p), 'ls-tree', '-z', object).toString().split('\0').filter(Boolean);
+        return reply(entries.map(entry => {
+          const tab = entry.indexOf('\t');
+          const [, type, id] = entry.slice(0, tab).split(' ');
+          const name = entry.slice(tab + 1);
+          return { id, name, type, path: path ? path + '/' + name : name };
+        }));
       }
-      if (post) {
+      if (post && item === 'files') {
         assert.equal(body.branch, p.default_branch);
-        await commitFile(p, sub, body.content, body.commit_message);
+        const content = body.encoding === 'base64' ? Buffer.from(body.content, 'base64') : body.content;
+        await commitFile(p, sub, content, body.commit_message);
         return reply({ file_path: sub, branch: body.branch });
       }
+    }
+    if (section === 'repository' && item === 'commits' && sub && get) {
+      const id = commitSha(p, sub);
+      return id ? reply({ id, title: git(repo(p), 'show', '-s', '--format=%s', id).toString().trimEnd() }) : absent();
+    }
+    if (section === 'pipelines' && get) {
+      const sha = url.searchParams.get('sha');
+      return reply(sha && commitSha(p, sha) ? [{ id: 1, ref: p.default_branch, status: 'success' }] : []);
+    }
+    if (section === 'repository' && item === 'tags' && get) {
+      if (sub) return reply(tag(p, sub));
+      const names = git(repo(p), 'tag', '--list').toString().split('\n').filter(Boolean);
+      const search = url.searchParams.get('search') ?? '';
+      const needle = search.replace(/^\^|\$$/g, '');
+      return reply(names.filter(name => {
+        if (search.startsWith('^') && !name.startsWith(needle)) return false;
+        if (search.endsWith('$') && !name.endsWith(needle)) return false;
+        if (search.startsWith('^') && search.endsWith('$')) return name === needle;
+        return name.includes(needle);
+      }).map(name => tag(p, name)));
+    }
+    if (post && ((section === 'repository' && item === 'tags') || section === 'releases')) {
+      const name: string = body.tag_name;
+      const rows = releases.get(p.id)!;
+      let existing = tag(p, name);
+      if ((section === 'repository' && existing) || (section === 'releases' && rows.some(r => r.tag_name === name)))
+        return new Response(null, { status: 409 });
+      if (!existing) {
+        const sha = commitSha(p, body.ref ?? p.default_branch);
+        if (!sha) return absent();
+        git(repo(p), 'tag', ...(body.message ? ['-m', body.message] : []), '--', name, sha);
+        existing = tag(p, name)!;
+      }
+      if (section === 'repository') return reply(existing);
+      const release = { tag_name: name, name: body.name, description: body.description, commit: existing.commit,
+        _links: { self: url.origin + '/' + p.path_with_namespace + '/-/releases/' + encodeURIComponent(name) } };
+      rows.push(release);
+      return reply(release);
     }
     if (section === 'repository' && item === 'archive.zip' && get) {
       const sha = url.searchParams.get('sha')!;
@@ -205,15 +287,19 @@ export function offlineGitLab(root: string) {
         headers: { 'Content-Type': 'application/zip' },
       });
     }
-    if (section === 'issues' && p.id === issue.project_id && Number(item) === issue.iid) {
+    if (section === 'issues') {
+      const issue = issues.get(Number(item));
+      if (!issue || p.id !== issue.project_id) return absent();
       if (!sub && put) {
-        const remove = body.remove_labels.split(',');
-        issue.labels = [...new Set([...issue.labels.filter(l => !remove.includes(l)), body.add_labels])];
+        const remove = (body.remove_labels ?? '').split(',');
+        const add = (body.add_labels ?? '').split(',').filter(Boolean);
+        issue.labels = [...new Set([...issue.labels.filter(l => !remove.includes(l)), ...add])];
       }
       if (!sub) return reply(issue);
-      if (sub === 'notes' && post) return reply(await note(p, actor, body.body));
-      if (sub === 'notes' && put && notes.has(Number(child))) {
-        notes.set(Number(child), body.body);
+      if (sub === 'notes' && post && !child) return reply(await note(issue, actor, body.body));
+      const saved = notes.get(Number(child));
+      if (sub === 'notes' && put && saved?.issueIid === issue.iid) {
+        saved.body = body.body;
         return reply({ id: Number(child), body: body.body });
       }
     }
@@ -233,17 +319,31 @@ export function offlineGitLab(root: string) {
     return absent();
   }
 
-  return { handle, admin, notes, membershipChecks,
-    async openIssue(hub: number) {
-      issue.project_id = hub;
+  return { handle, admin, notes, membershipChecks, releases,
+    updateFile(projectId: number, file: string, content: string, message: string) {
+      return commitFile(find(projectId)!, file, content, message);
+    },
+    headSha(projectId: number) { return git(repo(find(projectId)!), 'rev-parse', 'HEAD').toString().trim(); },
+    tagCommit(projectId: number, name: string) { return tag(find(projectId)!, name)?.commit.id; },
+    async openIssue(hub: number, options: Pick<Issue, 'title' | 'description' | 'labels'>) {
+      const iid = issues.size + 1;
+      const issue = { ...options, id: iid, iid, project_id: hub, state: 'opened' };
+      issues.set(iid, issue);
       await dispatch(find(hub)!, 'issue', 'issues_events', users[1], { ...issue, action: 'open' });
+      return iid;
     },
-    async awardEmoji(noteId: number, username: string) {
-      assert.ok(notes.has(noteId));
+    async awardEmoji(issueIid: number, noteId: number, username: string) {
+      const issue = issues.get(issueIid)!;
+      assert.equal(notes.get(noteId)?.issueIid, issueIid);
       await dispatch(find(issue.project_id)!, 'emoji', 'emoji_events', users.find(u => u.username === username)!,
-        { name: 'thumbsup', awardable_type: 'Note', awardable_id: noteId, action: 'award' });
+        { name: 'thumbsup', awardable_type: 'Note', awardable_id: noteId, action: 'award' }, issue);
     },
-    postNote(body: string) { return note(find(issue.project_id)!, users[1], body); },
+    postNote(issueIid: number, body: string, username = 'dev') {
+      return note(issues.get(issueIid)!, users.find(u => u.username === username)!, body);
+    },
+    issueNotes(issueIid: number) {
+      return [...notes.values()].filter(note => note.issueIid === issueIid).map(note => note.body);
+    },
     async mergeMergeRequest(project: number, iid: number) {
       const p = find(project)!;
       const mr = mrs.get(p.id)!.find(m => m.iid === iid)!;

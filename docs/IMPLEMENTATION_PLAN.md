@@ -137,8 +137,70 @@ ALTER TABLE session_merge_requests
 
 ### 4.2 Stage 4 最终验收标准（Final DoD）
 1. `npm run check`（全量 `tsc` + `knip` + `packages/core` 与 `packages/delivery` 全量单测与 6 阶段 E2E）100% 通过。
-2. 推送前严格按 [`AGENT.md`](file:///Users/murphy/code/work/relay/AGENT.md) 执行 `ocr delegate` 100% 覆盖率审查，确认无 Critical / High / 合理 Medium 问题，且 `packages/core` 零业务污染。
+2. 推送前严格按 [`AGENT.md`](../AGENT.md) 执行 `ocr delegate` 100% 覆盖率审查，确认无 Critical / High / 合理 Medium 问题，且 `packages/core` 零业务污染。
 
 **Stage 4 已实现。** 运行 `npm run start:delivery` 启动构建后的入口，或用 `npm run dev:delivery` 开发。角色标签按 `delivery::audit`、`delivery::env-change`、`delivery::code` 顺序匹配，默认环境变更角色。生产审批按 `DELIVERY_PROD_APPROVERS` 名单与项目成员资格校验；无名单时使用 `DELIVERY_PROD_MIN_ACCESS_LEVEL`（默认 40）。[环境示例](../.env.example) 列出全部 JumpServer 与 Delivery 配置。
 
 审计仓储使用同一 MySQL 池记录角色、目标资产、MR、SHA、审批单、任务与结果，`/status` 同时展示 MR 与执行审计。六阶段 E2E 通过 HTTP Webhook、临时 Git 仓库与受控外部服务替身验证审批、硬拦截、同一会话恢复、任务验收和沙箱清理。另有共享池建表、只读角色、生产权限与审计仓储测试。
+
+---
+
+## V3 演进实施计划：Hub SOP 驱动、可空能力包与标准发版工作流（方案 A）
+
+承接 V2 基线与已完成落地的 `npm run bootstrap` + `npm run e2e:offline` 离线真实全链路测试，V3 分为 **3 个紧凑、可独立验收的阶段（Stage 5 ~ Stage 7）**，严格守住零过度设计、零 `packages/core` 业务污染、零新增外部依赖原则。
+
+| 阶段 | 阶段目标 | 核心交付物 | 核心验收标准 |
+| :--- | :--- | :--- | :--- |
+| **Stage 5** | **`@detent/core` 通用能力：Hub `workflows/*.md` 加载器、可空能力包、`blockedMessage` 短路与 `gitlab-release` 原子工具** | • `GitLabClient` 新增只读树/文件读取及 Tag/Release API<br/>• `packages/core/src/workflows/hub-workflows.ts`（Frontmatter 解析、标签匹配、能力预检、缺失提示生成）<br/>• `packages/core/src/workspace/release-tools.ts`（`detent_list_tags`、`detent_create_release` + SHA/流水线硬守卫与审批卡）<br/>• `TurnProfile.blockedMessage` 短路与沙箱 `workflows/` 只读保护 | 1. `packages/core` 零 JumpServer/Ansible 业务词<br/>2. 单测完整覆盖：Frontmatter 解析、多标签冲突/无匹配/缺能力引导提示、Release 硬守卫与审批卡、写保护拦截 `CLAUDE.md`/`workflows/`<br/>3. 原有 101 项测试 100% 绿灯 |
+| **Stage 6** | **`@detent/delivery` 去硬编码化 + 可空 `jumpserver` 能力包 + 标准 Hub 模板与 `bootstrap.ts` 预置** | • `packages/delivery/src/index.ts` 将 `jumpserver`、`gitlab-release` 及用户自定义 `capabilities` 统一按 `DetentCapabilityPack` 装配<br/>• `packages/delivery/src/agents/profiles.ts` 移除硬编码 6 步 SOP，接入 Hub SOP 解析器并守住生产工具 RBAC 红线<br/>• `examples/hub-workspace/` 预置 `CLAUDE.md`、`workflows/{release,env-change,code-delivery,audit}.md`、`.gitlab/issue_templates/*.md`<br/>• `scripts/bootstrap.ts` 非破坏性预置全套 Hub 模板与 `delivery::release` 标签 | 1. 零 JumpServer 环境变量时 `createDeliveryApp` 正常启动，命中 `env-change` 自动发缺失提示，命中 `release`/`code` 正常执行<br/>2. 单测覆盖：审批期间改标签无法降级 `jms_run_ansible_job` / `detent_create_release` 的生产审批门槛；老仓库无 `workflows/` 平滑回退<br/>3. `bootstrap.ts` 重复运行不覆盖客户已改过的 `workflows/release.md` |
+| **Stage 7** | **全场景真实离线 E2E 验收与活文档/规则同步** | • 扩展 `scripts/e2e/offline-gitlab.ts` 支持 tree/tags/releases/commits API 及修改 Hub `workflows/release.md`<br/>• 扩展 `scripts/e2e/offline-anthropic.ts` 与 `run-offline-e2e.ts` 串联 **3 条真实离线全链路**：<br/>  1) 无 JumpServer 启动 -> 缺能力提示 + 无标签菜单提示（零 Claude 调用）<br/>  2) 运行中改写 Hub `workflows/release.md` -> 不重启 Pod 跑通自定义发版（Plan -> 锁定 SHA 审批卡 -> Developer 拒 / Maintainer 批 -> 真实创建 Git Tag & GitLab Release）<br/>  3) 完整 JumpServer + Ansible 6 阶段 E2E（由 Hub `workflows/env-change.md` 驱动）<br/>• 同步更新 `AGENT.md`、`.opencodereview/rule.json`、`README.md`、`README.zh-CN.md` | 1. `npm run check && npm run build` 100% 通过<br/>2. `npm run e2e:offline` 真实跑通全部 3 条场景且退出码 0、零残留容器/沙箱<br/>3. 推送前完成 `ocr delegate` 100% 覆盖率审查 |
+
+---
+
+### Stage 5 详细改造清单（`@detent/core`）
+1. **扩展 `GitLabClient`（`packages/core/src/gitlab/client.ts`）**：
+   - 新增只读方法：`listRepositoryTree(project, dirPath, ref)`（404 返回 `[]`）、`getRepositoryFile(project, filePath, ref)`（404 返回 `null`）、`listTags(project, search?)`、`getTag(project, tagName)`（404 返回 `null`）、`getCommit(project, sha)`（404 返回 `null`）。
+   - 新增发布写方法：`createTag(project, input)`、`createRelease(project, input)`（统一脱敏、沿用 `redirect: 'error'` 与 30s 超时）。
+2. **新增 Hub SOP 加载与能力预检模块（`packages/core/src/workflows/hub-workflows.ts`）**：
+   - 定义并导出 `DetentCapabilityPack`、`HubWorkflow`、`loadHubWorkflows(gitlab, hubProjectId, ref)`、`resolveHubWorkflowProfile(...)`。
+   - 极简严格的 Frontmatter 解析器（零新增 npm 依赖），解析 `label`、`mode`（`readonly` | `governed`）、`requires`（string[]）、`approver_tier`（`standard` | `prod`）、`allow_bash`（boolean）、`default`（boolean）、`description`（string），保留 Markdown 正文为 SOP 文本。
+   - 实现透明的匹配与缺失提示生成器：能力未启用提示（含各能力 `setupHint` 与当前可用替代标签）、无匹配 SOP 菜单提示、多流程标签冲突提示。
+3. **新增内置可选 `gitlab-release` 能力包（`packages/core/src/workspace/release-tools.ts`）**：
+   - `createGitLabReleaseTools({ gitlab, blockFailedPipeline? })` 导出 2 个工具：
+     - `detent_list_tags`（`readonly`）：按 `project` 与可选 `search` 查询已有 Tag。
+     - `detent_create_release`（`always_approve`）：入参 `project`、`tag_name`、`commit_sha`（40 位 hex）、`release_name?`、`release_notes?`、`tag_only?`。`guard()` 强校验 tag 名安全格式、目标提交存在、tag 未存在、以及（默认开启）该提交最新流水线非 `failed`；`renderApprovalCard()` 缩进防注入渲染锁定 SHA 审批卡；`execute()` 按 `tag_only` 调用 `createTag` 或 `createRelease`。
+4. **编排器与沙箱最小改动**：
+   - `packages/core/src/extensions.ts`：`TurnProfile` 新增 `blockedMessage?: string`；`DetentExtensions` 新增可选 `capabilities?: readonly DetentCapabilityPack[]`；`TurnProfileResolver` 的 `gitlab` 上下文新增 `listRepositoryTree` 与 `getRepositoryFile`。
+   - `packages/core/src/orchestrator/session-orchestrator.ts`：`run()` 提前解析 `profile`；若 `profile?.blockedMessage` 非空，直接脱敏发 Issue 评论并置 `IDLE`（不改 `permissionMode`、不建沙箱、不调 Claude）；同时向 `PermissionGate` 注入已启用 `capabilities` 中的工具。
+   - `packages/core/src/workspace/ephemeral-sandbox.ts`：`prepareTurnSandbox` 拷贝 `CLAUDE.md`、`.claude` 与 `workflows`（仍跳过符号链接）。
+   - `packages/core/src/claude/permission-gate.ts`：`allowedPath` 在写入时禁止修改 `CLAUDE.md` 与 `workflows` 顶层路径，防止编码 Agent 篡改 Hub 治理文档。
+
+### Stage 6 详细改造清单（`@detent/delivery` + Hub 模板 + `bootstrap.ts`）
+
+Stage 6 已实现。使用 `loadHubWorkflows` 和 `matchHubWorkflow` 解析当前流程；生产任务和发版均要求当前流程非只读且显式启用待审工具。
+
+1. **可空能力包装配（`packages/delivery/src/index.ts` & `config.ts`）**：
+   - `DeliveryOptions` 支持注入自定义 `capabilities?: readonly DetentCapabilityPack[]`。
+   - 内置注册两个标准能力包：
+     - `gitlab-release`（默认启用，可通过 `DELIVERY_ENABLE_RELEASE_TOOLS=false` 关闭，`blockFailedPipeline` 复用配置）；
+     - `jumpserver`（**可空**：仅当 `jumpserverClient` 或 `JUMPSERVER_BASE_URL` 配置时 `enabled: true`，否则 `enabled: false` 且携带配置提示 `setupHint`）。
+   - 注意：`createDeliveryApp` 需将 `GitLabClient` 实例传递给 `gitlab-release` 工具（或在 `createDetentApp` 支持工厂/注入，保持核心边界极简干净）。
+2. **去硬编码的 `profiles.ts`（`packages/delivery/src/agents/profiles.ts`）**：
+   - 删除 `EnvChangeAgent` 中硬编码的 6 步业务提示词，改为使用 Core 的 Hub SOP 加载与匹配函数。
+   - 保持生产工具硬 RBAC 列表（`jms_run_ansible_job`、`detent_create_release`）：无论审批期间 Issue 标签或 SOP 怎么变，只要待审批工具属于生产级工具或当前流程 `approver_tier === 'prod'`，均强制执行 `DELIVERY_PROD_APPROVERS` / `DELIVERY_PROD_MIN_ACCESS_LEVEL` 校验；且对 `jms_run_ansible_job` 仍要求当前流程显式声明 `requires: [jumpserver]` 且非只读。
+   - 若 Hub 仓库尚无 `workflows/` 目录，平滑回退到兼容模式：有 `jumpserver` 时兼容原三角色，无 `jumpserver` 时仅开放已启用能力且不注入 JumpServer 提示词。
+3. **预置标准 Hub 模板与 `scripts/bootstrap.ts` 升级**：
+   - 精简 `examples/hub-workspace/CLAUDE.md` 为纯“项目目录 + 资产目录 + 通用纪律”。
+   - 新增 `examples/hub-workspace/workflows/{release,env-change,code-delivery,audit}.md` 与 `examples/hub-workspace/.gitlab/issue_templates/{release,env-change,code-delivery,audit}.md`。
+   - 升级 `scripts/bootstrap.ts`：递归扫描 `examples/hub-workspace/` 目录（可通过 `DETENT_HUB_TEMPLATE_DIR` 覆盖），幂等写入 Hub 仓库默认分支（**已存在文件绝不覆盖**），并补齐 `delivery::release` 标签。
+
+### Stage 7 详细改造清单（离线真实 E2E 与活文档同步）
+1. **离线 GitLab 增强（`scripts/e2e/offline-gitlab.ts`）**：
+   - 新增 `repository/tree`、多级路径 `repository/files/:encoded`（支持 `workflows/...` 与 `.gitlab/issue_templates/...`）、`repository/commits/:sha`、`repository/tags`、`releases` 接口及测试辅助方法 `updateHubFile(...)`（模拟客户在 Hub 仓库修改 `workflows/release.md`）。
+2. **全场景离线真实 E2E（`scripts/e2e/run-offline-e2e.ts` & `offline-anthropic.ts`）**：
+   - 场景 1（**零 JumpServer 模式 + 缺能力/缺 SOP 引导**）：不传任何 `JUMPSERVER_*` 启动真实 Delivery Pod，分别开无标签 Issue 与 `delivery::env-change` Issue，断言 **0 次 Anthropic API 请求** 且 Issue 自动收到清晰引导评论。
+   - 场景 2（**客户改文档定制 Release 流程**）：直接往离线 Hub 仓库提交修改后的 `workflows/release.md`（例如定制 tag 前缀/发版步骤），**不重启 Pod** 开 `delivery::release` Issue，验证 Claude 按新 SOP 执行、弹出锁定 40 位 SHA 的 Release 审批卡、Developer 👍 被拒、Maintainer 👍 放行后真实创建 Git Tag 与 GitLab Release。
+   - 场景 3（**完整 JumpServer + Ansible 6 阶段交付**）：携带 JumpServer 配置启动 Pod，由 Hub `workflows/env-change.md` 驱动跑完原有全链路（含中途重启 Pod 无状态水合、未合并硬拦截、二次审批与 MySQL 6 张表断言）。
+3. **活文档与审查规则同步**：
+   - 同步更新 `AGENT.md`、`.opencodereview/rule.json`、`README.md`、`README.zh-CN.md`。
+   - 全量通过 `npm run check && npm run build && npm run e2e:offline` 及 `ocr delegate` 100% 覆盖率审查。

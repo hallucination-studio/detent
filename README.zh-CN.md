@@ -21,12 +21,12 @@
 
 Detent 采用 **双包分层架构**：
 - **`@detent/core`（通用基础架构包）**：将一个配置的 GitLab **工作区仓库（Workspace Hub Repository）** 转化为 100% 无状态、纯增量 MySQL 持久化的 Claude Code 会话中枢，实现 **`1 个 GitLab Issue = 1 个 Claude Code Session`**，自由编排跨项目 `0..N` 个 Worktree 与 `0..N` 个 Merge Request，并内置双层审批与单评论流式刷新。
-- **`@detent/delivery`（受治理 AI 变更交付中枢，V2 Stage 4 已实现）**：基于 `@detent/core` 扩展构建，面向生产环境与基础设施交付，打通 **GitLab Issue 变更工单 → JumpServer 只读账号巡检 → Ansible 脚本提 MR 人工合并自动续跑 → 执行前人工二次审批 → JumpServer 任务中心下发执行与三方审计留痕** 的合规交付闭环。
+- **`@detent/delivery`（受治理 AI 变更交付中枢）**：基于 `@detent/core` 扩展构建，面向生产环境与基础设施交付，打通 **GitLab Issue 变更工单 → JumpServer 只读账号巡检 → Ansible 脚本提 MR 人工合并自动续跑 → 执行前人工二次审批 → JumpServer 任务中心下发执行与三方审计留痕** 的合规交付闭环。
 
 ## 相关文档
 
 - 👉 **双包架构与变更交付设计文档**：[`docs/DESIGN.md`](./docs/DESIGN.md)
-- 👉 **V2 四阶段推进与验收计划**：[`docs/IMPLEMENTATION_PLAN.md`](./docs/IMPLEMENTATION_PLAN.md)
+- 👉 **V2 与 V3 推进与验收计划**：[`docs/IMPLEMENTATION_PLAN.md`](./docs/IMPLEMENTATION_PLAN.md)
 - 👉 **AI Agent 架构红线与开发规范**：[`AGENT.md`](./AGENT.md)
 
 ---
@@ -71,11 +71,11 @@ flowchart LR
 ```bash
 GITLAB_BASE_URL=https://gitlab.example.com \
 DETENT_PUBLIC_URL=https://detent.example.com \
-DETENT_TARGET_PROJECTS=ops/ansible-infra DETENT_HUB_MEMBERS=dev:30,sre:40 \
+DETENT_TARGET_PROJECTS=apps/web,ops/ansible-infra DETENT_HUB_MEMBERS=dev:30,sre:40 \
 npm run bootstrap -- --env-out .env
 ```
 
-默认 Hub 为 `ai/workspace-hub`，可通过 `DETENT_HUB_PROJECT` 指定其他路径，或用 `GITLAB_HUB_PROJECT_ID` 指定已有项目。重复运行会复用同一输出文件中的 PAT 和 Webhook 密钥。MySQL、Anthropic 和 JumpServer 参数可以通过环境变量传入，也可编辑生成的 `.env`（权限 0600）。构建后执行 `node --env-file=.env packages/delivery/dist/server.js` 即可加载配置并启动交付服务。手动配置步骤如下。
+默认 Hub 为 `ai/workspace-hub`，可通过 `DETENT_HUB_PROJECT` 指定其他路径，或用 `GITLAB_HUB_PROJECT_ID` 指定已有项目。脚本预置 `CLAUDE.md`、四份 `workflows/*.md` 流程、四份 Issue 模板及九个标签。重复运行时保留 Hub 中已有文件，并复用同一输出文件中的 PAT 和 Webhook 密钥。MySQL、Anthropic 和 JumpServer 参数可以通过环境变量传入，也可编辑生成的 `.env`（权限 0600）。构建后执行 `node --env-file=.env packages/delivery/dist/server.js` 即可加载配置并启动交付服务。手动配置步骤如下。
 
 ### 1. 准备“工作区仓库（Workspace Hub Repo）”
 1. 在 GitLab CE v18.3.0 中创建一个专门用于承载研发会话的工作区仓库（例如 `ai/workspace-hub`），记录其 **Project ID**（填入环境变量 `GITLAB_HUB_PROJECT_ID`）。
@@ -101,7 +101,11 @@ npm run bootstrap -- --env-out .env
 
 ## 离线交付 E2E
 
-准备 Node.js 20.12+、已安装的 npm 依赖、含 `git-http-backend` 的 Git，以及本地已缓存的 Docker 镜像 `mysql:8.0`，执行 `npm run e2e:offline`。脚本构建交付服务，通过 CLI 初始化两个仓库，在方案生成后重启 Pod，并通过本地 HTTP 服务验证 MR 合并、生产审批、执行审计及沙箱清理。
+准备 Node.js 20.12+、已安装的 npm 依赖、含 `git-http-backend` 的 Git，以及本地已缓存的 Docker 镜像 `mysql:8.0`，执行 `npm run e2e:offline`。脚本对一个 Hub 和两个目标仓库重复运行 bootstrap，检查凭证与客户修改的 SOP。三个场景共用同一个数据库，运行真实的 Delivery 与 Claude Code 进程。
+
+1. 零 JumpServer 配置启动。无标签 Issue 收到流程菜单，环境变更 Issue 收到缺能力指引，两者的 Anthropic 请求数均为零。
+2. 在同一 Pod 运行期间修改 `workflows/release.md` 的 Tag 前缀。开发者批准方案，维护者批准发版，检查真实 Git Tag 与 Release 的 SHA。
+3. 启用 JumpServer，持久化方案后重启 Pod。恢复会话并推送 Playbook，待人工合并 MR 和生产审批后执行，验证审计行、`/status`、增量消息与沙箱清理。
 
 如需复用本地 MySQL 8.0，设置 `E2E_MYSQL_HOST=127.0.0.1`。可选的 `E2E_MYSQL_PORT`、`E2E_MYSQL_USER`、`E2E_MYSQL_PASSWORD`、`E2E_MYSQL_DATABASE` 分别默认为 `3306`、`root`、空密码和 `detent`。请使用专用测试库。脚本会创建 Detent 所需的表，结束时清理本次测试的会话数据。
 
@@ -181,7 +185,9 @@ Webhook 返回 `202` 表示事件已进入当前进程的内存队列。正常�
 | `DELIVERY_PROD_APPROVERS` | 逗号分隔的 GitLab 用户名，忽略大小写。配置名单时，生产审批人还须达到 Hub 项目的 `GITLAB_MIN_ACCESS_LEVEL`。 |
 | `DELIVERY_PROD_MIN_ACCESS_LEVEL` | 名单为空时的生产审批门槛，默认 40（Maintainer）；方案审批沿用普通门槛，默认 30（Developer）。 |
 
-交付服务在每轮和每次审批时读取 Hub Issue 标签。优先匹配 `delivery::audit`（只读诊断，完成后直接回到 IDLE），其次为 `delivery::env-change`（巡检、方案、Ansible MR、人工合并、二次审批和执行验收），然后为 `delivery::code`（标准多项目研发工具）。未标注角色时使用环境变更流程。可将 [Hub 工作区示例](./examples/hub-workspace/CLAUDE.md) 复制到 Hub 仓库根目录。
+交付服务在每轮及每次审批时重读 Hub 默认分支上的 `workflows/*.md`。在文件头声明 Issue 标签（`label`）、模式（`mode`）、所需能力包（`requires`）和审批档位（`approver_tier`），正文编写操作步骤。例如在 `workflows/release.md` 中约定使用 `rel-` 前缀，合并后下一张发版单即可采用新规范，无需改代码或重启 Pod。[发版 SOP 示例](./examples/hub-workspace/workflows/release.md)
+
+预置的 `delivery::release` 使用默认启用的 `gitlab-release` 能力包，发版审批锁定目标项目、Tag 和完整 SHA。可通过 `DELIVERY_ENABLE_RELEASE_TOOLS=false` 关闭此包。`delivery::code` 使用基础工作区工具。可选的 `jumpserver` 能力包提供 `delivery::audit` 只读巡检和 `delivery::env-change` 环境变更所需的工具。按预置 SOP 开单时，无标签的 Issue 会收到标明就绪状态的流程菜单；选定流程缺少能力时，评论会给出配置提示和可用的替代标签。这两种情况都会在调用 Claude 前回到 `IDLE`。
 
 ### 项目结构
 ```text
@@ -190,7 +196,7 @@ detent/
 ├── .gitlab-ci.yml                  # GitLab CI 兜底流水线
 ├── docs/
 │   ├── DESIGN.md                   # 完整系统架构、时序图与 MySQL 增量数据模型设计文档
-│   └── IMPLEMENTATION_PLAN.md      # V2 四阶段实施与验收标准
+│   └── IMPLEMENTATION_PLAN.md      # V2 与 V3 实施与验收标准
 ├── AGENT.md                        # AI Agent 架构红线、现有代码基线与分阶段开发规范
 ├── README.md                       # 英文主文档（默认）
 ├── README.zh-CN.md                 # 中文文档

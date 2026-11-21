@@ -1,11 +1,23 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { dirname, posix, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseArgs, parseEnv } from 'node:util';
 
 interface User { id: number; username: string }
 interface Project { id: number; path_with_namespace: string; default_branch: string }
 const list = (s = '') => s.split(',').map(v => v.trim()).filter(Boolean);
+
+async function templateFiles(root: string, dir = ''): Promise<string[]> {
+  const paths: string[] = [];
+  for (const entry of await readdir(resolve(root, dir), { withFileTypes: true })) {
+    if (entry.name === '.DS_Store') continue;
+    const path = posix.join(dir, entry.name);
+    if (entry.isDirectory()) paths.push(...await templateFiles(root, path));
+    else if (entry.isFile()) paths.push(path);
+  }
+  return paths;
+}
 
 async function main() {
   const { values } = parseArgs({ options: { 'env-out': { type: 'string' } } });
@@ -121,14 +133,19 @@ async function main() {
 
   const hub = await project(env.GITLAB_HUB_PROJECT_ID || env.DETENT_HUB_PROJECT || 'ai/workspace-hub');
   const root = '/projects/' + hub.id;
-  const file = root + '/repository/files/CLAUDE.md';
-  if (!await lookup(file + '?ref=' + encodeURIComponent(hub.default_branch))) {
-    const content = await readFile(env.DETENT_CLAUDE_MD_FILE ?? new URL('../examples/hub-workspace/CLAUDE.md', import.meta.url), 'utf8');
-    await json(file, 'POST', { branch: hub.default_branch, content, commit_message: 'Seed Detent workspace instructions' });
+  const templateDir = env.DETENT_HUB_TEMPLATE_DIR ?? fileURLToPath(new URL('../examples/hub-workspace', import.meta.url));
+  const files = new Set(await templateFiles(templateDir));
+  if (env.DETENT_CLAUDE_MD_FILE) files.add('CLAUDE.md');
+  for (const path of [...files].sort()) {
+    const file = root + '/repository/files/' + encodeURIComponent(path);
+    if (await lookup(file + '?ref=' + encodeURIComponent(hub.default_branch))) continue;
+    const source = path === 'CLAUDE.md' && env.DETENT_CLAUDE_MD_FILE ? env.DETENT_CLAUDE_MD_FILE : resolve(templateDir, path);
+    const content = await readFile(source, 'base64');
+    await json(file, 'POST', { branch: hub.default_branch, content, encoding: 'base64', commit_message: 'Seed ' + path });
   }
   const labels = await all<{ name: string }>(root + '/labels');
   for (const name of ['claude::planning', 'claude::waiting-approval', 'claude::coding', 'claude::idle',
-    'claude::failed', 'delivery::audit', 'delivery::env-change', 'delivery::code']) {
+    'claude::failed', 'delivery::audit', 'delivery::env-change', 'delivery::code', 'delivery::release']) {
     if (!labels.some(l => l.name === name)) await json(root + '/labels', 'POST', { name, color: '#356288' });
   }
   for (const entry of list(env.DETENT_HUB_MEMBERS)) {

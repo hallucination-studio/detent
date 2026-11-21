@@ -1,6 +1,6 @@
 # AGENT.md — Detent 架构准则与 AI 开发指南
 
-本文档面向参与 Detent 项目开发与维护的 AI Coding Agents（如 ChatGPT、Codex、Claude Code、Antigravity 等）及研发工程师。在修改本项目代码前，**必须先完整阅读本文档、[docs/DESIGN.md](file:///Users/murphy/code/work/relay/docs/DESIGN.md) 与 [docs/IMPLEMENTATION_PLAN.md](file:///Users/murphy/code/work/relay/docs/IMPLEMENTATION_PLAN.md)**。
+本文档面向参与 Detent 项目开发与维护的 AI Coding Agents（如 ChatGPT、Codex、Claude Code、Antigravity 等）及研发工程师。在修改本项目代码前，**必须先完整阅读本文档、[docs/DESIGN.md](docs/DESIGN.md) 与 [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)**。
 
 ---
 
@@ -35,7 +35,15 @@ Stage 2 的 Delivery 合并事件处理器按目标项目 ID 和 MR IID 查找�
 
 Stage 3 的只读和自动工具在 `preflight` 执行守卫。生产任务在发卡前、批准后复核，提交前重读当前会话 MR。巡检与执行凭证分开配置，缺少所需凭证即拒绝。资产黑名单同时约束巡检和执行。结果查询必须由注入的 `DeliveryExecutionTracker` 验证会话归属。审批卡渲染、执行与归属判断均读取仓储。
 
-Stage 4 已实现。`npm run start:delivery` 启动生产服务。每轮与每次审批重读 Hub Issue 标签，优先级为 `delivery::audit`、`delivery::env-change`、`delivery::code`，未匹配时使用 EnvChangeAgent。只读角色在 SDK、工具门禁及工作区层强制只读，直接发布报告并进入 IDLE。生产审批使用 `DELIVERY_PROD_APPROVERS` 名单与项目成员门槛；名单为空时按 `DELIVERY_PROD_MIN_ACCESS_LEVEL`（默认 40）校验。待审期间切换角色不能降低执行门槛。
+### V3 基线（Stage 5–7）
+
+每轮与每次审批从 Hub 默认分支重读 `workflows/*.md`，按当前 Issue 标签选择 SOP 并检查 `requires`。沙箱内的 Hub `CLAUDE.md` 和顶层 `workflows/` 受写保护。未匹配流程、流程冲突或能力缺失时，`TurnProfile.blockedMessage` 在创建沙箱和调用 Claude 前将引导写入 Issue，会话回到 `IDLE`。
+
+`DetentCapabilityPack` 以 `enabled` 表达能力是否就绪，未启用的包通过 `setupHint` 提供配置指引。Delivery 的 `jumpserver` 包可空。默认启用的 `gitlab-release` 包提供只读的 `detent_list_tags` 和须审批的 `detent_create_release`，发布审批绑定项目、Tag 和完整提交 SHA。旧 Hub 无 SOP 时沿用兼容路由，未配置 JumpServer 时默认代码交付。
+
+`npm run bootstrap` 只补齐缺失的 Hub 规范、流程、Issue 模板和标签，复用同一输出文件内的凭证。`npm run e2e:offline` 在同一个 MySQL 8.0 实例上验证三条链路：缺流程与缺能力时零模型调用、运行中修改 SOP 后发版、重启 Pod 后继续受治理的环境变更。
+
+`jms_run_ansible_job` 与 `detent_create_release` 的待审单仅能在当前流程非只读且显式启用该工具时获批。两者始终校验生产审批人，`approver_tier: prod` 的流程对所有工具审批执行同样校验。方案审批沿用普通项目权限。生产审批要求 `DELIVERY_PROD_APPROVERS` 名单加项目成员门槛，或在名单为空时满足 `DELIVERY_PROD_MIN_ACCESS_LEVEL`（默认 40）。
 
 `delivery_executions` 通过 `onInitSchema(pool)` 在 Core 表之后、调用方建表之前初始化。所有权、执行状态和审批单关联均以仓储为准，审批卡渲染也从仓储读取 MR。禁止 Delivery 另建池或在 Pod 内缓存业务状态。结果查询更新审计，`renderStatusExtra` 将当前会话的执行记录加入 `/status`。环境变量全集与 Hub 规范见 [.env.example](.env.example) 和 [工作区示例](examples/hub-workspace/CLAUDE.md)。
 
@@ -44,7 +52,7 @@ Stage 4 已实现。`npm run start:delivery` 启动生产服务。每轮与每�
 为了确保仓库长期保持 **结构紧凑、逻辑自洽、测试覆盖完整**，所有 AI Agent 与工程师在提交和推送代码前必须遵守以下两道门禁：
 
 ### 2.1 提交前本地自动门禁（Pre-Commit）
-- 仓库已配置 [`.githooks/pre-commit`](file:///Users/murphy/code/work/relay/.githooks/pre-commit)（通过 `npm run prepare` 或 `git config core.hooksPath .githooks` 启用）。
+- 仓库已配置 [`.githooks/pre-commit`](.githooks/pre-commit)（通过 `npm run prepare` 或 `git config core.hooksPath .githooks` 启用）。
 - 每次 `git commit` 前必须完整通过：
   ```bash
   npm run check
@@ -53,7 +61,7 @@ Stage 4 已实现。`npm run start:delivery` 启动生产服务。每轮与每�
 - 严禁使用 `--no-verify` 跳过本地门禁；生产目录 `src/` 严禁混入 `InMemory*` 测试假实现。
 
 ### 2.2 推送前必须运行 OpenCodeReview 委托模式（Pre-Push OCR Delegation Review）
-在执行 `git push` 或提交 Merge Request 之前，**必须使用 `open-code-review-delegate` 委托模式**（复用当前宿主 Agent 的模型），结合项目规则 [`.opencodereview/rule.json`](file:///Users/murphy/code/work/relay/.opencodereview/rule.json)（已开启 `merge_system_rule: true`）对全部待推送变更进行 100% 覆盖率审查：
+在执行 `git push` 或提交 Merge Request 之前，**必须使用 `open-code-review-delegate` 委托模式**（复用当前宿主 Agent 的模型），结合项目规则 [`.opencodereview/rule.json`](.opencodereview/rule.json)（已开启 `merge_system_rule: true`）对全部待推送变更进行 100% 覆盖率审查：
 
 1. **预览待审变更范围**：
    ```bash
@@ -71,4 +79,4 @@ Stage 4 已实现。`npm run start:delivery` 启动生产服务。每轮与每�
    - 修复所有 **Critical / High** 及合理的 **Medium** 问题，重跑 `npm run check` 通过后再执行 `git push`。
 
 ### 2.3 活文档同步原则
-- 凡修改数据库表结构、状态机流转、扩展接口、审批权限边界或工具清单的变更，必须在同一次提交中同步更新 `AGENT.md`、[docs/DESIGN.md](file:///Users/murphy/code/work/relay/docs/DESIGN.md)、[docs/IMPLEMENTATION_PLAN.md](file:///Users/murphy/code/work/relay/docs/IMPLEMENTATION_PLAN.md) 与 [`.opencodereview/rule.json`](file:///Users/murphy/code/work/relay/.opencodereview/rule.json)。
+- 凡修改数据库表结构、状态机流转、扩展接口、审批权限边界或工具清单的变更，必须在同一次提交中同步更新 `AGENT.md`、[docs/DESIGN.md](docs/DESIGN.md)、[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) 与 [`.opencodereview/rule.json`](.opencodereview/rule.json)。

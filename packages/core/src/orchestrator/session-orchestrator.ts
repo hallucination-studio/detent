@@ -28,7 +28,7 @@ type Client = WorkspaceGitLab &
   Pick<
     GitLabClient,
     'createIssueNote' | 'updateIssueNote' | 'syncIssueStatusLabel' | 'getIssue' | 'hasApprovalPermission'
-  >;
+  > & Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile'>>;
 type Active = { controller: AbortController; ownsLease: boolean; gate?: PermissionGate };
 export class SessionOrchestrator {
   private active = new Map<string, Active>();
@@ -106,8 +106,8 @@ export class SessionOrchestrator {
       await this.repo.releaseSessionLease(s.id, owner);
     }
   }
-  private async state(s: IssueSessionRow, status: SessionStatus) {
-    await this.repo.updateSessionState(s.id, { status, permissionMode: s.permissionMode });
+  private async state(s: IssueSessionRow, status: SessionStatus, permissionMode?: PermissionMode) {
+    await this.repo.updateSessionState(s.id, permissionMode ? { status, permissionMode } : { status });
     s.status = status;
     await this.gitlab.syncIssueStatusLabel(s.hubProjectId, s.hubIssueIid, status);
   }
@@ -135,7 +135,14 @@ export class SessionOrchestrator {
     let sandbox: TurnSandbox | undefined;
     let streamer: NoteStreamer | undefined;
     try {
-      await this.state(s, plan ? 'PLANNING' : 'CODING');
+      const profile = await this.resolveTurnProfile(s);
+      controller.signal.throwIfAborted();
+      if (profile?.blockedMessage?.trim()) {
+        await this.gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, redactGitUrl(profile.blockedMessage));
+        await this.state(s, 'IDLE');
+        return;
+      }
+      await this.state(s, plan ? 'PLANNING' : 'CODING', s.permissionMode);
       const note = await this.gitlab.createIssueNote(
         s.hubProjectId,
         s.hubIssueIid,
@@ -154,10 +161,12 @@ export class SessionOrchestrator {
         await flush();
         await host.checkpoint(sandbox!, s.id);
       };
-      const profile = await this.resolveTurnProfile(s);
       const effectivePlan = plan || (profile?.readonly ?? false);
       const gate = new PermissionGate({
-        extensionTools: this.extensions.tools,
+        extensionTools: [
+          ...(this.extensions.tools ?? []),
+          ...(this.extensions.capabilities ?? []).filter(pack => pack.enabled).flatMap(pack => pack.tools),
+        ],
         profile,
         onApprovalResolved: this.extensions.hooks?.onApprovalResolved,
         session: s,

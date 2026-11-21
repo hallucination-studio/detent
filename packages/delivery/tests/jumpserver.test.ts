@@ -45,7 +45,7 @@ const asTool = (name: string) => 'mcp__detent__jms_' + name;
 
 it('validates role-specific configuration and parses list, timeout and pipeline settings', () => {
   expect(loadDeliveryConfig({})).toEqual({
-    prodApprovers: [], prodMinAccessLevel: 40, jumpserverTimeoutMs: 30000, jumpserverReadonlyAccount: 'readonly', blockedAssets: [], blockFailedPipeline: true,
+    enableReleaseTools: true, prodApprovers: [], prodMinAccessLevel: 40, jumpserverTimeoutMs: 30000, jumpserverReadonlyAccount: 'readonly', blockedAssets: [], blockFailedPipeline: true,
     inspectAllowPrefixes: ['systemctl status', 'nginx -t', 'df -h', 'free -m', 'uptime', 'ss -tlnp', 'kubectl get', 'cat /etc/nginx'],
   });
   expect(loadDeliveryConfig({ ...env, JUMPSERVER_TIMEOUT_MS: '4500', JUMPSERVER_READONLY_ACCOUNT: 'audit',

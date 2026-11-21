@@ -1,4 +1,7 @@
-import { createDetentApp, loadConfig, type AppConfig, type DetentExtensions } from '@detent/core';
+import {
+  createDetentApp, createGitLabReleaseCapability, GitLabClient, loadConfig,
+  type AppConfig, type DetentCapabilityPack, type DetentExtensions, type ReleaseGitLab,
+} from '@detent/core';
 import { createDeliveryTurnProfileResolver } from './agents/profiles.js';
 import { MySqlDeliveryAuditRepository, formatDeliveryExecutionsStatus, type DeliveryAuditRepository } from './db/audit.js';
 import { loadDeliveryConfig, type DeliveryConfig } from './config.js';
@@ -20,21 +23,35 @@ export type { DeliveryExecutionRecord } from './jumpserver/tools.js';
 
 export interface DeliveryOptions extends DetentExtensions {
   deliveryConfig?: DeliveryConfig;
+  gitlabClient?: ReleaseGitLab;
   jumpserverClient?: JumpServerClient;
   executionTracker?: DeliveryExecutionTracker & Partial<Pick<DeliveryAuditRepository, 'listSessionExecutions'>>;
 }
 
 export function createDeliveryApp(config: AppConfig = loadConfig(), options: DeliveryOptions = {}): ReturnType<typeof createDetentApp> {
-  const { deliveryConfig = loadDeliveryConfig(), jumpserverClient, executionTracker, ...extensions } = options;
+  const { deliveryConfig = loadDeliveryConfig(), jumpserverClient, gitlabClient, executionTracker, ...extensions } = options;
   const client = jumpserverClient ?? (deliveryConfig.jumpserverBaseUrl ? new HttpJumpServerClient(deliveryConfig, config) : undefined);
   const auditRepo = executionTracker ? undefined : new MySqlDeliveryAuditRepository();
   const tracker = executionTracker ?? auditRepo;
-  const tools = client
-    ? [...createJumpServerTools({ client, config: deliveryConfig, tracker }), ...(extensions.tools ?? [])]
-    : extensions.tools;
+  const release: DetentCapabilityPack = deliveryConfig.enableReleaseTools
+    ? {
+        ...createGitLabReleaseCapability({ gitlab: gitlabClient ?? new GitLabClient(config), blockFailedPipeline: deliveryConfig.blockFailedPipeline }),
+        setupHint: '可在服务端设置 DELIVERY_ENABLE_RELEASE_TOOLS=true 启用发版能力包',
+      }
+    : { name: 'gitlab-release', enabled: false, setupHint: '服务端已禁用 gitlab-release（DELIVERY_ENABLE_RELEASE_TOOLS=false）', tools: [] };
+  const jumpserver: DetentCapabilityPack = {
+    name: 'jumpserver', enabled: !!client,
+    setupHint: '请配置 JUMPSERVER_BASE_URL 及独立的只读/任务中心凭证（JUMPSERVER_READONLY_* 与 JUMPSERVER_JOB_*）',
+    tools: client ? createJumpServerTools({ client, config: deliveryConfig, tracker }) : [],
+  };
+  const packs = new Map<string, DetentCapabilityPack>();
+  for (const pack of [release, jumpserver, ...(extensions.capabilities ?? [])]) packs.set(pack.name.trim().toLowerCase(), pack);
+  const capabilities = [...packs.values()];
   return createDetentApp(config, {
-    ...extensions, tools,
-    resolveTurnProfile: extensions.resolveTurnProfile ?? createDeliveryTurnProfileResolver(deliveryConfig),
+    ...extensions, capabilities,
+    resolveTurnProfile: createDeliveryTurnProfileResolver(deliveryConfig, {
+      hubDefaultBranch: config.gitlabHubDefaultBranch, capabilities, resolveTurnProfile: extensions.resolveTurnProfile,
+    }),
     async onInitSchema(pool) {
       await auditRepo?.init(pool);
       await extensions.onInitSchema?.(pool);

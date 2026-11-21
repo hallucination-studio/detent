@@ -92,11 +92,11 @@ With Node.js 20.12+ and a GitLab CE instance, `npm run bootstrap` provisions the
 ```bash
 GITLAB_BASE_URL=https://gitlab.example.com \
 DETENT_PUBLIC_URL=https://detent.example.com \
-DETENT_TARGET_PROJECTS=ops/ansible-infra DETENT_HUB_MEMBERS=dev:30,sre:40 \
+DETENT_TARGET_PROJECTS=apps/web,ops/ansible-infra DETENT_HUB_MEMBERS=dev:30,sre:40 \
 npm run bootstrap -- --env-out .env
 ```
 
-The default Hub is `ai/workspace-hub`. Set `DETENT_HUB_PROJECT` to another path or `GITLAB_HUB_PROJECT_ID` to an existing project ID. Rerunning with the same output file reuses the bot PAT and webhook secret. Supply MySQL, Anthropic, and JumpServer settings through the environment or edit the resulting mode-0600 file.
+The default Hub is `ai/workspace-hub`. Set `DETENT_HUB_PROJECT` to another path or `GITLAB_HUB_PROJECT_ID` to an existing project ID. Bootstrap seeds `CLAUDE.md`, four SOPs under `workflows/`, four Issue templates, and nine labels. Rerunning with the same output file reuses the bot PAT and webhook secret and preserves existing Hub files. Supply MySQL, Anthropic, and JumpServer settings through the environment or edit the resulting mode-0600 file.
 
 For manual GitLab setup, copy [`.env.example`](./.env.example) and fill in your credentials:
 
@@ -147,7 +147,11 @@ node --env-file=.env packages/delivery/dist/server.js
 
 ## Offline delivery E2E
 
-With Node.js 20.12+, installed npm dependencies, Git (including `git-http-backend`), and a locally cached `mysql:8.0` Docker image, run `npm run e2e:offline`. The harness builds Delivery, provisions both repositories through the CLI, restarts the pod after planning, and verifies the MR, production approval, execution audit, and sandbox cleanup using loopback HTTP services.
+With Node.js 20.12+, installed npm dependencies, Git (including `git-http-backend`), and a locally cached `mysql:8.0` Docker image, run `npm run e2e:offline`. The harness runs the bootstrap CLI twice against a Hub and two target repositories, checks that credentials and a customer edit survive, and exercises three scenarios against one database with the real Delivery and Claude Code processes.
+
+1. A pod with no JumpServer configuration posts the workflow menu and missing-capability guidance on separate Issues with zero Anthropic requests.
+2. On that same pod, a live edit to `workflows/release.md` sets the tag prefix. A developer approves the plan, a maintainer approves publication, and the harness checks the Git tag and Release against the approved SHA.
+3. A JumpServer-enabled pod persists a plan and restarts. The resumed session pushes a playbook, waits for a human MR merge and production approval, then verifies execution, the audit row, `/status`, transcript continuity, and sandbox cleanup.
 
 To use an existing local MySQL 8.0 instance, set `E2E_MYSQL_HOST=127.0.0.1`. The optional `E2E_MYSQL_PORT`, `E2E_MYSQL_USER`, `E2E_MYSQL_PASSWORD`, and `E2E_MYSQL_DATABASE` default to `3306`, `root`, an empty password, and `detent`. Use a dedicated test database. The harness creates the Detent tables and removes its session rows during teardown.
 
@@ -178,11 +182,16 @@ To use an existing local MySQL 8.0 instance, set `E2E_MYSQL_HOST=127.0.0.1`. The
 
 ## Governed Delivery Control Plane (`@detent/delivery`)
 
-When running `npm run start:delivery`, Detent initializes the `delivery_executions` audit table on Core's MySQL pool and routes each turn based on Hub Issue labels (checked in priority order):
+Delivery reads `workflows/*.md` from the Hub default branch on each turn and approval. Each SOP declares its Issue `label`, `mode`, required capability packs (`requires`), and `approver_tier`. Its Markdown body supplies the instructions. To adopt a tag prefix such as `rel-`, edit the body of `workflows/release.md` in the Hub. The next release Issue uses the merged change without application code changes or a pod restart. [Example release SOP](./examples/hub-workspace/workflows/release.md)
 
-1. **`delivery::audit`** — Read-only diagnostics via JumpServer; enforces read-only mode across SDK, tool gates, and workspace, publishing findings directly and returning to `IDLE`.
-2. **`delivery::env-change`** *(default when no role label is set)* — Full governed change lifecycle: read-only inspection → plan approval → Ansible MR → human merge auto-resume → production execution approval → JumpServer Job Center execution & post-change verification.
-3. **`delivery::code`** — Standard multi-repo engineering, testing, and MR workflow.
+| Issue label | Workflow | Required capability |
+| --- | --- | --- |
+| `delivery::release` | Plan a version, approve the exact tag and commit SHA, and publish | `gitlab-release` (enabled by default) |
+| `delivery::code` | Implement and review code across repositories | Built-in workspace tools |
+| `delivery::audit` | Inspect assets and report findings in read-only mode | `jumpserver` |
+| `delivery::env-change` | Inspect, approve a plan, merge the playbook MR, approve execution, and verify | `jumpserver` |
+
+With the seeded SOPs, an unlabeled Issue receives a menu showing which workflows are ready. If a selected SOP requires a disabled pack, the Issue lists the missing capability, setup instructions, and ready alternatives. Both paths return to `IDLE` before Claude runs. JumpServer is optional for release and code delivery. Set `DELIVERY_ENABLE_RELEASE_TOOLS=false` to disable the release pack.
 
 <details>
 <summary><strong>Delivery & JumpServer Environment Variables</strong></summary>
@@ -221,7 +230,7 @@ detent/
 ├── .opencodereview/rule.json       # Automated architecture & code quality review rules
 ├── docs/
 │   ├── DESIGN.md                   # Architecture, sequence diagrams & MySQL data model
-│   └── IMPLEMENTATION_PLAN.md      # V2 four-stage roadmap & acceptance criteria
+│   └── IMPLEMENTATION_PLAN.md      # V2 and V3 roadmap & acceptance criteria
 ├── examples/
 │   └── hub-workspace/CLAUDE.md     # Sample Workspace Hub repository CLAUDE.md
 ├── packages/

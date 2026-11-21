@@ -34,7 +34,15 @@ export function defineExtensionTool<S extends z.ZodRawShape>(tool: DetentExtensi
   return tool as AnyDetentExtensionTool;
 }
 
+export interface DetentCapabilityPack {
+  name: string;
+  setupHint?: string;
+  enabled: boolean;
+  tools: readonly AnyDetentExtensionTool[];
+}
+
 export interface TurnProfile {
+  blockedMessage?: string;
   name?: string;
   readonly?: boolean;
   extraSystemPrompt?: string;
@@ -52,7 +60,8 @@ export interface TurnProfile {
 export type TurnProfileResolver = (ctx: {
   session: IssueSessionRow;
   repo: DetentRepository;
-  gitlab: Pick<GitLabClient, 'getIssue' | 'hasApprovalPermission'>;
+  gitlab: Pick<GitLabClient, 'getIssue' | 'hasApprovalPermission'> &
+    Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile'>>;
 }) => TurnProfile | Promise<TurnProfile>;
 
 export interface SessionLifecycleHooks {
@@ -68,6 +77,7 @@ export type WebhookExtension = (event: ExtensionWebhookEvent) => {
 
 export interface DetentExtensions {
   tools?: readonly AnyDetentExtensionTool[];
+  capabilities?: readonly DetentCapabilityPack[];
   renderStatusExtra?(session: IssueSessionRow): Promise<string | null | undefined>;
   onInitSchema?(pool: Pool): Promise<void>;
   resolveTurnProfile?: TurnProfileResolver;

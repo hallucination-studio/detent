@@ -125,7 +125,7 @@ export class EphemeralSandbox {
       const dir = path.join(rootDir, 'hub');
       await this.clone(s, hub.http_url_to_repo, this.config.gitlabHubDefaultBranch, dir);
       for (const name of (await fs.readdir(dir)).filter(
-        (name) => name === 'CLAUDE.md' || name === '.claude',
+        (name) => ['CLAUDE.md', '.claude', 'workflows'].includes(name),
       )) {
         const source = path.join(dir, name);
         await fs.cp(source, path.join(s.workspaceRoot, name), {

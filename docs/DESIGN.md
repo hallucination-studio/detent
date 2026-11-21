@@ -3,9 +3,9 @@
 Detent 的名称来自飞机油门杆上点火前的机械止动槽。受治理 AI 变更交付中枢将这一原则落实为执行门禁：生产任务只有在目标 MR 已合并、合并版本校验通过且执行审批获准后才会下发。
 
 > [!IMPORTANT]
-> **总体定位**：本项目采用 **双包分层架构（`@detent/core` + `@detent/delivery`）**：
-> 1. **`@detent/core`（通用基础架构包）**：将配置的 GitLab CE v18.3.0 **工作区仓库（Workspace Hub Repo）** 打造为 100% 无状态、多项目、纯增量 MySQL 持久化的 Claude Code 会话中枢（`1 GitLab Issue = 1 Claude Code Session`，解耦 `0..N` 个跨项目 Worktree 与 `0..N` 个 MR，支持双层审批与零本地磁盘依赖）。**保持零业务耦合，可独立复用或开源。**
-> 2. **`@detent/delivery`（受治理 AI 变更交付中枢拓展模块）**：基于 `@detent/core` 的标准扩展点构建，面向生产环境变更与基础设施交付，打通 **`GitLab Issue 变更工单 → JumpServer 只读账号巡检 → Ansible/配置提 MR 人工合并自动续跑 → 执行前人工二次审批 → JumpServer 任务中心下发 Ansible 执行与审计`** 的全合规交付闭环。
+> **总体定位**：本项目采用 **双包分层架构（`@detent/core` + `@detent/delivery`）**，并在 V3 演进为 **“硬安全边界由代码兜底 + 软交付流程由 Hub 仓库 SOP 驱动 + 运维能力包可空可插拔”**：
+> 1. **`@detent/core`（通用基础架构包）**：将配置的 GitLab CE v18.3.0 **工作区仓库（Workspace Hub Repo）** 打造为 100% 无状态、多项目、纯增量 MySQL 持久化的 Claude Code 会话中枢（`1 GitLab Issue = 1 Claude Code Session`，解耦 `0..N` 个跨项目 Worktree 与 `0..N` 个 MR，支持双层审批、Hub `workflows/*.md` SOP 加载、可空能力包预检与通用 GitLab Release 原子工具）。**保持零业务耦合，可独立复用或开源。**
+> 2. **`@detent/delivery`（受治理 AI 变更交付中枢拓展模块）**：基于 `@detent/core` 的标准扩展点构建，将 JumpServer + Ansible 封装为**可选/可空能力包（`jumpserver`）**，并随 Hub 模板预置开箱即用的标准交付 SOP（`release` / `env-change` / `code-delivery` / `audit`）。客户可直接编辑 Hub 仓库 Markdown 定制流程，无需 JumpServer 也可独立运行发版与代码交付，或接入自有执行 MCP。
 
 ---
 
@@ -324,3 +324,94 @@ erDiagram
 ```
 
 `delivery_executions` 使用 InnoDB，与 Core 外键使用相同的 `utf8mb4_bin` 排序规则。共享池初始化完成后登记提交时的角色、目标资产、Playbook 和合并 SHA。`(session_id, jumpserver_job_id)` 唯一标识会话中的任务，`(session_id, created_at)` 支持按时间列出审计记录。结果查询保存状态与摘要，首次进入 SUCCESS 或 FAILED 时保存毫秒级完成时间。`/status` 在 MR 摘要和待审批行之间显示执行记录、审批单 ID 和 JumpServer 详情链接。
+
+---
+
+## 五、 V3 架构演进：Hub 仓库 SOP 驱动与可空能力包（方案 A）
+
+### 5.1 设计动机与核心边界
+
+企业交付流程千差万别（例如发版策略可能是“合并 `main` 后直接打 tag”，也可能是“拉 `release/vX.Y` 改版本号再合并打 tag”；运维执行面可能是 JumpServer + Ansible，也可能是纯 GitLab CI / ArgoCD / 自研发布平台）。V3 将 **“硬安全门禁”** 与 **“软业务流程”** 彻底解耦：
+
+| 层次 | 承载位置 | 职责边界 | 变更方式 |
+| :--- | :--- | :--- | :--- |
+| **Layer 3：软交付流程（SOP）** | **GitLab Hub 仓库**（`CLAUDE.md`、`workflows/*.md`、`.gitlab/issue_templates/*.md`） | 分支/Tag 策略、前后置检查清单、MR 编排步骤、回滚与报告格式、自定义新流程（如 `hotfix.md`） | 客户直接编辑 Hub 仓库 Markdown 并合并到受保护默认分支，**下一轮立即生效、零发版、自带 Git Review 审计** |
+| **Layer 2：可空能力包（Capability Packs）** | `@detent/core`（`gitlab-release`）+ `@detent/delivery`（`jumpserver`）+ 用户扩展（`capabilities`） | 封装外部系统原子工具及其**工具级硬守卫**；**所有非基础能力均可空**，未配置即不注册，不向未启用客户暴露无关提示词 | 通过环境变量按需开启，或通过 `DetentCapabilityPack` 接入自有工具 |
+| **Layer 1：硬治理底座** | `@detent/core` 编排器与 `PermissionGate` | 无状态 Pod、MySQL 增量持久化、Plan 门禁、`always_approve` 审批卡、RBAC 审批人校验、能力/SOP 缺失预检与 Issue 提示、Hub 治理文件写保护 | 平台代码保障，**不可被 Markdown SOP 弱化或绕过** |
+
+### 5.2 Hub 仓库标准目录与 `workflows/*.md` 契约
+
+```text
+workspace-hub/
+├── CLAUDE.md                         # 全局上下文：团队仓库清单、环境/资产表、通用约定
+├── workflows/                        # 每个 Markdown 文件定义一种可定制交付流程
+│   ├── release.md                    # 标准发版 SOP（requires: [gitlab-release]）
+│   ├── env-change.md                 # 标准生产环境变更 SOP（requires: [jumpserver]）
+│   ├── code-delivery.md              # 标准跨项目研发交付 SOP（requires: []）
+│   └── audit.md                      # 标准只读巡检排障 SOP（requires: [jumpserver]）
+└── .gitlab/
+    └── issue_templates/              # GitLab 原生开单模板（下拉选流程并自动打标签）
+        ├── release.md
+        ├── env-change.md
+        ├── code-delivery.md
+        └── audit.md
+```
+
+每个 `workflows/<name>.md` 采用 **极简 YAML Frontmatter（仅声明路由、安全档位与能力依赖）+ 纯自然语言 Markdown 正文（不引入重型 DSL 引擎）**：
+
+```markdown
+---
+label: delivery::release          # 触发该 SOP 的 GitLab Issue 标签（忽略大小写）
+mode: governed                    # readonly（纯只读直接出报告）| governed（走 Plan 审批与写/执行阶段）
+requires: [gitlab-release]        # 所需能力包清单；纯代码/GitOps 写 []
+approver_tier: prod               # standard（普通审批门槛）| prod（生产审批人名单 / Maintainer 门槛）
+default: false                    # 可选：是否作为无标签 Issue 的默认兜底流程（默认 false）
+description: 标准仓库发版流程
+---
+
+# 标准发版流程（客户可按团队规范直接修改正文）
+...
+```
+
+> [!IMPORTANT]
+> **安全不变量（SOP 不可越权）**：
+> 1. `EphemeralSandbox` 将 Hub 仓库的 `CLAUDE.md`、`.claude/` 与 `workflows/` 拷入沙箱后，`PermissionGate` **严禁编码 Agent 写入 `CLAUDE.md` 或 `workflows/`**，仅允许修改 `projects/` 下的业务仓库。
+> 2. `mode: readonly` 强制锁定 SDK `plan` 模式、禁用 `Edit`/`Write`/`Bash` 及一切非 `readonly` 工具，无法通过其他字段放宽。
+> 3. **高危工具权限不可被 SOP 降级**：诸如 `jms_run_ansible_job`、`detent_create_release` 等代码定义的生产级工具，即使 SOP 误写 `approver_tier: standard` 或审批期间被更换 Issue 标签，审批时必须重新确认当前流程已就绪、非只读且启用该工具，再校验生产审批人。
+> 4. `approver_tier: prod` 对流程内的所有 `TOOL_USE` 审批生效。Plan 审批使用普通项目权限。
+
+### 5.3 核心扩展契约演进（`@detent/core` 零业务污染）
+
+1. **可空能力包契约（`DetentCapabilityPack`）**：
+   ```ts
+   export interface DetentCapabilityPack {
+     /** 能力包标识，对应 workflows/*.md frontmatter 的 requires 项 */
+     name: string;
+     /** 能力未启用时展示在 GitLab Issue 引导卡片中的配置提示 */
+     setupHint?: string;
+     /** true 表示服务端已就绪可用；false 表示当前未配置（工具不注册） */
+     enabled: boolean;
+     /** 能力包提供的受治理扩展工具（enabled 为 false 时忽略） */
+     tools: readonly AnyDetentExtensionTool[];
+   }
+   ```
+   - `gitlab-workspace`（基础分支/提交/MR/Pipeline）始终内置可用。
+   - `gitlab-release`（`@detent/core` 内置可选能力包）：
+     - `detent_list_tags`（`policy: 'readonly'`）：列出目标仓库已有 tag 与对应 commit SHA，辅助生成 Release Notes 与版本规划。
+     - `detent_create_release`（`policy: 'always_approve'`）：支持创建 Git Tag + GitLab Release（或 `tag_only: true` 仅打 Tag）。**硬守卫**：校验 tag 名格式合法、目标 `commit_sha` 为完整 40 位有效提交且存在于目标仓库、该 tag 尚未存在、（可配置）对应提交最新流水线非 `failed`。审批卡明确锁定 **目标仓库、Tag 名、40 位 Commit SHA、模式与 Release Notes 摘要**，人工确认 👍 后执行。
+   - `jumpserver`（`@detent/delivery` 可选/可空能力包）：仅当配置 `JUMPSERVER_BASE_URL` 或注入 `jumpserverClient` 时 `enabled: true`；未配置时 `enabled: false` 并携带 `setupHint`，**零 JumpServer 配置即可完整运行 `start:delivery`、Release 与代码交付**。
+   - 用户自有扩展：可通过 `createDetentApp / createDeliveryApp` 的 `capabilities` 注册自定义能力包（如 `{ name: 'argocd', enabled: true, tools: [...] }`），并在 Hub `workflows/*.md` 中通过 `requires: [argocd]` 引用。
+
+2. **轮次预检短路（`TurnProfile.blockedMessage`）**：
+   - `TurnProfile` 新增可选字段 `blockedMessage?: string`。
+   - `TurnProfileResolver` 上下文的 `gitlab` 同步开放 `listRepositoryTree` 与 `getRepositoryFile`（只读读取 Hub 仓库默认分支，保证无状态 Pod 跨轮次、跨审批回调都能一致解析 `workflows/*.md`，禁止 Pod 内存缓存业务状态）。
+   - `SessionOrchestrator.run()` 在解析 `profile` 后、**克隆沙箱与调用 Claude 之前**检测 `profile.blockedMessage`：若存在则直接将引导说明发布到 Issue 评论、置状态为 `IDLE`（保留原 `permissionMode` 以便用户补齐配置或打标签后无缝继续）并结束本轮，**零 Token 消耗、不让 AI 盲猜报错**。
+
+3. **逻辑/能力缺失时的 Issue 友好引导（4 种场景）**：
+   - **场景 1（SOP 依赖的能力包未启用 / 为空）**：例如命中 `workflows/env-change.md`（`requires: [jumpserver]`）但未配置 JumpServer → 直接在 Issue 提示缺失能力名 + `setupHint`，并列出两条可操作路径（补齐服务端配置，或编辑 Hub 对应 `workflows/*.md` 改写流程 / 切换为当前可用的其他工作流标签）。
+   - **场景 2（Issue 未匹配到任何 SOP）**：Hub 仓库存在 `workflows/`，但 Issue 无匹配标签且无 `default: true` 流程 → 直接在 Issue 列出 Hub 当前全部可用流程（标签、文件、说明），指导用户加标签或新增 `workflows/<name>.md`。
+   - **场景 3（多条冲突流程标签同时命中）**：同一 Issue 同时打了多个非只读流程标签（如同时打 `delivery::release` 与 `delivery::env-change`）→ 在 Issue 提示仅保留一个目标流程标签，避免歧义。
+   - **场景 4（老 Hub 仓库尚无 `workflows/` 目录）**：平滑兼容回退——仅启用服务端实际已配置的能力包，按 `CLAUDE.md` 工作（若无 `jumpserver` 能力则绝不注入 JumpServer/Ansible 提示词）。
+
+4. **初始化脚本非破坏性预置（`scripts/bootstrap.ts`）**：
+   - `npm run bootstrap` 自动将 `examples/hub-workspace/` 下的 `CLAUDE.md`、`workflows/*.md` 及 `.gitlab/issue_templates/*.md` 幂等写入 Hub 仓库默认分支（**文件已存在则跳过，绝不覆盖客户自定义修改**），并自动创建 `delivery::release` 标签。

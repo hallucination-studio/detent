@@ -28,6 +28,24 @@ interface Pipeline {
   ref: string;
   status: string;
 }
+interface TreeEntry {
+  id: string;
+  name: string;
+  type: 'blob' | 'tree';
+  path: string;
+}
+interface Tag {
+  name: string;
+  message: string | null;
+  commit: { id: string; title?: string };
+}
+interface Release {
+  tag_name: string;
+  name: string;
+  description: string;
+  commit?: { id: string };
+  _links?: { self?: string };
+}
 const labels: Record<SessionStatus, string> = {
   PLANNING: 'claude::planning',
   WAITING_PLAN: 'claude::waiting-approval',
@@ -40,6 +58,14 @@ export const redactGitUrl = (text: string) => text.replace(/(https?:\/\/oauth2:)
 class GitLabError extends Error {
   constructor(readonly status: number) {
     super('GitLab HTTP ' + status);
+  }
+}
+async function onNotFound<T, F>(request: Promise<T>, fallback: F): Promise<T | F> {
+  try {
+    return await request;
+  } catch (error) {
+    if (error instanceof GitLabError && error.status === 404) return fallback;
+    throw error;
   }
 }
 export class GitLabClient {
@@ -118,6 +144,35 @@ export class GitLabClient {
   }
   listProjects(search = '') {
     return this.pages<Project>('/projects', { membership: 'true', search });
+  }
+  listRepositoryTree(project: number, dirPath: string, ref: string): Promise<TreeEntry[]> {
+    return onNotFound(this.pages<TreeEntry>(this.project(project) + '/repository/tree', { path: dirPath, ref }), []);
+  }
+  async getRepositoryFile(project: number, filePath: string, ref: string) {
+    const path = this.project(project) + '/repository/files/' + encodeURIComponent(filePath);
+    const file = await onNotFound(this.json<{ content: string }>(path + '?ref=' + encodeURIComponent(ref)), null);
+    return file && Buffer.from(file.content, 'base64').toString('utf8');
+  }
+  listTags(project: number, search?: string) {
+    const query = new URLSearchParams({ per_page: '100' });
+    if (search) query.set('search', search);
+    return this.json<Tag[]>(this.project(project) + '/repository/tags?' + query);
+  }
+  getTag(project: number, tagName: string) {
+    return onNotFound(this.json<Tag>(this.project(project) + '/repository/tags/' + encodeURIComponent(tagName)), null);
+  }
+  getCommit(project: number, sha: string) {
+    const path = this.project(project) + '/repository/commits/' + encodeURIComponent(sha);
+    return onNotFound(this.json<{ id: string; title: string }>(path), null);
+  }
+  listPipelinesBySha(project: number, sha: string) {
+    return this.json<Pipeline[]>(this.project(project) + '/pipelines?sha=' + encodeURIComponent(sha));
+  }
+  createTag(project: number, input: { tag_name: string; ref: string; message?: string }) {
+    return this.json<Tag>(this.project(project) + '/repository/tags', 'POST', input);
+  }
+  createRelease(project: number, input: { tag_name: string; ref: string; name?: string; description?: string }) {
+    return this.json<Release>(this.project(project) + '/releases', 'POST', input);
   }
   async createMergeRequest(
     p: number,

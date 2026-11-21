@@ -25,7 +25,9 @@ it('dispatches an authenticated extension event with access to the core orchestr
     expect(pool.query).toHaveBeenCalledWith(expect.stringContaining('CREATE TABLE IF NOT EXISTS delivery_executions'));
     await sharedPool.query('CREATE TABLE IF NOT EXISTS sample (id INT)');
   });
-  const app = createDeliveryApp(loadConfig({ GITLAB_WEBHOOK_SECRET: 'test' }), { matchWebhookEvent, onInitSchema });
+  const app = createDeliveryApp(loadConfig({ GITLAB_WEBHOOK_SECRET: 'test' }), {
+    deliveryConfig: loadDeliveryConfig({}), matchWebhookEvent, onInitSchema,
+  });
   const post = (payload: object, token = 'test') => app.inject({
     method: 'POST', url: '/webhooks/gitlab', headers: { 'x-gitlab-token': token }, payload,
   });
@@ -60,11 +62,36 @@ it.each(['injected', 'http', 'disabled'] as const)('assembles %s tools alongside
     listAssets: vi.fn(), runReadonlyInspect: vi.fn(), runAnsibleJob: vi.fn(), getJobResult: vi.fn(),
   };
   const custom = defineExtensionTool({ name: 'custom', description: 'test', policy: 'readonly', schema: {}, execute: vi.fn() });
-  const app = createDeliveryApp(config, { deliveryConfig, jumpserverClient: mode === 'injected' ? client : undefined, tools: [custom] });
+  const tools = [custom];
+  const customPack = { name: 'deploy', enabled: true, tools: [] };
+  const app = createDeliveryApp(config, { deliveryConfig, jumpserverClient: mode === 'injected' ? client : undefined,
+    tools, capabilities: [customPack] });
   try {
-    const registered = vi.mocked(createDetentApp).mock.lastCall![1]!.tools!;
-    expect(registered.map(tool => tool.name)).toEqual(mode === 'disabled' ? ['custom'] :
-      ['jms_list_assets', 'jms_readonly_inspect', 'jms_run_ansible_job', 'jms_get_job_result', 'custom']);
+    const extensions = vi.mocked(createDetentApp).mock.lastCall![1]!;
+    expect(extensions.tools).toBe(tools);
+    const [release, jumpserver, deploy] = extensions.capabilities!;
+    expect(deploy).toBe(customPack);
+    expect(release).toMatchObject({ name: 'gitlab-release', enabled: true });
+    expect(release.tools.map(tool => tool.name)).toEqual(['detent_list_tags', 'detent_create_release']);
+    expect(jumpserver).toMatchObject({ name: 'jumpserver', enabled: mode !== 'disabled', setupHint: expect.stringContaining('JUMPSERVER_BASE_URL') });
+    expect(jumpserver.tools.map(tool => tool.name)).toEqual(mode === 'disabled' ? [] :
+      ['jms_list_assets', 'jms_readonly_inspect', 'jms_run_ansible_job', 'jms_get_job_result']);
+  } finally {
+    await app.close();
+  }
+});
+
+it.each(['false', ' 0 '])('disables release tools with %s and lets a caller replace a named pack', async value => {
+  const replacement = { name: ' JumpServer ', enabled: true, tools: [] };
+  const app = createDeliveryApp(loadConfig({ GITLAB_WEBHOOK_SECRET: 'test' }), {
+    deliveryConfig: loadDeliveryConfig({ DELIVERY_ENABLE_RELEASE_TOOLS: value }), capabilities: [replacement],
+  });
+  try {
+    const { capabilities } = vi.mocked(createDetentApp).mock.lastCall![1]!;
+    expect(capabilities).toEqual([
+      { name: 'gitlab-release', enabled: false, tools: [], setupHint: expect.stringContaining('DELIVERY_ENABLE_RELEASE_TOOLS=false') },
+      replacement,
+    ]);
   } finally {
     await app.close();
   }
@@ -81,7 +108,8 @@ it.each(['default', 'audit tracker', 'tracker only'] as const)('composes /status
   const listSessionExecutions = vi.fn(async () => [record]);
   const renderStatusExtra = vi.fn(async () => 'Caller section');
   const tracker = { recordExecution: vi.fn(), hasSessionJob: vi.fn() };
-  const executionTracker = mode === 'default' ? undefined : mode === 'audit tracker' ? { ...tracker, listSessionExecutions } : tracker;
+  const injected = mode === 'audit tracker' ? { ...tracker, listSessionExecutions } : tracker;
+  const executionTracker = mode === 'default' ? undefined : injected;
   vi.stubGlobal('fetch', vi.fn(async () => Response.json({ id: 99, username: 'bot' })));
   const app = createDeliveryApp(loadConfig({ GITLAB_WEBHOOK_SECRET: 'test' }), { executionTracker, renderStatusExtra });
   const extensions = vi.mocked(createDetentApp).mock.lastCall![1]!;
@@ -102,5 +130,35 @@ it.each(['default', 'audit tracker', 'tracker only'] as const)('composes /status
   } finally {
     await app.close();
     vi.unstubAllGlobals();
+  }
+});
+
+it('uses the injected release client and enforces production permissions on caller-selected profiles', async () => {
+  const gitlabClient = {
+    getProject: vi.fn().mockResolvedValue({ id: 7 }), listTags: vi.fn().mockResolvedValue([]), getCommit: vi.fn(),
+    getTag: vi.fn(), listPipelinesBySha: vi.fn(), createTag: vi.fn(), createRelease: vi.fn(),
+  };
+  const name = 'detent_create_release';
+  const profile = { readonly: false, enabledExtensionTools: [name], canApprove: vi.fn(async () => true) };
+  const app = createDeliveryApp(loadConfig({ GITLAB_WEBHOOK_SECRET: 'test' }), {
+    deliveryConfig: loadDeliveryConfig({ DELIVERY_PROD_APPROVERS: 'ops' }), gitlabClient, resolveTurnProfile: () => profile,
+  });
+  try {
+    const extensions = vi.mocked(createDetentApp).mock.lastCall![1]!;
+    const repo = new InMemoryDetentRepository();
+    const session = await repo.getOrCreateSession(1, 88, 'release');
+    const tagTool = extensions.capabilities!.find(pack => pack.name === 'gitlab-release')!.tools.find(tool => tool.name === 'detent_list_tags')!;
+    await tagTool.execute({ project: 'apps/web' }, { session, repo, workspaceRoot: '.', permissionMode: 'plan' });
+    expect(gitlabClient.listTags).toHaveBeenCalledWith(7, undefined);
+
+    const gitlab = { getIssue: vi.fn(), hasApprovalPermission: vi.fn(async () => true) };
+    const current = await extensions.resolveTurnProfile!({ session, repo, gitlab });
+    const params = { projectId: 1, userId: 7, username: 'dev', approvalType: 'TOOL_USE' as const, toolName: name };
+    expect(await current.canApprove!(params)).toBe(false);
+    expect(await current.canApprove!({ ...params, username: 'ops' })).toBe(true);
+    profile.canApprove.mockResolvedValue(false);
+    expect(await current.canApprove!({ ...params, username: 'ops' })).toBe(false);
+  } finally {
+    await app.close();
   }
 });

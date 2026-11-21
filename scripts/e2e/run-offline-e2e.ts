@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parseEnv, promisify } from 'node:util';
 import mysql, { type RowDataPacket } from 'mysql2/promise';
-import { offlineAnthropic } from './offline-anthropic.js';
+import { createOfflineAnthropic } from './offline-anthropic.js';
 import { offlineGitLab } from './offline-gitlab.js';
 import { offlineJumpServer } from './offline-jumpserver.js';
 
@@ -86,7 +86,8 @@ async function main() {
     const gitlab = offlineGitLab(tmp), jms = offlineJumpServer();
     const gitUrl = await serve(gitlab.handle);
     const jmsUrl = await serve(jms.handle);
-    const anthropicUrl = await serve(offlineAnthropic);
+    const anthropic = createOfflineAnthropic();
+    const anthropicUrl = await serve(anthropic.handle);
     const env = process.env;
     const external = env.E2E_MYSQL_HOST;
     const host = external || loopback;
@@ -120,19 +121,16 @@ async function main() {
     const publicUrl = 'http://' + loopback + ':' + podPort;
     const sandbox = join(tmp, 'sandboxes'), envFile = join(tmp, '.env');
     const localEnv = { PATH: env.PATH, HOME: tmp, TMPDIR: tmp };
-    const provision = () => run(join(process.cwd(), 'node_modules/.bin/tsx'), ['scripts/bootstrap.ts', '--env-out', envFile], {
+    const provision = (extra: Record<string, string> = {}) => run(join(process.cwd(), 'node_modules/.bin/tsx'), ['scripts/bootstrap.ts', '--env-out', envFile], {
       env: { ...localEnv, GITLAB_BASE_URL: gitUrl, GITLAB_ADMIN_TOKEN: gitlab.admin, DETENT_PUBLIC_URL: publicUrl,
-        DETENT_TARGET_PROJECTS: 'ops/ansible-infra', DETENT_HUB_MEMBERS: 'dev:30,sre:40',
+        DETENT_TARGET_PROJECTS: 'apps/web,ops/ansible-infra', DETENT_HUB_MEMBERS: 'dev:30,sre:40',
         HOST: loopback, PORT: String(podPort), EPHEMERAL_ROOT: sandbox, MYSQL_HOST: host, MYSQL_PORT: String(port),
         MYSQL_USER: user, MYSQL_PASSWORD: password, MYSQL_DATABASE: database, ANTHROPIC_API_KEY: 'offline-api-key',
-        ANTHROPIC_BASE_URL: anthropicUrl, JUMPSERVER_BASE_URL: jmsUrl, JUMPSERVER_READONLY_TOKEN: jms.readonly,
-        JUMPSERVER_JOB_TOKEN: jms.job },
+        ANTHROPIC_BASE_URL: anthropicUrl, ...extra },
       timeout: 60000,
     });
     await provision();
     const config = parseEnv(await readFile(envFile, 'utf8'));
-    await provision();
-    assert.deepEqual(parseEnv(await readFile(envFile, 'utf8')), config, 'Bootstrap rotated credentials on rerun');
     assert.equal((await stat(envFile)).mode & 0o777, 0o600);
     assert.equal(config.GITLAB_ADMIN_TOKEN, undefined);
     const hub = Number(config.GITLAB_HUB_PROJECT_ID);
@@ -142,24 +140,41 @@ async function main() {
       return res.json();
     }
     const projects: { id: number; path_with_namespace: string }[] = await gitlabGet('/projects');
-    assert.equal(projects.length, 2);
+    assert.equal(projects.length, 3);
     assert.equal(projects.find(p => p.id === hub)?.path_with_namespace, 'ai/workspace-hub');
     const target = projects.find(p => p.path_with_namespace === 'ops/ansible-infra')!;
-    const file = await gitlabGet('/projects/' + hub + '/repository/files/CLAUDE.md?ref=main');
-    assert.deepEqual(Buffer.from(file.content, 'base64'), await readFile('examples/hub-workspace/CLAUDE.md'));
+    const web = projects.find(p => p.path_with_namespace === 'apps/web')!;
+    const releasePath = 'workflows/release.md';
+    async function hubFile(path: string) {
+      const file = await gitlabGet('/projects/' + hub + '/repository/files/' + encodeURIComponent(path) + '?ref=main');
+      return Buffer.from(file.content, 'base64').toString();
+    }
+    const templates = ['CLAUDE.md'];
+    for (const name of ['audit', 'code-delivery', 'env-change', 'release'])
+      templates.push('workflows/' + name + '.md', '.gitlab/issue_templates/' + name + '.md');
+    for (const path of templates)
+      assert.equal(await hubFile(path), await readFile(join('examples/hub-workspace', path), 'utf8'), path);
+
+    const savedSop = await hubFile(releasePath) + '\nInclude the change ticket in release notes.\n';
+    await gitlab.updateFile(hub, releasePath, savedSop, 'Document team release notes');
+    const jmsEnv = { JUMPSERVER_BASE_URL: jmsUrl, JUMPSERVER_READONLY_TOKEN: jms.readonly, JUMPSERVER_JOB_TOKEN: jms.job };
+    await provision(jmsEnv);
+    const withJms = parseEnv(await readFile(envFile, 'utf8'));
+    assert.deepEqual({ ...withJms }, { ...config, ...jmsEnv }, 'Bootstrap changed existing settings or credentials');
+    assert.equal(await hubFile(releasePath), savedSop, 'Bootstrap overwrote the customer workflow');
     const labels: { name: string }[] = await gitlabGet('/projects/' + hub + '/labels');
     assert.deepEqual(labels.map(l => l.name).sort(), ['claude::coding', 'claude::failed', 'claude::idle', 'claude::planning',
-      'claude::waiting-approval', 'delivery::audit', 'delivery::code', 'delivery::env-change']);
+      'claude::waiting-approval', 'delivery::audit', 'delivery::code', 'delivery::env-change', 'delivery::release']);
     for (const p of projects) {
       const hooks = await gitlabGet('/projects/' + p.id + '/hooks');
       assert.equal(hooks.length, 1);
       assert.equal(hooks[0].url, publicUrl + '/webhooks/gitlab');
-      assert.equal(hooks[0].pipeline_events, p.id === target.id);
+      assert.equal(hooks[0].pipeline_events, p.id !== hub);
       assert.equal(hooks[0].push_events, false);
     }
-    async function startPod(id: string) {
-      pod = spawn(process.execPath, ['--env-file=' + envFile, 'packages/delivery/dist/server.js'], {
-        env: { ...localEnv, POD_ID: id }, stdio: ['ignore', 'inherit', 'inherit'], detached: true,
+    async function startPod(id: string, settings: NodeJS.ProcessEnv) {
+      pod = spawn(process.execPath, ['packages/delivery/dist/server.js'], {
+        env: { ...localEnv, ...settings, POD_ID: id }, stdio: ['ignore', 'inherit', 'inherit'], detached: true,
       });
       pod.on('error', error => { failure = error; });
       await until(id + ' health check', async () => {
@@ -168,17 +183,18 @@ async function main() {
       });
     }
     await close(reservation);
-    const session = async () => (await rows('SELECT * FROM issue_sessions WHERE hub_project_id=? AND hub_issue_iid=1', [hub]))[0];
-    let ownsIssue = false;
+    const fixtures = () => rows('SELECT id FROM issue_sessions WHERE hub_project_id=? AND hub_issue_iid BETWEEN 1 AND 4', [hub]);
+    let ownsIssues = false;
     if (external) cleanup.push(async () => {
-      const fixture = ownsIssue && await session();
-      if (!fixture) return;
+      if (!ownsIssues) return;
       const cx = await db.getConnection();
       try {
         await cx.beginTransaction();
-        for (const table of ['delivery_executions', 'approval_requests', 'session_merge_requests', 'session_worktrees', 'session_messages'])
-          await cx.query('DELETE FROM ' + table + ' WHERE session_id=?', [fixture.id]);
-        await cx.query('DELETE FROM issue_sessions WHERE id=?', [fixture.id]);
+        for (const fixture of await fixtures()) {
+          for (const table of ['delivery_executions', 'approval_requests', 'session_merge_requests', 'session_worktrees', 'session_messages'])
+            await cx.query('DELETE FROM ' + table + ' WHERE session_id=?', [fixture.id]);
+          await cx.query('DELETE FROM issue_sessions WHERE id=?', [fixture.id]);
+        }
         await cx.commit();
       } catch (error) {
         await cx.rollback();
@@ -186,18 +202,83 @@ async function main() {
       } finally { cx.release(); }
     });
     cleanup.push(stopPod);
-    await startPod('detent-pod-1');
-    assert.ok(!await session(), 'Fixture issue already exists');
-    async function state(status: string, released = true) {
-      return until(status, async () => {
-        const s = await session();
-        if (s?.status === 'FAILED') throw Error('Delivery failed: ' + [...gitlab.notes.values()].at(-1));
-        if (s?.status === status && (!released || !s.locked_by_pod)) return s;
+    const noJms = Object.fromEntries(Object.entries(config).filter(([key]) => !key.startsWith('JUMPSERVER_')));
+    await startPod('detent-pod-nojms', noJms);
+    assert.deepEqual(await fixtures(), [], 'Fixture Issues already exist');
+    ownsIssues = true;
+    async function state(iid: number, status: string) {
+      return until('#' + iid + ' ' + status, async () => {
+        const [s] = await rows('SELECT * FROM issue_sessions WHERE hub_project_id=? AND hub_issue_iid=?', [hub, iid]);
+        if (s?.status === 'FAILED') throw Error('Delivery failed: ' + gitlab.issueNotes(iid).at(-1));
+        if (s?.status === status && (status === 'WAITING_TOOL' || !s.locked_by_pod)) return s;
       });
     }
-    ownsIssue = true;
-    await gitlab.openIssue(hub);
-    const first = await state('WAITING_PLAN');
+
+    async function rejectDeveloper(iid: number, approval: RowDataPacket) {
+      gitlab.membershipChecks.length = 0;
+      await gitlab.awardEmoji(iid, approval.gitlab_note_id, 'dev');
+      await until('developer RBAC lookup', () => gitlab.membershipChecks.includes(hub + '/2'));
+      assert.equal((await rows('SELECT status FROM approval_requests WHERE id=?', [approval.id]))[0].status, 'PENDING');
+    }
+
+    anthropic.resetRequests();
+    const unlabeled = await gitlab.openIssue(hub, { title: 'Choose a workflow', description: '', labels: [] });
+    await state(unlabeled, 'IDLE');
+    assert.equal(anthropic.getRequests(), 0);
+    const [menu] = gitlab.issueNotes(unlabeled);
+    assert.match(menu, /delivery::audit\b/);
+    assert.match(menu, /delivery::env-change .*缺少能力包：jumpserver/);
+    assert.match(menu, /delivery::release .*已就绪/);
+    assert.match(menu, /delivery::code .*已就绪/);
+    const missing = await gitlab.openIssue(hub, { title: 'Inspect web01', description: '', labels: ['delivery::env-change'] });
+    await state(missing, 'IDLE');
+    assert.equal(anthropic.getRequests(), 0);
+    const [guidance] = gitlab.issueNotes(missing);
+    assert.match(guidance, /jumpserver：.*JUMPSERVER_BASE_URL/);
+    const alternatives = guidance.split('\n').find(line => line.includes('已就绪的工作流标签')) ?? '';
+    for (const label of ['delivery::release', 'delivery::code']) assert.ok(alternatives.includes(label));
+    console.log('Workflow menu and missing-capability guidance posted with zero Anthropic requests.');
+
+    const customReleaseWorkflow = [
+      '---', 'label: delivery::release', 'mode: governed', 'requires: [gitlab-release]', 'approver_tier: prod', '---',
+      'CUSTOM_RELEASE_TAG_PREFIX: rel-', 'List existing tags, then request approval to publish the pinned commit.', '',
+    ].join('\n');
+    await gitlab.updateFile(hub, releasePath, customReleaseWorkflow, 'Customize release tag convention');
+    const webSha = gitlab.headSha(web.id);
+    assert.match(webSha, /^[a-f0-9]{40}$/);
+    const release = await gitlab.openIssue(hub, { title: 'Publish the web service', description: 'Release apps/web at ' + webSha,
+      labels: ['delivery::release'] });
+    const planned = await state(release, 'WAITING_PLAN');
+    const [releasePlan] = await rows('SELECT * FROM approval_requests WHERE session_id=? AND approval_type=?', [planned.id, 'PLAN']);
+    const planBody = gitlab.notes.get(releasePlan.gitlab_note_id)!.body;
+    for (const field of ['rel-1.0.0', webSha]) assert.ok(planBody.includes(field));
+    await gitlab.awardEmoji(release, releasePlan.gitlab_note_id, 'dev');
+    await state(release, 'WAITING_TOOL');
+    const [publish] = await rows('SELECT * FROM approval_requests WHERE session_id=? AND tool_name=?', [planned.id, 'detent_create_release']);
+    const releaseCard = gitlab.notes.get(publish.gitlab_note_id)!.body;
+    for (const field of ['GitLab 发布审批', 'apps/web', 'rel-1.0.0', webSha]) assert.ok(releaseCard.includes(field));
+    await rejectDeveloper(release, publish);
+    assert.equal(gitlab.tagCommit(web.id, 'rel-1.0.0'), undefined);
+    assert.deepEqual(gitlab.releases.get(web.id), []);
+    await gitlab.awardEmoji(release, publish.gitlab_note_id, 'sre');
+    await state(release, 'IDLE');
+    const [published] = await rows('SELECT status, decided_by FROM approval_requests WHERE id=?', [publish.id]);
+    assert.equal(published.status, 'APPROVED');
+    assert.equal(published.decided_by, 'sre');
+    assert.equal(gitlab.tagCommit(web.id, 'rel-1.0.0'), webSha);
+    assert.deepEqual(gitlab.releases.get(web.id), [{ tag_name: 'rel-1.0.0', name: 'Release rel-1.0.0',
+      description: 'Live customized release workflow verified.', commit: { id: webSha },
+      _links: { self: gitUrl + '/apps/web/-/releases/rel-1.0.0' } }]);
+    assert.ok(gitlab.issueNotes(release).some(note => note.includes('Release rel-1.0.0 published for apps/web.')));
+    assert.deepEqual(await readdir(sandbox), []);
+    console.log('Live Hub release SOP verified on the same pod. Maintainer approved the pinned tag and release.');
+
+    await stopPod();
+    await startPod('detent-pod-1', withJms);
+    const change = await gitlab.openIssue(hub, { title: 'Reload nginx on web01',
+      description: 'Prepare and verify a reviewed nginx reload.', labels: ['delivery::env-change'] });
+    assert.deepEqual([unlabeled, missing, release, change], [1, 2, 3, 4]);
+    const first = await state(change, 'WAITING_PLAN');
     const id = first.id;
     const records = (table: string) => rows('SELECT * FROM ' + table + ' WHERE session_id=?', [id]);
     const transcript = () => rows('SELECT seq, raw_json_line FROM session_messages WHERE session_id=? ORDER BY seq', [id]);
@@ -205,14 +286,14 @@ async function main() {
     assert.ok(prefix.length > 0 && prefix.length === first.last_message_seq);
     const [plan] = await records('approval_requests');
     assert.equal(plan.approval_type, 'PLAN');
-    assert.match(gitlab.notes.get(plan.gitlab_note_id)!, /Claude 实施方案审批/);
+    assert.match(gitlab.notes.get(plan.gitlab_note_id)!.body, /Claude 实施方案审批/);
     assert.equal(jms.inspections.length, 1);
     assert.deepEqual(await readdir(sandbox), []);
     console.log('Plan persisted. Restarting the delivery pod.');
     await stopPod();
-    await startPod('detent-pod-2');
-    await gitlab.awardEmoji(plan.gitlab_note_id, 'dev');
-    const coding = await state('IDLE');
+    await startPod('detent-pod-2', withJms);
+    await gitlab.awardEmoji(change, plan.gitlab_note_id, 'dev');
+    const coding = await state(change, 'IDLE');
     assert.equal(coding.claude_session_id, first.claude_session_id);
     assert.ok(coding.last_message_seq > first.last_message_seq);
     assert.ok((await transcript()).some(row => row.raw_json_line.includes('尚未合并')), 'Missing pre-merge rejection');
@@ -222,14 +303,14 @@ async function main() {
     assert.equal(mr.target_project_id, target.id);
     const [worktree] = await records('session_worktrees');
     assert.equal(worktree.id, mr.worktree_id);
-    assert.equal(worktree.branch_name, 'change/issue-1');
+    assert.equal(worktree.branch_name, 'change/issue-' + change);
     assert.equal((await records('approval_requests')).length, 1);
     assert.deepEqual(jms.uploads, []);
     assert.deepEqual(jms.executions, []);
     console.log('MR opened after restart. Premature execution denied.');
 
     const sha = await gitlab.mergeMergeRequest(target.id, 1);
-    const waiting = await state('WAITING_TOOL', false);
+    const waiting = await state(change, 'WAITING_TOOL');
     assert.match(waiting.locked_by_pod, /^detent-pod-2\//);
     const [merged] = await records('session_merge_requests');
     assert.equal(merged.merge_commit_sha, sha);
@@ -240,17 +321,14 @@ async function main() {
     assert.equal(approvals.length, 2);
     assert.equal(approvals.find(a => a.id === plan.id)?.decided_by, 'dev');
     const production = approvals.find(a => a.tool_name === 'jms_run_ansible_job')!;
-    const card = gitlab.notes.get(production.gitlab_note_id)!;
+    const card = gitlab.notes.get(production.gitlab_note_id)!.body;
     for (const field of ['生产变更执行审批', sha, 'web01', 'deploy/nginx-reload.yml', mr.mr_web_url]) assert.ok(card.includes(field));
-    gitlab.membershipChecks.length = 0;
-    await gitlab.awardEmoji(production.gitlab_note_id, 'dev');
-    await until('developer RBAC lookup', () => gitlab.membershipChecks.includes(hub + '/2'));
-    assert.equal((await rows('SELECT status FROM approval_requests WHERE id=?', [production.id]))[0].status, 'PENDING');
+    await rejectDeveloper(change, production);
     assert.deepEqual(jms.uploads, []);
     assert.deepEqual(jms.executions, []);
 
-    await gitlab.awardEmoji(production.gitlab_note_id, 'sre');
-    const final = await state('IDLE');
+    await gitlab.awardEmoji(change, production.gitlab_note_id, 'sre');
+    const final = await state(change, 'IDLE');
     assert.equal(final.claude_session_id, first.claude_session_id);
     const [decision] = await rows('SELECT * FROM approval_requests WHERE id=?', [production.id]);
     assert.equal(decision.decided_by, 'sre');
@@ -264,13 +342,14 @@ async function main() {
     assert.equal(audit.approval_id, production.id);
     assert.equal(audit.mr_id, mr.id);
     assert.equal(audit.commit_sha, sha);
+    assert.equal(audit.agent_profile, 'env-change');
     assert.equal(audit.status, 'SUCCESS');
     assert.match(audit.output_summary, /nginx reloaded/);
     assert.ok(audit.finished_at);
-    assert.ok([...gitlab.notes.values()].some(n => n.includes('Reload verified on web01')));
-    await gitlab.postNote('/status');
-    const status = await until('/status reply', () => [...gitlab.notes.values()].find(n => n.startsWith('IDLE\n')));
-    for (const field of ['ops/ansible-infra!1', 'merged @ ' + sha.slice(0, 8), '交付执行记录', 'EnvChangeAgent',
+    assert.ok(gitlab.issueNotes(change).some(n => n.includes('Reload verified on web01')));
+    await gitlab.postNote(change, '/status');
+    const status = await until('/status reply', () => gitlab.issueNotes(change).find(n => n.startsWith('IDLE\n')));
+    for (const field of ['ops/ansible-infra!1', 'merged @ ' + sha.slice(0, 8), '交付执行记录', 'env-change',
       'deploy/nginx-reload.yml', 'SUCCESS', audit.jumpserver_job_url, production.id]) assert.ok(status.includes(field));
     const history = await transcript();
     assert.deepEqual(history.slice(0, prefix.length), prefix);

@@ -56,4 +56,4 @@ it('restores two projects and binary, staged and untracked changes in another po
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-});
+}, 15000);

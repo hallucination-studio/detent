@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { JumpServerAuth } from './jumpserver/client.js';
 
 const list = (value: string) => value.split(',').map(item => item.trim()).filter(Boolean);
+const enabledByDefault = z.string().default('true').transform(value => !['false', '0'].includes(value.trim().toLowerCase()));
 const auth = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('signature'), accessKeyId: z.string().min(1), accessKeySecret: z.string().min(1) }),
   z.object({ kind: z.literal('bearer'), token: z.string().min(1) }),
@@ -20,7 +21,8 @@ const schema = z.object({
   prodApprovers: z.string().default('').transform(value => list(value.toLowerCase())),
   prodMinAccessLevel: z.coerce.number().int().positive().default(40),
   blockedAssets: z.string().default('').transform(list),
-  blockFailedPipeline: z.string().default('true').transform(value => !['false', '0'].includes(value.trim().toLowerCase())),
+  blockFailedPipeline: enabledByDefault,
+  enableReleaseTools: enabledByDefault,
 });
 
 export type DeliveryConfig = z.infer<typeof schema>;
@@ -50,6 +52,7 @@ export function loadDeliveryConfig(env: NodeJS.ProcessEnv = process.env): Delive
     prodMinAccessLevel: env.DELIVERY_PROD_MIN_ACCESS_LEVEL,
     blockedAssets: env.JUMPSERVER_BLOCKED_ASSETS,
     blockFailedPipeline: env.JUMPSERVER_BLOCK_FAILED_PIPELINE,
+    enableReleaseTools: env.DELIVERY_ENABLE_RELEASE_TOOLS,
   });
   assertSeparateCredentials(config);
   return config;

@@ -1,0 +1,156 @@
+import { it, expect, vi } from 'vitest';
+import { mkdtemp, realpath, appendFile, readFile, rm, symlink, link, mkdir, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { loadConfig } from '../src/config.js';
+import { InMemoryDetentRepository } from './memory-repository.js';
+import { PermissionGate, ColdHold } from '../src/claude/permission-gate.js';
+import { schemas } from '../src/workspace/mcp-tools.js';
+import { TranscriptHydrator, transcriptPath } from '../src/claude/transcript-hydrator.js';
+
+async function setup() {
+  const repo = new InMemoryDetentRepository();
+  const session = await repo.getOrCreateSession(1, 42, 'test');
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'detent-claude-')));
+  const gitlab = { createIssueNote: vi.fn(async () => ({ id: 20 })), syncIssueStatusLabel: vi.fn() };
+  const ctx = {
+    config: loadConfig({ HOT_HOLD_TIMEOUT_MS: '5000' }),
+    repo,
+    session,
+    workspaceRoot: root,
+    gitlab,
+    controller: new AbortController(),
+    checkpoint: vi.fn(),
+  };
+  return { root, repo, session, ctx, gate: new PermissionGate(ctx) };
+}
+it('hydrates exact lines and appends only new sequences, including repeated checkpoints', async () => {
+  const { repo, root, session } = await setup();
+  try {
+    session.claudeSessionId = 'session-1';
+    session.lastMessageSeq = 3;
+    const raw = (n: number) => JSON.stringify({ uuid: 'u' + n, type: 'assistant', n });
+    await repo.appendIncrementalMessages(
+      session.id,
+      [1, 2, 3].map((n) => ({ seq: n, messageType: 'assistant', messageUuid: 'u' + n, rawJsonLine: raw(n) })),
+    );
+    const spy = vi.spyOn(repo, 'appendIncrementalMessages');
+    const hydrator = new TranscriptHydrator(repo);
+    await hydrator.hydrateTranscriptToTmp(session, root, root);
+    const file = transcriptPath(root, root, session.claudeSessionId);
+    expect(await readFile(file, 'utf8')).toBe([1, 2, 3].map(raw).join('\n') + '\n');
+    await appendFile(file, [4, 5].map(raw).join('\n') + '\n');
+    for (let i = 0; i < 2; i++)
+      await hydrator.flushIncrementalTranscriptToMySql(session, root, root, session.claudeSessionId);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0][1].map((m) => m.seq)).toEqual([4, 5]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+it('allows configured Git queries and gates compound commands and side effects', async () => {
+  const { gate, root, session, ctx } = await setup();
+  try {
+    for (const command of [
+      'git status --ignored', 'git log -n 5', 'git diff HEAD~1', 'git diff -- src/claude',
+      'git branch', 'git branch --list', 'git branch -a -vv', 'git branch -r', 'git branch --remotes',
+      'git branch --show-current', 'git branch --all -v',
+    ])
+      expect(await gate.canUseTool('Bash', { command }), command).toMatchObject({ behavior: 'allow' });
+
+    const gated = [
+      'git branch -D main', 'git branch new-name', 'git branch -m old new', 'git diff --output file',
+      'git diff --output=file', 'git log --output=file', 'git status && pwd', 'git status; pwd',
+      'git status | cat', 'git status > file', 'git diff $(pwd)', 'git diff `pwd`', 'git status\npwd',
+      'git status-extra',
+    ];
+    for (const command of gated)
+      expect(await gate.preflight('Bash', { command }), command).toMatchObject({ behavior: 'deny' });
+    session.permissionMode = 'default';
+    for (const command of gated)
+      expect(await gate.preflight('Bash', { command }), command).toBe('ask');
+    ctx.config.safeBashPrefixes = ['npm test'];
+    expect(await gate.preflight('Bash', { command: 'npm test -- --watch=false' })).toMatchObject({ behavior: 'allow' });
+    expect(await gate.preflight('Bash', { command: 'git status' })).toBe('ask');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it('checks the existing path prefix and protects workspace metadata on writes', async () => {
+  const { gate, root, session } = await setup();
+  try {
+    await mkdir(path.join(root, 'src'));
+    await mkdir(path.join(root, '.git'));
+    await writeFile(path.join(root, 'src', 'file'), 'data');
+    await link(path.join(root, 'src', 'file'), path.join(root, 'hardlink'));
+    await symlink('src', path.join(root, 'inside'));
+    await symlink('.git', path.join(root, 'metadata'));
+    await symlink(path.dirname(root), path.join(root, 'outside'));
+    await symlink(path.join(path.dirname(root), 'missing-' + path.basename(root)), path.join(root, 'dangling'));
+
+    expect(await gate.canUseTool('Edit', { file_path: 'src/file' })).toMatchObject({ behavior: 'deny' });
+    session.permissionMode = 'default';
+    for (const tool of ['Read', 'Write']) {
+      for (const file_path of ['../secret', '~/.claude/settings.json', 'outside', 'outside/new/file', 'dangling', 'dangling/file'])
+        expect(await gate.canUseTool(tool, { file_path }), file_path).toMatchObject({ behavior: 'deny' });
+      for (const file_path of ['inside/file', 'inside/new/file', 'new/sub/file', 'hardlink'])
+        expect(await gate.canUseTool(tool, { file_path }), file_path).toMatchObject({ behavior: 'allow' });
+    }
+    for (const file_path of ['.git/config', '.claude/settings.json', 'src/.mcp.json', 'metadata/new/file']) {
+      expect(await gate.canUseTool('Write', { file_path }), file_path).toMatchObject({ behavior: 'deny' });
+      expect(await gate.canUseTool('Read', { file_path }), file_path).toMatchObject({ behavior: 'allow' });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+it('automatically allows every registered workspace tool after plan approval', async () => {
+  const { gate, session, ctx, root } = await setup();
+  try {
+    for (const name of ['detent_commit_and_push', 'detent_create_mr', 'detent_close_worktree'])
+      expect(await gate.preflight(name, {})).toMatchObject({ behavior: 'deny' });
+
+    for (const name of ['detent_list_projects', 'detent_checkout_worktree', 'detent_get_pipeline_status', 'detent_get_pipeline_job_log'])
+      expect(await gate.preflight(name, {})).toMatchObject({ behavior: 'allow' });
+    session.permissionMode = 'default';
+    for (const name of Object.keys(schemas))
+      expect(await gate.canUseTool('mcp__detent__' + name, {})).toMatchObject({ behavior: 'allow' });
+    expect(await gate.preflight('detent_unknown', {})).toMatchObject({ behavior: 'deny' });
+    expect(ctx.gitlab.createIssueNote).not.toHaveBeenCalled();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+it.each(['APPROVED', 'REJECTED'] as const)('persists and wakes a hot tool approval %s', async (status) => {
+  const { repo, session, ctx, gate, root } = await setup();
+  try {
+    session.permissionMode = 'default';
+    const promise = gate.canUseTool('Bash', { command: 'npm install ioredis' });
+    await vi.waitFor(() => expect(ctx.gitlab.createIssueNote).toHaveBeenCalledOnce());
+    expect(ctx.checkpoint).toHaveBeenCalledOnce();
+    expect(await repo.getApprovalByNoteId(session.id, 20)).toMatchObject({
+      status: 'PENDING',
+      approvalType: 'TOOL_USE',
+    });
+    await gate.resolvePendingApproval(status, 'dev', 'because');
+    expect(await promise).toMatchObject(
+      status === 'APPROVED' ? { behavior: 'allow' } : { behavior: 'deny', message: 'because' },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+it('aborts on timeout and retains the pending question for another pod', async () => {
+  const { repo, session, ctx, gate, root } = await setup();
+  try {
+    ctx.config.hotHoldTimeoutMs = 1;
+    await expect(
+      gate.canUseTool('AskUserQuestion', { questions: [{ question: 'Which branch?' }] }),
+    ).rejects.toBeInstanceOf(ColdHold);
+    expect(ctx.controller.signal.aborted).toBe(true);
+    expect(await repo.getLatestPendingApproval(session.id)).toMatchObject({ approvalType: 'ASK_USER' });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

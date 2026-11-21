@@ -1,0 +1,44 @@
+stages:
+  - verify
+  - review
+
+default:
+  image: node:22-alpine
+
+variables:
+  NPM_CONFIG_CACHE: "$CI_PROJECT_DIR/.npm"
+
+cache:
+  key:
+    files:
+      - package-lock.json
+  paths:
+    - .npm/
+
+verify:
+  stage: verify
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  before_script:
+    - apk add --no-cache git
+    - npm ci
+  script:
+    - npm run check
+    - npm run build
+    - node --input-type=module -e "import '@detent/core'; import '@detent/delivery'"
+
+ocr_review:
+  stage: review
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $OCR_LLM_AUTH_TOKEN'
+  allow_failure: true
+  before_script:
+    - apk add --no-cache git curl
+    - npm install -g @alibaba-group/open-code-review@1
+  script:
+    - ocr config set llm.url "${OCR_LLM_URL:-https://api.anthropic.com/v1/messages}"
+    - ocr config set llm.auth_token "$OCR_LLM_AUTH_TOKEN"
+    - ocr config set llm.model "${OCR_LLM_MODEL:-claude-sonnet-4-20250514}"
+    - ocr config set llm.use_anthropic "${OCR_LLM_USE_ANTHROPIC:-true}"
+    - ocr review --audience agent --from "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --to "$CI_COMMIT_SHA" --background-file AGENT.md

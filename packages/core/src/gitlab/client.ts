@@ -1,0 +1,182 @@
+import type { AppConfig } from '../config.js';
+import type { GitLabUser, SessionStatus } from '../types.js';
+
+interface Project {
+  id: number;
+  path_with_namespace: string;
+  http_url_to_repo: string;
+  default_branch: string;
+}
+interface Issue {
+  id: number;
+  iid: number;
+  title: string;
+  description: string | null;
+  labels: string[];
+  state: 'opened' | 'closed';
+}
+interface MergeRequest {
+  iid: number;
+  title: string;
+  web_url: string;
+  source_branch: string;
+  target_branch: string;
+  state: 'opened' | 'closed' | 'merged';
+}
+interface Pipeline {
+  id: number;
+  ref: string;
+  status: string;
+}
+const labels: Record<SessionStatus, string> = {
+  PLANNING: 'claude::planning',
+  WAITING_PLAN: 'claude::waiting-approval',
+  WAITING_TOOL: 'claude::waiting-approval',
+  CODING: 'claude::coding',
+  IDLE: 'claude::idle',
+  FAILED: 'claude::failed',
+};
+export const redactGitUrl = (text: string) => text.replace(/(https?:\/\/oauth2:)[^\s/@]+@/gi, '$1***@');
+class GitLabError extends Error {
+  constructor(readonly status: number) {
+    super('GitLab HTTP ' + status);
+  }
+}
+export class GitLabClient {
+  private identity?: GitLabUser;
+  constructor(
+    private config: AppConfig,
+    private http: typeof fetch = fetch,
+  ) {}
+  private async request(path: string, method = 'GET', body?: object) {
+    const response = await this.http(this.config.gitlabBaseUrl.replace(/\/$/, '') + '/api/v4' + path, {
+      method,
+      headers: { 'PRIVATE-TOKEN': this.config.gitlabToken, 'Content-Type': 'application/json' },
+      redirect: 'error',
+      signal: AbortSignal.timeout(30000),
+      body: body && JSON.stringify(body),
+    });
+    if (!response.ok) throw new GitLabError(response.status);
+    return response;
+  }
+  private async json<T>(path: string, method = 'GET', body?: object): Promise<T> {
+    return (await this.request(path, method, body)).json();
+  }
+  private project(id: string | number) {
+    return '/projects/' + encodeURIComponent(id);
+  }
+  async initBotIdentity() {
+    this.identity = await this.json<GitLabUser>('/user');
+  }
+  isBotUser(id?: number, name?: string) {
+    return Boolean(this.identity && (id === this.identity.id || name === this.identity.username));
+  }
+  async hasApprovalPermission(project: number, user: number, minAccessLevel = this.config.gitlabMinAccessLevel): Promise<boolean> {
+    try {
+      const member = await this.json<{ access_level: number }>(
+        this.project(project) + '/members/all/' + user,
+      );
+      return member.access_level >= minAccessLevel;
+    } catch (error) {
+      if (error instanceof GitLabError && [403, 404].includes(error.status)) return false;
+      throw error;
+    }
+  }
+  private notes(p: number, i: number) {
+    return this.project(p) + '/issues/' + i + '/notes';
+  }
+  getIssue(project: number, iid: number) {
+    return this.json<Issue>(this.project(project) + '/issues/' + iid);
+  }
+  createIssueNote(p: number, i: number, body: string) {
+    return this.json<{ id: number }>(this.notes(p, i), 'POST', { body: redactGitUrl(body) });
+  }
+  async updateIssueNote(p: number, i: number, n: number, body: string) {
+    await this.request(this.notes(p, i) + '/' + n, 'PUT', { body: redactGitUrl(body) });
+  }
+  async syncIssueStatusLabel(p: number, i: number, status: SessionStatus) {
+    const label = labels[status];
+    await this.request(this.project(p) + '/issues/' + i, 'PUT', {
+      add_labels: label,
+      remove_labels: [...new Set(Object.values(labels))].filter((l) => l !== label).join(','),
+    });
+  }
+  getProject(p: string | number) {
+    return this.json<Project>(this.project(p));
+  }
+  private async pages<T>(resource: string, params: Record<string, string> = {}) {
+    const rows: T[] = [];
+    let page = '1';
+    while (page) {
+      const query = new URLSearchParams({ ...params, per_page: '100', page });
+      const res = await this.request(resource + '?' + query);
+      const batch: T[] = await res.json();
+      rows.push(...batch);
+      page = res.headers.get('x-next-page') ?? '';
+    }
+    return rows;
+  }
+  listProjects(search = '') {
+    return this.pages<Project>('/projects', { membership: 'true', search });
+  }
+  async createMergeRequest(
+    p: number,
+    input: { source_branch: string; target_branch: string; title: string; description: string },
+  ) {
+    const { source_branch, target_branch, title, description } = input;
+    const resource = this.project(p) + '/merge_requests';
+    try {
+      return await this.json<MergeRequest>(resource, 'POST', {
+        source_branch,
+        target_branch,
+        title,
+        description,
+      });
+    } catch (error) {
+      // GitLab may already have created the MR before the previous turn lost its response.
+      if (!(error instanceof GitLabError) || ![400, 409].includes(error.status)) throw error;
+      const matches = await this.pages<MergeRequest & { source_project_id: number }>(resource, {
+        scope: 'all',
+        state: 'opened',
+        source_branch,
+        target_branch,
+      });
+      const existing = matches.find(
+        (m) =>
+          m.source_project_id === p && m.source_branch === source_branch && m.target_branch === target_branch,
+      );
+      if (!existing) throw error;
+      return existing;
+    }
+  }
+  listPipelines(p: number, ref: string | number) {
+    const path =
+      typeof ref === 'number'
+        ? '/merge_requests/' + ref + '/pipelines'
+        : '/pipelines?ref=' + encodeURIComponent(ref);
+    return this.json<Pipeline[]>(this.project(p) + path);
+  }
+  getPipelineJobs(p: number, id: number) {
+    return this.pages<{ id: number; name: string; status: string }>(
+      this.project(p) + '/pipelines/' + id + '/jobs',
+    );
+  }
+  async getJobTrace(p: number, id: number) {
+    return redactGitUrl(
+      (await (await this.request(this.project(p) + '/jobs/' + id + '/trace')).text()).slice(-16000),
+    );
+  }
+  buildAuthenticatedCloneUrl(httpUrl: string) {
+    const url = new URL(httpUrl);
+    if (
+      !['https:', 'http:'].includes(url.protocol) ||
+      url.origin !== new URL(this.config.gitlabBaseUrl).origin ||
+      url.username ||
+      url.password
+    )
+      throw Error('Unexpected GitLab clone origin');
+    url.username = 'oauth2';
+    url.password = this.config.gitlabToken;
+    return url.href;
+  }
+}

@@ -1,0 +1,5 @@
+#!/bin/sh
+set -e
+
+echo "[pre-commit] Running typecheck, dead-code scan (knip), and unit tests..."
+npm run check

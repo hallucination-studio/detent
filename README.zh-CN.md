@@ -64,6 +64,19 @@ flowchart LR
 
 ## GitLab CE v18.3.0 接入配置指南
 
+### 自动配置
+
+使用 Node.js 20.12+ 运行 `npm run bootstrap` 可创建 Bot、初始化 Hub 的 `CLAUDE.md` 与标签，并配置成员和 Webhook。先导出 `GITLAB_ADMIN_TOKEN` 以创建 Bot 及其 PAT，或导出已有的 `GITLAB_TOKEN`，该账号需有管理相关项目、成员和 Webhook 的权限。
+
+```bash
+GITLAB_BASE_URL=https://gitlab.example.com \
+DETENT_PUBLIC_URL=https://detent.example.com \
+DETENT_TARGET_PROJECTS=ops/ansible-infra DETENT_HUB_MEMBERS=dev:30,sre:40 \
+npm run bootstrap -- --env-out .env
+```
+
+默认 Hub 为 `ai/workspace-hub`，可通过 `DETENT_HUB_PROJECT` 指定其他路径，或用 `GITLAB_HUB_PROJECT_ID` 指定已有项目。重复运行会复用同一输出文件中的 PAT 和 Webhook 密钥。MySQL、Anthropic 和 JumpServer 参数可以通过环境变量传入，也可编辑生成的 `.env`（权限 0600）。构建后执行 `node --env-file=.env packages/delivery/dist/server.js` 即可加载配置并启动交付服务。手动配置步骤如下。
+
 ### 1. 准备“工作区仓库（Workspace Hub Repo）”
 1. 在 GitLab CE v18.3.0 中创建一个专门用于承载研发会话的工作区仓库（例如 `ai/workspace-hub`），记录其 **Project ID**（填入环境变量 `GITLAB_HUB_PROJECT_ID`）。
 2. 在该工作区仓库根目录下可维护全局 `CLAUDE.md`（例如说明团队有哪些业务仓库、各自的职责、分支命名规范与测试要求）以及 `.claude/` 自定义配置。
@@ -85,6 +98,12 @@ flowchart LR
 - *（可选，用于 Pipeline 联动）* 在目标业务仓库添加 Webhook，勾选 **Pipeline events** 指向同一地址，当关联 MR 的流水线状态变更时会自动同步回对应的工作区 Issue。
 
 ---
+
+## 离线交付 E2E
+
+准备 Node.js 20.12+、已安装的 npm 依赖、含 `git-http-backend` 的 Git，以及本地已缓存的 Docker 镜像 `mysql:8.0`，执行 `npm run e2e:offline`。脚本构建交付服务，通过 CLI 初始化两个仓库，在方案生成后重启 Pod，并通过本地 HTTP 服务验证 MR 合并、生产审批、执行审计及沙箱清理。
+
+如需复用本地 MySQL 8.0，设置 `E2E_MYSQL_HOST=127.0.0.1`。可选的 `E2E_MYSQL_PORT`、`E2E_MYSQL_USER`、`E2E_MYSQL_PASSWORD`、`E2E_MYSQL_DATABASE` 分别默认为 `3306`、`root`、空密码和 `detent`。请使用专用测试库。脚本会创建 Detent 所需的表，结束时清理本次测试的会话数据。
 
 ## Issue 内交互使用手册
 
@@ -149,7 +168,7 @@ Webhook 返回 `202` 表示事件已进入当前进程的内存队列。正常�
 
 ### 启动交付服务
 
-在服务环境中设置配置变量（本地可用 `set -a; . ./.env; set +a` 加载按示例填写的文件）。安装依赖后运行 `npm run build` 和 `npm run start:delivery`，开发时使用 `npm run dev:delivery`。启动时使用 Core 的 MySQL 连接池创建 `delivery_executions` 表。记录关联会话、已合并 MR、执行审批单和 JumpServer 任务，查询任务结果时更新状态、输出摘要和完成时间。
+在服务环境中设置配置变量，也可按上文示例用 Node.js 的 `--env-file` 选项读取配置。安装依赖后运行 `npm run build` 和 `npm run start:delivery`，开发时使用 `npm run dev:delivery`。启动时使用 Core 的 MySQL 连接池创建 `delivery_executions` 表。记录关联会话、已合并 MR、执行审批单和 JumpServer 任务，查询任务结果时更新状态、输出摘要和完成时间。
 
 | 配置项 | 用途与默认值 |
 | --- | --- |

@@ -87,7 +87,18 @@ npm run build
 
 ### 2. Configure Environment
 
-Copy [`.env.example`](./.env.example) to `.env` and fill in your credentials:
+With Node.js 20.12+ and a GitLab CE instance, `npm run bootstrap` provisions the bot, Hub instructions and labels, project memberships, and webhooks. Export `GITLAB_ADMIN_TOKEN` to create the bot and its PAT, or export an existing `GITLAB_TOKEN` whose user can manage the requested projects, members, and hooks.
+
+```bash
+GITLAB_BASE_URL=https://gitlab.example.com \
+DETENT_PUBLIC_URL=https://detent.example.com \
+DETENT_TARGET_PROJECTS=ops/ansible-infra DETENT_HUB_MEMBERS=dev:30,sre:40 \
+npm run bootstrap -- --env-out .env
+```
+
+The default Hub is `ai/workspace-hub`. Set `DETENT_HUB_PROJECT` to another path or `GITLAB_HUB_PROJECT_ID` to an existing project ID. Rerunning with the same output file reuses the bot PAT and webhook secret. Supply MySQL, Anthropic, and JumpServer settings through the environment or edit the resulting mode-0600 file.
+
+For manual GitLab setup, copy [`.env.example`](./.env.example) and fill in your credentials:
 
 ```bash
 cp .env.example .env
@@ -106,15 +117,11 @@ Minimum required variables for `@detent/core`:
 Load environment variables and start either the standalone core runtime or the governed delivery control plane:
 
 ```bash
-set -a; . ./.env; set +a
-
 # Standalone Core runtime (@detent/core)
-npm start
-# Development watch mode: npm run dev
+node --env-file=.env packages/core/dist/server.js
 
 # Governed Delivery control plane (@detent/delivery)
-npm run start:delivery
-# Development watch mode: npm run dev:delivery
+node --env-file=.env packages/delivery/dist/server.js
 ```
 
 ### 4. Configure GitLab
@@ -137,6 +144,12 @@ npm run start:delivery
 > **Webhook Queue Note**: Webhook endpoints return `202` once an event is enqueued in the process's in-memory queue. Graceful shutdown drains in-flight events; abrupt process termination may drop unprocessed events.
 
 ---
+
+## Offline delivery E2E
+
+With Node.js 20.12+, installed npm dependencies, Git (including `git-http-backend`), and a locally cached `mysql:8.0` Docker image, run `npm run e2e:offline`. The harness builds Delivery, provisions both repositories through the CLI, restarts the pod after planning, and verifies the MR, production approval, execution audit, and sandbox cleanup using loopback HTTP services.
+
+To use an existing local MySQL 8.0 instance, set `E2E_MYSQL_HOST=127.0.0.1`. The optional `E2E_MYSQL_PORT`, `E2E_MYSQL_USER`, `E2E_MYSQL_PASSWORD`, and `E2E_MYSQL_DATABASE` default to `3306`, `root`, an empty password, and `detent`. Use a dedicated test database. The harness creates the Detent tables and removes its session rows during teardown.
 
 ## Interactive Issue Workflow
 

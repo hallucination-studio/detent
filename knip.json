@@ -1,7 +1,9 @@
 {
   "$schema": "https://unpkg.com/knip@5/schema.json",
   "workspaces": {
-    ".": {},
+    ".": {
+      "project": ["scripts/**/*.ts"]
+    },
     "packages/core": {
       "entry": ["src/server.ts", "tests/**/*.test.ts"],
       "project": ["src/**/*.ts", "tests/**/*.ts"]

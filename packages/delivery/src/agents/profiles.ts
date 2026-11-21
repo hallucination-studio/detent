@@ -15,6 +15,7 @@ interface ProfileOptions {
   hubDefaultBranch?: string;
   capabilities?: readonly DetentCapabilityPack[];
   resolveTurnProfile?: TurnProfileResolver;
+  canCloseIssue?: TurnProfile['canCloseIssue'];
 }
 
 function blocked(name: string, blockedMessage: string): WorkflowProfile {
@@ -34,7 +35,7 @@ async function hubProfile({ session, gitlab }: ResolverContext, options: Profile
     // The audit table stores up to 64 characters. The prompt retains the full source path.
     const name = Array.from(workflow.file.replace(/\.md$/i, '')).slice(0, 64).join('');
     return {
-      name, readonly,
+      name, readonly, closePolicy: workflow.closePolicy,
       disableBash: readonly || !(workflow.allowBash ?? (workflow.approverTier === 'standard')),
       enabledExtensionTools: enabledToolNames, extraSystemPrompt: '当前工作流：workflows/' + workflow.file + '\n\n' + workflow.body,
       approverTier: workflow.approverTier,
@@ -68,6 +69,7 @@ async function hubProfile({ session, gitlab }: ResolverContext, options: Profile
 }
 
 export function createDeliveryTurnProfileResolver(config: DeliveryConfig, options: ProfileOptions = {}): TurnProfileResolver {
+  const { canCloseIssue } = options;
   function canApproveProd(gitlab: ResolverContext['gitlab'], projectId: number, userId: number, username: string) {
     if (config.prodApprovers.length)
       return config.prodApprovers.includes(username.toLowerCase()) && gitlab.hasApprovalPermission(projectId, userId);
@@ -77,10 +79,18 @@ export function createDeliveryTurnProfileResolver(config: DeliveryConfig, option
     const selected: WorkflowProfile = options.resolveTurnProfile ? await options.resolveTurnProfile(ctx) : await hubProfile(ctx, options);
     return {
       ...selected,
+      ...(!selected.blockedMessage && canCloseIssue && {
+        async canCloseIssue(context) {
+          const checked = await canCloseIssue(context);
+          if (!checked.ok) return checked;
+          return selected.canCloseIssue?.(context) ?? checked;
+        },
+      }),
       async canApprove(params) {
         if (selected.blockedMessage) return false;
         const { projectId, userId, username, approvalType, toolName } = params;
         const plan = approvalType === 'PLAN' || toolName === 'Plan';
+        if (!plan && toolName === 'detent_close_issue' && selected.closePolicy !== 'approve') return false;
         const prodTool = !plan && prodTools.has(toolName);
         if (prodTool && (selected.readonly || (selected.enabledExtensionTools !== undefined && !selected.enabledExtensionTools.includes(toolName))))
           return false;

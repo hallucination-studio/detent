@@ -38,6 +38,7 @@ export const matchMergeRequestWebhook: WebhookExtension = (event) => {
           permissionMode: 'default',
           async beforeRun(session) {
             if (!(await repo.markMergeRequestMerged(mr.id, sha, user.username))) return false;
+            if (session.status === 'DONE') return false;
             const waiting = session.status === 'WAITING_PLAN' || session.status === 'WAITING_TOOL';
             const status = waiting ? '会话正在等待审批，审批后将继续。' : '正在自动恢复变更会话…';
             const commit = sha ? ` (commit ${sha.slice(0, 8)})` : '';

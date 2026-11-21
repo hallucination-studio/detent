@@ -204,3 +204,12 @@ Stage 6 已实现。使用 `loadHubWorkflows` 和 `matchHubWorkflow` 解析当�
 3. **活文档与审查规则同步**：
    - 同步更新 `AGENT.md`、`.opencodereview/rule.json`、`README.md`、`README.zh-CN.md`。
    - 全量通过 `npm run check && npm run build && npm run e2e:offline` 及 `ocr delegate` 100% 覆盖率审查。
+
+---
+
+## V4 演进实施计划：Issue 自动闭环终止条件与全 SOP 确定性 Mock-LLM E2E
+
+| 阶段 | 阶段目标 | 核心交付物 | 核心验收标准 |
+| :--- | :--- | :--- | :--- |
+| **Stage 8** | **Issue 自动闭环机制（`DONE` / `claude::done` + `detent_close_issue` + `close_policy` + 硬守卫）** | • `SessionStatus` 新增 `'DONE'` 与 `claude::done` 标签；`GitLabClient` 新增 `closeIssue`<br/>• `HubWorkflow` 支持 `close_policy: manual \| auto \| approve`（默认 `manual`）<br/>• `SessionOrchestrator` 集成 `detent_close_issue` 延迟原子关闭与 4 重硬守卫；`DetentExtensions.resolveTurnProfile` 返回的 `TurnProfile` 支持 `closePolicy` 与 `canCloseIssue`<br/>• `@detent/delivery` 注入执行记录终态守卫、MR 合并跳过 `DONE` 会话；标准模板更新 `close_policy: auto` 与终止条件；`scripts/bootstrap.ts` 补齐 `claude::done` 标签 | 1. 单测覆盖：`manual`/`auto`/`approve`、Plan 阶段禁关、未合并 MR 禁关、待审项禁关、未成功执行记录禁关、轮次报错不关单、只读巡检使用 SDK `default` 模式且工作区保持只读，关单前先归档 Worktree 再刷新最终评论，关闭后置 `DONE`<br/>2. `packages/core` 零业务污染<br/>3. `npm run check && npm run build` 全绿 |
+| **Stage 9** | **全 6 场景 Mock-LLM 确定性 E2E（支持全离线 `e2e:offline` 与真本地 GitLab CE 18.3.0 `e2e:gitlab` 双目标）+ 活文档同步** | • 升级 `scripts/e2e/offline-anthropic.ts` 支持全 6 条 SOP（`audit` / `code-delivery` / `release` / `env-change` / `hotfix` / `close_policy: approve`）与提前关单拦截验证<br/>• 抽离简洁的 GitLab E2E Driver 适配离线 `offline-gitlab.ts` 与真实本地 GitLab CE v18.3.0 API（`scripts/e2e/live-gitlab.ts`），新增 `npm run e2e:gitlab`<br/>• 同步更新 `AGENT.md`、`.opencodereview/rule.json`、`README.md`、`README.zh-CN.md` | 1. `npm run check && npm run build` 100% 通过<br/>2. `npm run e2e:offline` 跑通全部 6 条 SOP + Issue 自动闭环（退出码 0）<br/>3. `npm run e2e:gitlab` 对真实本地 Docker GitLab CE 18.3.0 + MySQL 8.0 + Mock LLM 跑通全部 6 条 SOP（0 真实模型 API 调用，全部完结 Issue 为 `closed` + `claude::done`）<br/>4. 推送前完成 `ocr delegate` 100% 覆盖率审查 |

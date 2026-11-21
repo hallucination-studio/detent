@@ -4,6 +4,7 @@ export type SessionStatus =
   | 'CODING'
   | 'WAITING_TOOL'
   | 'IDLE'
+  | 'DONE'
   | 'FAILED';
 
 export type PermissionMode = 'plan' | 'default' | 'acceptEdits';

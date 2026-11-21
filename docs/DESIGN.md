@@ -275,7 +275,7 @@ Stage 4 的 `TurnProfileResolver` 在每轮和每次审批时从 GitLab 读取 H
 | Agent 角色 | 触发标签（示例） | 允许工具范围 | 审批策略 |
 | :--- | :--- | :--- | :--- |
 | **`EnvChangeAgent`**（环境变更交付） | `delivery::env-change`（或默认） | GitLab Worktree/MR 工具 + JumpServer 只读巡检 + JumpServer Ansible 执行（禁用裸 `Bash` SSH） | Plan 方案审批（Developer+） + **MR 人工合并** + 执行前二次审批（Maintainer / 指定 SRE 审批组） |
-| **`ReadonlyAuditAgent`**（只读巡检/排障） | `delivery::audit` | GitLab 只读 + JumpServer 只读巡检（禁止一切写工具与执行工具） | SDK 使用 plan 模式，门禁与工作区仅放行只读工具，直接发布诊断报告进入 IDLE |
+| **`ReadonlyAuditAgent`**（只读巡检/排障） | `delivery::audit` | GitLab 只读 + JumpServer 只读巡检（禁止一切写工具与执行工具） | SDK 使用 default 模式，门禁与工作区强制只读；巡检验收后按 SOP 关闭工单 |
 | **`CodeDeliveryAgent`**（通用研发交付） | `delivery::code` | `@detent/core` 标准多项目编码工具 + 受控 `Bash` | 遵循 `@detent/core` 默认双层审批 |
 
 ---
@@ -376,7 +376,7 @@ description: 标准仓库发版流程
 > [!IMPORTANT]
 > **安全不变量（SOP 不可越权）**：
 > 1. `EphemeralSandbox` 将 Hub 仓库的 `CLAUDE.md`、`.claude/` 与 `workflows/` 拷入沙箱后，`PermissionGate` **严禁编码 Agent 写入 `CLAUDE.md` 或 `workflows/`**，仅允许修改 `projects/` 下的业务仓库。
-> 2. `mode: readonly` 强制锁定 SDK `plan` 模式、禁用 `Edit`/`Write`/`Bash` 及一切非 `readonly` 工具，无法通过其他字段放宽。
+> 2. `mode: readonly` 使用 SDK `default` 模式。只读 SOP 禁用 `Edit`/`Write`/`Bash`；门禁与工作区强制只读，关单按 `close_policy` 单独授权。
 > 3. **高危工具权限不可被 SOP 降级**：诸如 `jms_run_ansible_job`、`detent_create_release` 等代码定义的生产级工具，即使 SOP 误写 `approver_tier: standard` 或审批期间被更换 Issue 标签，审批时必须重新确认当前流程已就绪、非只读且启用该工具，再校验生产审批人。
 > 4. `approver_tier: prod` 对流程内的所有 `TOOL_USE` 审批生效。Plan 审批使用普通项目权限。
 
@@ -415,3 +415,34 @@ description: 标准仓库发版流程
 
 4. **初始化脚本非破坏性预置（`scripts/bootstrap.ts`）**：
    - `npm run bootstrap` 自动将 `examples/hub-workspace/` 下的 `CLAUDE.md`、`workflows/*.md` 及 `.gitlab/issue_templates/*.md` 幂等写入 Hub 仓库默认分支（**文件已存在则跳过，绝不覆盖客户自定义修改**），并自动创建 `delivery::release` 标签。
+
+---
+
+## 六、 V4 架构演进：Issue 自动闭环终止条件与全 SOP 确定性验收
+
+### 6.1 设计原则：将“轮次结束（`IDLE`）”与“工单闭环（`DONE` / `closed`）”解耦
+
+在多轮审批与跨库 MR 协作场景下，单轮结束（`IDLE`）往往只是在等待人工 Review、合并或追问，**绝不能在每轮结束后无条件关闭 Issue**；但当需求与当前 Hub SOP 的全部验收条件都已满足时，工单也不应长期滞留在 `Open` 状态。
+
+V4 通过 **3 层组合机制** 实现安全可控的 Issue 闭环：
+
+1. **新增状态与标签**：`SessionStatus` 新增 `'DONE'`，对应 GitLab 状态标签 `claude::done`（清晰区分等待中的 `claude::idle` 与已闭环的 `claude::done`；人工手动关闭 Issue 同样同步为 `DONE` / `claude::done`）。
+2. **Hub `workflows/*.md` 声明关闭策略（`close_policy`）**：
+   - `close_policy: manual`（未声明时的默认保守策略）：不向 Claude 暴露关单工具，只能由人工手动关闭 Issue。
+   - `close_policy: auto`：向 Claude 暴露 `detent_close_issue({ summary })`；满足代码硬守卫后，在**本轮末尾原子收口关闭**。
+   - `close_policy: approve`：向 Claude 暴露 `detent_close_issue({ summary })` 且治理策略为 `always_approve`；通过代码硬守卫后弹出【工单闭环关闭审批】卡，需人工点 👍 或 `/approve` 才在轮次末尾关闭。
+   - 4 套内置标准 SOP（`audit`、`release`、`env-change`、`code-delivery`）默认配置 `close_policy: auto`，并在 SOP 正文写明各自的业务终止条件；用户可直接改为 `approve` 或 `manual`。
+3. **代码层硬守卫与轮次末尾延迟原子关闭**：
+   - **`detent_close_issue` 硬守卫（不可被 LLM 幻觉绕过）**：
+     1. 非 `readonly` 流程在 `permissionMode === 'plan'` 阶段（方案尚未批准）严禁关单；
+     2. 存在其他 `PENDING` 审批请求时严禁关单；
+     3. 当前会话在 `session_merge_requests` 中只要还有任意一条 `mr_state === 'opened'` 的未合并 MR，严禁关单（防止刚提 MR 就误关）；
+     4. 支持扩展钩子 `canCloseIssue({ session, repo })`：`@detent/delivery` 校验若本会话存在 `delivery_executions` 记录且最新一条状态非 `SUCCESS`，严禁关单。
+   - **延迟原子收口**：`detent_close_issue` 在轮次中仅记录待关闭请求；只有本轮 Claude 正常结束且未抛错时，编排器按序完成 **增量落库 transcript → 保存工作区检查点 → 复核关单守卫 → 归档全部活跃 Worktree → 刷新最终评论 → 调用 GitLab `closeIssue`（`state_event: 'close'`）→ 状态置为 `DONE` 并打上 `claude::done`**。Bot 自身关闭触发的 `issue (close)` Webhook 被 `isBotUser` 自动忽略，零自环；人工后续在 GitLab 点 Reopen 并发表评论可无缝恢复会话。
+   - **已闭环会话防误唤醒**：`@detent/delivery` 的 MR 合并处理器对已处于 `DONE` 的会话记录合并信息但不再自动拉起新轮次。
+
+### 6.2 全 SOP 确定性 Mock-LLM 验收体系（双目标模式）
+
+为避免依赖外部模型 API 的波动与费用，同时保证全部标准 SOP 与客户自定义 SOP 都得到真实闭环验收，E2E 统一采用 **本地确定性 Mock Anthropic SSE 服务驱动真实 `@anthropic-ai/claude-code` 二进制进程**，并支持双目标复用同一套 6 场景测试套件：
+- **`npm run e2e:offline`**：离线 GitLab（含真实 `git-http-backend`）+ 离线 JumpServer + Mock Anthropic + 真实 MySQL 8.0 Docker + 真实 `bootstrap.ts` + 真实 `packages/delivery/dist/server.js`。
+- **`npm run e2e:gitlab`**：直连真实本地 GitLab CE v18.3.0（如 `http://127.0.0.1:8080`）+ 真实 MySQL 8.0 + Mock Anthropic + Mock JumpServer，零模型 API 费用、100% 确定性验收真实 GitLab API/Webhook/Tag/Release/Issue 自动闭环。

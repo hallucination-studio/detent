@@ -1,4 +1,4 @@
-import { defineExtensionTool, type AnyDetentExtensionTool, type ExtensionToolContext } from '@detent/core';
+import { defineExtensionTool, escapeMarkdownCell, neutralizeQuickActions, redactGitUrl, type AnyDetentExtensionTool, type ExtensionToolContext } from '@detent/core';
 import { z } from 'zod';
 import { redactSecrets, type DeliveryConfig } from '../config.js';
 import type { JobResultResponse, JumpServerClient } from './client.js';
@@ -83,25 +83,26 @@ export function createJumpServerTools({ client, config, tracker }: {
         const verified = await verifyMerge(input, ctx, config.blockFailedPipeline);
         if (!verified.ok) throw Error(verified.reason);
         const { mr } = verified;
-        // Indent submitted values so multiline input cannot create its own links, headings or GitLab quick actions.
-        const fields = [
-          '审批单 ' + approvalId,
-          '目标资产 ' + JSON.stringify(input.asset_ids),
-          'Ansible 仓库 ' + mr.targetProjectPath,
-          'Playbook ' + input.playbook_path,
-          '合并人 ' + (mr.mergedBy ?? '未知'),
-          '提交 SHA ' + input.commit_sha,
-          ...(input.extra_vars ? ['变更变量 ' + JSON.stringify(input.extra_vars)] : []),
-          '变更原因 ' + (input.reason ?? '未提供'),
-        ];
         const url = new URL(mr.mrWebUrl);
         if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) throw Error('无效的 MR 链接');
-        const ref = mr.targetProjectPath + '!' + mr.mrIid;
-        return redactSecrets([
-          '### 生产变更执行审批', '', '已合并 MR [' + ref + '](<' + url.href + '>)', '',
-          ...fields.flatMap(field => field.split(/\r\n?|\n/).map(line => '    ' + line)), '',
-          '请运维负责人点 👍 或回复 `/approve` 放行。点 👎 或回复 `/reject <原因>` 拒绝。',
-        ].join('\n'), config);
+        const cell = (value: string, format: 'text' | 'code' = 'text') =>
+          escapeMarkdownCell(redactSecrets(value, config), format);
+        const ref = cell(mr.targetProjectPath + '!' + mr.mrIid);
+        const mergedBy = mr.mergedBy ? '@' + mr.mergedBy.replace(/^@/, '') : '未知';
+        const table = [
+          '| 项目 | 内容 |', '| :--- | :--- |',
+          '| 已合并 MR | [' + ref + '](<' + url.href.replaceAll('|', '%7C') + '>)（由 ' + cell(mergedBy, 'code') + ' 合并） |',
+          '| 提交 SHA | ' + cell(input.commit_sha, 'code') + ' |',
+          '| 目标资产 | ' + cell(JSON.stringify(input.asset_ids), 'code') + ' |',
+          '| Ansible 仓库 | ' + cell(mr.targetProjectPath, 'code') + ' |',
+          '| Playbook | ' + cell(input.playbook_path, 'code') + ' |',
+          input.extra_vars && '| 变更变量 | ' + cell(JSON.stringify(input.extra_vars), 'code') + ' |',
+          '| 变更原因 | ' + cell(input.reason ?? '未提供') + ' |',
+        ].filter(Boolean).join('\n');
+        return neutralizeQuickActions(redactSecrets(redactGitUrl([
+          '### 🚀 生产变更执行审批', table,
+          '> 请运维负责人点 👍 或回复 `/approve` 放行 · 👎 或 `/reject <原因>` 拒绝 · <sub>审批单 `' + approvalId + '`</sub>',
+        ].join('\n\n')), config));
       },
       async execute(input, ctx) {
         const { approvalId } = ctx;
@@ -123,7 +124,11 @@ export function createJumpServerTools({ client, config, tracker }: {
         } catch {
           throw Error(redactSecrets(`任务 ${job.jobId} 已提交（${job.jobUrl}），审批单 ${approvalId} 的追踪记录写入失败。请核对已有任务，避免重复提交。`, config));
         }
-        return { jobId: job.jobId, status: job.status, jobUrl: job.jobUrl, mrId: mr.id, approvalId, commitSha: input.commit_sha };
+        return {
+          jobId: job.jobId, status: job.status, approved: true,
+          nextAction: '任务已获批并提交至 JumpServer 任务中心，请立即调用 jms_get_job_result 查询终态。',
+          jobUrl: job.jobUrl, mrId: mr.id, approvalId, commitSha: input.commit_sha,
+        };
       },
     }),
     defineExtensionTool({

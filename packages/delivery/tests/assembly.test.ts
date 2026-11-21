@@ -162,3 +162,33 @@ it('uses the injected release client and enforces production permissions on call
     await app.close();
   }
 });
+
+it('requires the latest execution to succeed and preserves the caller’s close guard', async () => {
+  const repo = new InMemoryDetentRepository();
+  const session = await repo.getOrCreateSession(1, 42, 'verify');
+  const listSessionExecutions = vi.fn().mockResolvedValue([]);
+  const canCloseIssue = vi.fn().mockResolvedValue({ ok: true });
+  const app = createDeliveryApp(loadConfig({ GITLAB_WEBHOOK_SECRET: 'test' }), {
+    executionTracker: { recordExecution: vi.fn(), hasSessionJob: vi.fn(), listSessionExecutions },
+    resolveTurnProfile: () => ({ closePolicy: 'auto', canCloseIssue }),
+  });
+  try {
+    const extensions = vi.mocked(createDetentApp).mock.lastCall![1]!;
+    const profile = await extensions.resolveTurnProfile!({
+      session, repo, gitlab: { getIssue: vi.fn(), hasApprovalPermission: vi.fn() },
+    });
+    const check = () => profile.canCloseIssue!({ session, repo });
+    expect(await check()).toEqual({ ok: true });
+    for (const status of ['PENDING', 'RUNNING', 'FAILED']) {
+      listSessionExecutions.mockResolvedValue([{ status: 'SUCCESS' }, { status }]);
+      expect(await check()).toEqual({ ok: false, reason: '最新交付执行记录状态为 ' + status + '，未成功前禁止关闭工单' });
+    }
+    listSessionExecutions.mockResolvedValue([{ status: 'FAILED' }, { status: 'SUCCESS' }]);
+    expect(await check()).toEqual({ ok: true });
+    expect(listSessionExecutions).toHaveBeenLastCalledWith(session.id);
+    canCloseIssue.mockResolvedValue({ ok: false, reason: 'verification incomplete' });
+    expect(await check()).toEqual({ ok: false, reason: 'verification incomplete' });
+  } finally {
+    await app.close();
+  }
+});

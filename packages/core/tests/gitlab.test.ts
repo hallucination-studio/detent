@@ -2,6 +2,7 @@ import { it, expect, vi } from 'vitest';
 import { parseNoteIntent, parseEmojiIntent } from '../src/gitlab/command-parser.js';
 import { GitLabClient } from '../src/gitlab/client.js';
 import {
+  escapeTableCell,
   NoteStreamer,
   renderSummary,
   renderPlanApprovalCard,
@@ -87,6 +88,27 @@ it('reads Issue labels and metadata by project and Issue IID', async () => {
   expect(await client.getIssue(5, 42)).toEqual(issue);
   expect(http).toHaveBeenCalledWith(expect.stringMatching(/\/projects\/5\/issues\/42$/), expect.objectContaining({ method: 'GET' }));
 });
+it('neutralizes quick actions and redacts credentials on both GitLab note endpoints', async () => {
+  const http = vi.fn().mockResolvedValue(Response.json({ id: 9 }));
+  const client = new GitLabClient(loadConfig({}), http);
+  const body = 'https://oauth2:secret@git/repo\r/close\r\n \t/approve';
+  await client.createIssueNote(1, 2, body);
+  await client.updateIssueNote(1, 2, 9, body);
+  for (const [, request] of http.mock.calls)
+    expect(JSON.parse(request.body)).toEqual({ body: 'https://oauth2:***@git/repo\n\\/close\n \t\\/approve' });
+});
+it('closes the Issue by IID and applies the done label', async () => {
+  const http = vi.fn().mockResolvedValue(Response.json({}));
+  const client = new GitLabClient(loadConfig({}), http);
+  await client.closeIssue(5, 42);
+  await client.syncIssueStatusLabel(5, 42, 'DONE');
+  expect(http.mock.calls[0]).toEqual([expect.stringMatching(/\/projects\/5\/issues\/42$/), expect.objectContaining({
+    method: 'PUT', body: JSON.stringify({ state_event: 'close' }),
+  })]);
+  expect(JSON.parse(http.mock.calls[1][1].body)).toMatchObject({
+    add_labels: 'claude::done', remove_labels: expect.stringContaining('claude::idle'),
+  });
+});
 it('coalesces 20 events, serializes final flush and redacts approval cards and traces', async () => {
   vi.useFakeTimers();
   try {
@@ -104,12 +126,11 @@ it('coalesces 20 events, serializes final flush and redacts approval cards and t
       '20 个步骤',
       'step 19',
       '<details>',
-      'Worktrees',
-      'Merge Requests',
       'oauth2:***@',
     ])
       expect(body).toContain(fragment);
-    expect(body).not.toContain('secret');
+    expect(body).not.toMatch(/secret|活跃 Worktrees|Merge Requests/);
+    expect(renderSummary([], [])).toBe('');
     expect(renderPlanApprovalCard(url)).not.toContain('secret');
     expect(
       renderToolApprovalCard({
@@ -122,4 +143,33 @@ it('coalesces 20 events, serializes final flush and redacts approval cards and t
   } finally {
     vi.useRealTimers();
   }
+});
+
+it('publishes a text-only result without empty sections or executable quick actions', async () => {
+  const update = vi.fn();
+  const stream = new NoteStreamer(200, update, async () => '');
+  await stream.flush('结果\r\n /close\r/label ~done\n\t/approve\n// keep comment\n/* keep block */');
+  expect(update).toHaveBeenCalledExactlyOnceWith('结果\n \\/close\n\\/label ~done\n\t\\/approve\n// keep comment\n/* keep block */');
+  expect(renderPlanApprovalCard('/close')).toContain('### 📋 实施方案审批\n\n\\/close\n\n---');
+});
+
+it('renders numbered questions, fenced commands and escaped fallback tool inputs', () => {
+  const tool = { id: 'approval-id', toolName: 'AskUserQuestion', approvalType: 'ASK_USER' } as const;
+  const questions = [{ question: '哪个分支？\n /label' }, { question: '/close' }];
+  const ask = renderToolApprovalCard({ ...tool, toolInput: { questions } });
+  expect(ask).toContain('1. 哪个分支？\n \\/label\n2. \\/close');
+  expect(ask).not.toMatch(/AskUserQuestion|approval-id|questions/);
+
+  const approval = { ...tool, approvalType: 'TOOL_USE' } as const;
+  const command = 'echo ````\n/close\ncd /tmp/turn/workspace/projects/web';
+  const bash = renderToolApprovalCard(
+    { ...approval, toolName: 'Bash', toolInput: { command, description: '检查' } },
+    '/tmp/turn/workspace',
+  );
+  expect(bash).toContain('**用途**：检查\n\n`````sh\necho ````\n\\/close\ncd projects/web\n`````');
+  const card = (toolInput: Record<string, unknown>) => renderToolApprovalCard({ ...approval, toolName: 'other', toolInput });
+  expect(card({ 'a|b': 'c\r/label\n|' })).toContain('| a\\|b | c /label \\| |');
+  expect(escapeTableCell('prod`|`svc', 'code')).toBe('`` prod`\\|`svc ``');
+  expect(card({ args: ['```'] })).toContain('````json');
+  expect(card({})).toContain('```json\n{}\n```');
 });

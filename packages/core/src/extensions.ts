@@ -41,7 +41,11 @@ export interface DetentCapabilityPack {
   tools: readonly AnyDetentExtensionTool[];
 }
 
+export type IssueClosePolicy = 'manual' | 'auto' | 'approve';
+
 export interface TurnProfile {
+  closePolicy?: IssueClosePolicy;
+  canCloseIssue?(ctx: { session: IssueSessionRow; repo: DetentRepository }): Promise<{ ok: true } | { ok: false; reason: string }>;
   blockedMessage?: string;
   name?: string;
   readonly?: boolean;

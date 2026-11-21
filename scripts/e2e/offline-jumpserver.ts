@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { strFromU8, unzipSync } from 'fflate';
 
-export function offlineJumpServer() {
+export function offlineJumpServer({ ansibleRepo = 'ops/ansible-infra' } = {}) {
   const readonly = randomUUID(), job = randomUUID();
   const inspections: string[] = [], executions: string[] = [], uploads: string[] = [];
   let definition: string | undefined;
@@ -27,11 +27,16 @@ export function offlineJumpServer() {
       const zip = form.get('path');
       assert.ok(zip && typeof zip !== 'string' && zip.name === 'playbook.zip');
       const comment = String(form.get('comment'));
-      const [, sha] = /^ops\/ansible-infra@([a-f0-9]{40}) deploy\/nginx-reload\.yml$/.exec(comment) ?? [];
+      const sha = /@([a-f0-9]{40}) /.exec(comment)?.[1];
       assert.ok(sha, 'Expected a commit-pinned playbook');
+      assert.equal(comment, ansibleRepo + '@' + sha + ' deploy/nginx-reload.yml');
       const files = unzipSync(new Uint8Array(await zip.arrayBuffer()));
-      const path = 'ansible-infra-' + sha + '/deploy/nginx-reload.yml';
-      assert.deepEqual(JSON.parse(strFromU8(files['main.yml'])), [{ import_playbook: path }]);
+      const entry = JSON.parse(strFromU8(files['main.yml']));
+      const path: string = entry[0].import_playbook;
+      assert.deepEqual(entry, [{ import_playbook: path }]);
+      const [root, ...relative] = path.split('/');
+      assert.ok(root.startsWith(ansibleRepo.split('/').at(-1) + '-'));
+      assert.equal(relative.join('/'), 'deploy/nginx-reload.yml');
       assert.match(strFromU8(files[path]), /state: reloaded/);
       uploads.push(sha);
       return Response.json({ id: 'playbook-' + sha });
@@ -63,8 +68,8 @@ export function offlineJumpServer() {
     const match = /^\/api\/v1\/ops\/job-execution\/(task-detail|result)\/([^/]+)\/$/.exec(path);
     if (req.method === 'GET' && match) {
       if (tasks.get(match[2]) !== role) return forbidden();
-      return Response.json(match[1] === 'task-detail' ? { status: 'success', summary: { success: 1 } } :
-        { result: { web01: role === job ? 'nginx reloaded' : 'nginx active' } });
+      if (match[1] === 'task-detail') return Response.json({ status: 'success', summary: { success: 1 } });
+      return Response.json({ result: { web01: role === job ? 'nginx reloaded' : 'nginx active' } });
     }
     return new Response(null, { status: 404 });
   }

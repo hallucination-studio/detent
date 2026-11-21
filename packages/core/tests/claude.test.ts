@@ -51,7 +51,10 @@ it('hydrates exact lines and appends only new sequences, including repeated chec
 it('allows configured Git queries and gates compound commands and side effects', async () => {
   const { gate, root, session, ctx } = await setup();
   try {
+    await symlink(path.dirname(root), path.join(root, 'outside'));
     for (const command of [
+      'git -C projects/app status', 'git -C projects/app diff --stat',
+      'git -C . log -n 2', 'git -C projects/app branch --list',
       'git status --ignored', 'git log -n 5', 'git diff HEAD~1', 'git diff -- src/claude',
       'git branch', 'git branch --list', 'git branch -a -vv', 'git branch -r', 'git branch --remotes',
       'git branch --show-current', 'git branch --all -v',
@@ -62,7 +65,9 @@ it('allows configured Git queries and gates compound commands and side effects',
       'git branch -D main', 'git branch new-name', 'git branch -m old new', 'git diff --output file',
       'git diff --output=file', 'git log --output=file', 'git status && pwd', 'git status; pwd',
       'git status | cat', 'git status > file', 'git diff $(pwd)', 'git diff `pwd`', 'git status\npwd',
-      'git status-extra',
+      'git status-extra', 'git -C /etc status', 'git -C ../outside status', 'git -C outside status',
+      'git -C ~/other status', 'git -C projects/app branch -D main', 'git -C projects/app status && pwd',
+      'git -C projects/app diff --output=report', 'git -C projects/app log --out=file',
     ];
     for (const command of gated)
       expect(await gate.preflight('Bash', { command }), command).toMatchObject({ behavior: 'deny' });
@@ -70,6 +75,7 @@ it('allows configured Git queries and gates compound commands and side effects',
     for (const command of gated)
       expect(await gate.preflight('Bash', { command }), command).toBe('ask');
     ctx.config.safeBashPrefixes = ['npm test'];
+    expect(await gate.preflight('Bash', { command: 'git -C projects/app status' })).toBe('ask');
     expect(await gate.preflight('Bash', { command: 'npm test -- --watch=false' })).toMatchObject({ behavior: 'allow' });
     expect(await gate.preflight('Bash', { command: 'git status' })).toBe('ask');
   } finally {

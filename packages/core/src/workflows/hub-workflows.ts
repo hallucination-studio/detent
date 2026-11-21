@@ -1,4 +1,4 @@
-import type { DetentCapabilityPack } from '../extensions.js';
+import type { DetentCapabilityPack, IssueClosePolicy } from '../extensions.js';
 import type { GitLabClient } from '../gitlab/client.js';
 
 export type WorkflowMode = 'readonly' | 'governed';
@@ -10,6 +10,7 @@ export interface HubWorkflow {
   mode: WorkflowMode;
   requires: string[];
   approverTier: WorkflowApproverTier;
+  closePolicy: IssueClosePolicy;
   allowBash?: boolean;
   isDefault: boolean;
   description: string;
@@ -17,7 +18,7 @@ export interface HubWorkflow {
 }
 
 const normalize = (value: string) => value.trim().toLowerCase();
-const keys = new Set(['label', 'mode', 'requires', 'approver_tier', 'allow_bash', 'default', 'description']);
+const keys = new Set(['label', 'mode', 'requires', 'approver_tier', 'close_policy', 'allow_bash', 'default', 'description']);
 
 // A single plain or quoted scalar, optionally followed by a YAML comment.
 function scalar(value: string) {
@@ -48,6 +49,8 @@ export function parseHubWorkflowMarkdown(file: string, raw: string): HubWorkflow
   const label = normalize(fields.get('label') ?? '');
   const mode = fields.get('mode') ?? 'governed';
   const approverTier = fields.get('approver_tier') ?? 'standard';
+  const closePolicy = fields.get('close_policy') ?? 'manual';
+  if (closePolicy !== 'manual' && closePolicy !== 'auto' && closePolicy !== 'approve') return null;
   const allowBash = fields.get('allow_bash');
   const byDefault = fields.get('default') ?? 'false';
   if (!label || (mode !== 'readonly' && mode !== 'governed')) return null;
@@ -64,7 +67,7 @@ export function parseHubWorkflowMarkdown(file: string, raw: string): HubWorkflow
     if (name.trim()) requires.push(normalize(name));
   }
   return {
-    file, label, mode, approverTier, requires: [...new Set(requires)],
+    file, label, mode, approverTier, closePolicy, requires: [...new Set(requires)],
     ...(allowBash !== undefined && { allowBash: allowBash === 'true' }),
     isDefault: byDefault === 'true', description: fields.get('description') || file,
     body: lines.slice(end + 1).join('\n').trim(),

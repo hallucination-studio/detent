@@ -5,8 +5,8 @@ import type { PermissionResult } from '@anthropic-ai/claude-code';
 import type { AppConfig } from '../config.js';
 import type { DetentRepository } from '../db/repository.js';
 import type { AnyDetentExtensionTool, ExtensionToolContext, SessionLifecycleHooks, TurnProfile } from '../extensions.js';
-import { redactGitUrl, type GitLabClient } from '../gitlab/client.js';
-import { renderToolApprovalCard } from '../gitlab/note-streamer.js';
+import type { GitLabClient } from '../gitlab/client.js';
+import { renderNote, renderToolApprovalCard } from '../gitlab/note-streamer.js';
 import type { ApprovalRequestRow, IssueSessionRow } from '../types.js';
 import { allowedInPlan, isWorkspaceTool } from '../workspace/mcp-tools.js';
 
@@ -24,10 +24,17 @@ export class ColdHold extends Error {
 const fileTools = new Set(['Read', 'Edit', 'Write', 'Glob', 'Grep']);
 const readTools = new Set(['Read', 'Glob', 'Grep']);
 const branchQueryFlags = new Set(['--list', '-a', '--all', '--show-current', '-r', '--remotes', '-v', '-vv']);
-function safeCommand(command: unknown, prefixes: string[], plan: boolean) {
+async function safeCommand(command: unknown, prefixes: string[], plan: boolean, workspaceRoot: string) {
   // Only literal shell words qualify for automatic approval.
   if (typeof command !== 'string' || /[^\w ./=:@%+,~^\t-]/.test(command)) return false;
   const words = command.trim().split(/[ \t]+/);
+  if (words[0] === 'git' && words[1] === '-C') {
+    const [, , dir, subcommand] = words;
+    if (!dir || !/^[\w./-]+$/.test(dir) || dir.startsWith('/') || dir.includes('..')) return false;
+    if (!['status', 'diff', 'log', 'branch'].includes(subcommand) || !(await contained(workspaceRoot, dir, false)))
+      return false;
+    words.splice(1, 2); // Apply the configured prefix and argument checks to the same Git query.
+  }
   const cmd = words.join(' ');
   if (!prefixes.some((prefix) => cmd === prefix || cmd.startsWith(prefix + ' '))) return false;
 
@@ -173,7 +180,8 @@ export class PermissionGate {
     const allow: PermissionResult = { behavior: 'allow', updatedInput: input };
     const extension = this.extensionTools.get(name);
     if (extension) {
-      if (effectiveReadOnly && extension.policy !== 'readonly') return deny('当前模式仅允许只读操作');
+      const closeApproval = extension.name === 'detent_close_issue' && this.ctx.profile?.closePolicy === 'approve';
+      if (effectiveReadOnly && extension.policy !== 'readonly' && !closeApproval) return deny('当前模式仅允许只读操作');
       if (extension.policy === 'readonly' || extension.policy === 'coding_auto') {
         const checked = await extension.guard?.(input, this.extensionContext);
         return checked && !checked.ok ? deny(checked.reason) : allow;
@@ -215,7 +223,7 @@ export class PermissionGate {
         return deny('此模式或路径不允许文件操作');
       return allow;
     }
-    if (name === 'Bash' && safeCommand(input.command, config.safeBashPrefixes, effectiveReadOnly)) return allow;
+    if (name === 'Bash' && await safeCommand(input.command, config.safeBashPrefixes, effectiveReadOnly, workspaceRoot)) return allow;
     if (isWorkspaceTool(name) && (!effectiveReadOnly || allowedInPlan(name))) return allow;
     if (name === 'ExitPlanMode' && effectiveReadOnly) return deny('请直接输出方案，由 GitLab 用户审批。');
     if (effectiveReadOnly && name !== 'AskUserQuestion') return deny('当前模式仅允许只读操作');
@@ -246,8 +254,9 @@ export class PermissionGate {
       input,
     );
     try {
-      const card = await extension?.renderApprovalCard?.(a.id, input, this.extensionContext) ?? renderToolApprovalCard(a);
-      const note = await gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, redactGitUrl(card));
+      const card = await extension?.renderApprovalCard?.(a.id, input, this.extensionContext)
+        ?? renderToolApprovalCard(a, this.ctx.workspaceRoot);
+      const note = await gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, renderNote(card));
       await repo.updateApprovalNoteId(a.id, note.id);
     } catch (error) {
       await resolveApproval(repo, s, a.id, 'EXPIRED', 'detent', '审批卡片发布失败', this.ctx.onApprovalResolved);

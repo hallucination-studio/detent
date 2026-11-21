@@ -82,18 +82,21 @@ it('checks commit existence, tag availability and the newest pipeline in order',
   expect(unblocked.gitlab.listPipelinesBySha).not.toHaveBeenCalled();
 });
 
-it('indents every submitted line on the approval card and truncates only the preview', async () => {
+it('escapes approval fields and quick actions and truncates only the notes preview', async () => {
   const { release, ctx, gitlab } = await setup();
-  const notes = '# Heading\r/close\r\n/label ~other\n' + '文'.repeat(800) + 'tail';
-  const card = await release.renderApprovalCard!('approval', { ...input, release_name: 'v1\n/close', release_notes: notes }, ctx);
-  for (const field of ['审批单 approval', '目标仓库 group/app', 'Tag 名称 stable/v1', '锁定 Commit SHA ' + sha,
-    '发布模式 创建 Git Tag + GitLab Release', 'Release 名称 v1', 'Release Notes 摘要 # Heading', '/close', '/label ~other'])
-    expect(card.split('\n')).toContain('    ' + field);
+  const notes = '# Heading\r/close\r\n/label ~other\n' + '文'.repeat(800) + 'end-of-release-notes';
+  const card = await release.renderApprovalCard!('approval', { ...input, release_name: 'v1|beta\n/close', release_notes: notes }, ctx);
+  for (const field of ['<sub>审批单 `approval`</sub>', '| 目标仓库 | `group/app` |', '| Tag / 模式 | `stable/v1`（创建 Git Tag + GitLab Release） |',
+    '| 锁定提交 | `' + sha + '` |', '| Release 名称 | v1\\|beta /close |', '<details><summary>Release Notes 预览</summary>',
+    '# Heading\n\\/close\n\\/label ~other'])
+    expect(card).toContain(field);
   expect(card).not.toMatch(/^\/(close|label)/m);
   expect(card).toContain('…');
-  expect(card).not.toContain('tail');
+  expect(card).not.toContain('end-of-release-notes');
   expect(card).toMatch(/👍.*\/approve.*👎.*\/reject/);
-  expect(await release.renderApprovalCard!('approval', { ...input, tag_only: true }, ctx)).toContain('仅创建 Git Tag');
+  const tagOnly = await release.renderApprovalCard!('approval', { ...input, tag_only: true }, ctx);
+  expect(tagOnly).toContain('仅创建 Git Tag');
+  expect(tagOnly).not.toMatch(/Release 名称|<details>/);
   await release.execute({ ...input, release_name: 'v1', release_notes: notes }, { ...ctx, approvalId: 'approval' });
   expect(gitlab.createRelease).toHaveBeenCalledWith(7, { tag_name: input.tag_name, ref: sha, name: 'v1', description: notes });
 });

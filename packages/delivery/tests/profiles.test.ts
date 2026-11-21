@@ -180,3 +180,14 @@ it('routes legacy Hubs without JumpServer using only available tools', async () 
   const { profile: unavailable } = await resolve(['delivery::release'], {}, [disabled]);
   expect(unavailable.blockedMessage).toContain('gitlab-release');
 });
+
+it.each(['standard', 'prod'])('uses the %s approval tier for a readonly close request', async tier => {
+  const files = { 'audit.md': workflows['audit.md'].replace('close_policy: auto', 'close_policy: approve')
+    .replace('approver_tier: standard', 'approver_tier: ' + tier) };
+  const { profile } = await resolve(['delivery::audit'], {}, [jumpserver], files);
+  expect(profile).toMatchObject({ readonly: true, closePolicy: 'approve' });
+  const request = { ...approve, toolName: 'detent_close_issue' };
+  expect(await profile.canApprove!({ ...request, userId: 20 })).toBe(false);
+  expect(await profile.canApprove!(request)).toBe(tier === 'standard');
+  expect(await profile.canApprove!({ ...request, userId: 40 })).toBe(true);
+});

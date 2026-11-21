@@ -7,11 +7,12 @@ export {
   parseHubWorkflowMarkdown, loadHubWorkflows, matchHubWorkflow,
   type HubWorkflow, type WorkflowMode, type WorkflowApproverTier,
 } from './workflows/hub-workflows.js';
+export { escapeTableCell as escapeMarkdownCell, neutralizeQuickActions } from './gitlab/note-streamer.js';
 export { createWebhookApp } from './gitlab/webhook.js';
 export { SessionOrchestrator, SessionBusy } from './orchestrator/session-orchestrator.js';
 export type { DetentRepository } from './db/repository.js';
 export type { ApprovalRequestRow, ApprovalType, IssueSessionRow, PermissionMode, SessionMergeRequestRow } from './types.js';
 export type {
   AnyDetentExtensionTool, ExtensionToolContext, ExtensionWebhookEvent, DetentCapabilityPack, DetentExtensions, DetentExtensionTool, SessionLifecycleHooks,
-  ToolGovernancePolicy, TurnProfile, TurnProfileResolver, WebhookExtension,
+  IssueClosePolicy, ToolGovernancePolicy, TurnProfile, TurnProfileResolver, WebhookExtension,
 } from './extensions.js';

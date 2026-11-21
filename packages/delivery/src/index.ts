@@ -50,6 +50,13 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
   return createDetentApp(config, {
     ...extensions, capabilities,
     resolveTurnProfile: createDeliveryTurnProfileResolver(deliveryConfig, {
+      async canCloseIssue({ session }) {
+        const rows = await tracker?.listSessionExecutions?.(session.id);
+        const latest = rows?.at(-1);
+        if (latest && latest.status !== 'SUCCESS')
+          return { ok: false, reason: '最新交付执行记录状态为 ' + latest.status + '，未成功前禁止关闭工单' };
+        return { ok: true };
+      },
       hubDefaultBranch: config.gitlabHubDefaultBranch, capabilities, resolveTurnProfile: extensions.resolveTurnProfile,
     }),
     async onInitSchema(pool) {

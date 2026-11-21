@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { randomInt, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { gitlabApi, projectActions, type E2EGitLabDriver } from './gitlab-driver.js';
 
 interface User { id: number; username: string }
 interface Hook { id: number; url: string; token: string; issues_events: boolean; emoji_events: boolean;
@@ -30,10 +31,14 @@ const gitEnv = { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GL
   GIT_AUTHOR_NAME: 'GitLab', GIT_AUTHOR_EMAIL: 'gitlab@localhost', GIT_COMMITTER_NAME: 'GitLab',
   GIT_COMMITTER_EMAIL: 'gitlab@localhost' };
 
-export function offlineGitLab(root: string) {
+export async function offlineGitLab(root: string, serve: (handle: (req: Request) => Promise<Response>) =>
+  Promise<{ baseUrl: string; close(): Promise<void> }>): Promise<E2EGitLabDriver> {
   const users = ['root', 'dev', 'sre'].map((username, i) => ({ id: i + 1, username }));
   const admin = randomUUID();
   const tokens = new Map<string, User>([[admin, users[0]]]);
+  const actors = { dev: randomUUID(), sre: randomUUID() };
+  tokens.set(actors.dev, users[1]);
+  tokens.set(actors.sre, users[2]);
   const groups: { id: number; full_path: string }[] = [];
   const projects: Project[] = [];
   const firstProjectId = randomInt(1, 2 ** 31 - 1);
@@ -131,7 +136,7 @@ export function offlineGitLab(root: string) {
     const credential = req.headers.get('private-token') ?? '';
     const actor = tokens.get(credential);
     if (!actor) return new Response(null, { status: 401 });
-    const [resource, ref, section, item, sub, child] = url.pathname.slice(8).split('/').map(decodeURIComponent);
+    const [resource, ref, section, item, sub, child, operation] = url.pathname.slice(8).split('/').map(decodeURIComponent);
     const get = req.method === 'GET', post = req.method === 'POST', put = req.method === 'PUT';
     const body = get ? {} : await req.json();
     if (get && resource === 'user') return reply(actor);
@@ -234,7 +239,9 @@ export function offlineGitLab(root: string) {
           return { id, name, type, path: path ? path + '/' + name : name };
         }));
       }
-      if (post && item === 'files') {
+      if ((post || put) && item === 'files') {
+        const exists = git(repo(p), 'ls-tree', '--name-only', p.default_branch, '--', sub).length > 0;
+        if (exists !== put) return new Response(null, { status: exists ? 400 : 404 });
         assert.equal(body.branch, p.default_branch);
         const content = body.encoding === 'base64' ? Buffer.from(body.content, 'base64') : body.content;
         await commitFile(p, sub, content, body.commit_message);
@@ -280,6 +287,8 @@ export function offlineGitLab(root: string) {
       return reply(release);
     }
     if (section === 'repository' && item === 'archive.zip' && get) {
+      if (['cors', 'no-cors', 'websocket'].includes(req.headers.get('sec-fetch-mode') ?? ''))
+        return new Response(JSON.stringify({ message: '406 Not Acceptable' }), { status: 406 });
       const sha = url.searchParams.get('sha')!;
       assert.match(sha, /^[a-f0-9]{40}$/);
       const prefix = p.path_with_namespace.split('/').pop() + '-' + sha + '/';
@@ -287,17 +296,37 @@ export function offlineGitLab(root: string) {
         headers: { 'Content-Type': 'application/zip' },
       });
     }
+    if (section === 'releases' && get) return reply(releases.get(p.id)!.find(r => r.tag_name === item));
     if (section === 'issues') {
+      if (post && !item) {
+        const iid = issues.size + 1;
+        const issue = { id: iid, iid, project_id: p.id, state: 'opened', title: body.title, description: body.description,
+          labels: body.labels.split(',').filter(Boolean) };
+        issues.set(iid, issue);
+        await dispatch(p, 'issue', 'issues_events', actor, { ...issue, action: 'open' });
+        return reply(issue);
+      }
       const issue = issues.get(Number(item));
       if (!issue || p.id !== issue.project_id) return absent();
       if (!sub && put) {
+        if (body.state_event === 'close') {
+          issue.state = 'closed';
+          await dispatch(p, 'issue', 'issues_events', actor, { ...issue, action: 'close' });
+        }
         const remove = (body.remove_labels ?? '').split(',');
         const add = (body.add_labels ?? '').split(',').filter(Boolean);
         issue.labels = [...new Set([...issue.labels.filter(l => !remove.includes(l)), ...add])];
       }
       if (!sub) return reply(issue);
       if (sub === 'notes' && post && !child) return reply(await note(issue, actor, body.body));
+      if (sub === 'notes' && get && !child)
+        return reply([...notes].filter(([, n]) => n.issueIid === issue.iid).map(([id, n]) => ({ id, body: n.body })));
       const saved = notes.get(Number(child));
+      if (sub === 'notes' && post && operation === 'award_emoji' && saved?.issueIid === issue.iid) {
+        await dispatch(p, 'emoji', 'emoji_events', actor,
+          { name: body.name, awardable_type: 'Note', awardable_id: Number(child), action: 'award' }, issue);
+        return reply({ name: body.name });
+      }
       if (sub === 'notes' && put && saved?.issueIid === issue.iid) {
         saved.body = body.body;
         return reply({ id: Number(child), body: body.body });
@@ -305,6 +334,21 @@ export function offlineGitLab(root: string) {
     }
     if (section === 'merge_requests') {
       const rows = mrs.get(p.id)!;
+      if (put && sub === 'merge') {
+        const iid = Number(item);
+        const mr = rows.find(m => m.iid === iid);
+        if (!mr) return absent();
+        const bare = repo(p);
+        const target = git(bare, 'rev-parse', mr.target_branch).toString().trim();
+        git(bare, 'merge-base', '--is-ancestor', target, mr.source_branch);
+        // The target is an ancestor, so the reviewed source tree is the exact merge result.
+        const sha = git(bare, 'commit-tree', mr.source_branch + '^{tree}', '-p', target, '-p', mr.source_branch,
+          '-m', 'Merge !' + iid).toString().trim();
+        git(bare, 'update-ref', 'refs/heads/' + mr.target_branch, sha, target);
+        mr.state = 'merged';
+        await dispatch(p, 'merge_request', 'merge_requests_events', actor, { ...mr, action: 'merge', merge_commit_sha: sha });
+        return reply({ ...mr, merge_commit_sha: sha });
+      }
       if (get && sub === 'pipelines') return reply([]);
       if (get && !item) return reply(rows);
       if (post && !item) {
@@ -319,44 +363,13 @@ export function offlineGitLab(root: string) {
     return absent();
   }
 
-  return { handle, admin, notes, membershipChecks, releases,
-    updateFile(projectId: number, file: string, content: string, message: string) {
-      return commitFile(find(projectId)!, file, content, message);
-    },
-    headSha(projectId: number) { return git(repo(find(projectId)!), 'rev-parse', 'HEAD').toString().trim(); },
-    tagCommit(projectId: number, name: string) { return tag(find(projectId)!, name)?.commit.id; },
-    async openIssue(hub: number, options: Pick<Issue, 'title' | 'description' | 'labels'>) {
-      const iid = issues.size + 1;
-      const issue = { ...options, id: iid, iid, project_id: hub, state: 'opened' };
-      issues.set(iid, issue);
-      await dispatch(find(hub)!, 'issue', 'issues_events', users[1], { ...issue, action: 'open' });
-      return iid;
-    },
-    async awardEmoji(issueIid: number, noteId: number, username: string) {
-      const issue = issues.get(issueIid)!;
-      assert.equal(notes.get(noteId)?.issueIid, issueIid);
-      await dispatch(find(issue.project_id)!, 'emoji', 'emoji_events', users.find(u => u.username === username)!,
-        { name: 'thumbsup', awardable_type: 'Note', awardable_id: noteId, action: 'award' }, issue);
-    },
-    postNote(issueIid: number, body: string, username = 'dev') {
-      return note(issues.get(issueIid)!, users.find(u => u.username === username)!, body);
-    },
-    issueNotes(issueIid: number) {
-      return [...notes.values()].filter(note => note.issueIid === issueIid).map(note => note.body);
-    },
-    async mergeMergeRequest(project: number, iid: number) {
-      const p = find(project)!;
-      const mr = mrs.get(p.id)!.find(m => m.iid === iid)!;
-      const bare = repo(p);
-      const target = git(bare, 'rev-parse', mr.target_branch).toString().trim();
-      git(bare, 'merge-base', '--is-ancestor', target, mr.source_branch);
-      // The target is an ancestor, so the reviewed source tree is the exact merge result.
-      const sha = git(bare, 'commit-tree', mr.source_branch + '^{tree}', '-p', target, '-p', mr.source_branch,
-        '-m', 'Merge !' + iid).toString().trim();
-      git(bare, 'update-ref', 'refs/heads/' + mr.target_branch, sha, target);
-      mr.state = 'merged';
-      await dispatch(p, 'merge_request', 'merge_requests_events', users[2], { ...mr, action: 'merge', merge_commit_sha: sha });
-      return sha;
-    },
+  const server = await serve(handle);
+  const baseUrl = server.baseUrl;
+  return {
+    ...projectActions(gitlabApi(baseUrl, admin), actors), baseUrl, adminToken: admin, membershipChecks,
+    hubProjectPath: 'ai/workspace-hub', targetProjects: { web: 'apps/web', api: 'apps/api', ansible: 'ops/ansible-infra' },
+    devUsername: 'dev', sreUsername: 'sre', podHost: '127.0.0.1',
+    detentPublicUrl: port => 'http://127.0.0.1:' + port,
+    async ensureUsers() {}, close: server.close,
   };
 }

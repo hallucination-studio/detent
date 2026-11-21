@@ -18,11 +18,11 @@ it('parses routing fields, comments and Markdown body with either line ending', 
     "requires: [ Sample, 'API', , ]", 'description: "审查 #1" # inline comment',
   ].join('\n')).replaceAll('\n', '\r\n'));
   expect(workflow).toEqual({
-    file: 'scan.md', label: 'scan', mode, approverTier, allowBash: false, isDefault: true,
+    file: 'scan.md', label: 'scan', mode, approverTier, closePolicy: 'manual', allowBash: false, isDefault: true,
     requires: ['sample', 'api'], description: '审查 #1', body: '# Steps\n\nReview.',
   } satisfies HubWorkflow);
   expect(parseHubWorkflowMarkdown('x.md', raw('label: x'))).toEqual({
-    file: 'x.md', label: 'x', mode: 'governed', approverTier: 'standard', isDefault: false,
+    file: 'x.md', label: 'x', mode: 'governed', approverTier: 'standard', closePolicy: 'manual', isDefault: false,
     requires: [], description: 'x.md', body: '# Steps\n\nReview.',
   });
   expect(parseHubWorkflowMarkdown('x.md', raw('label: x\nrequires: A, B\nallow_bash: true')))
@@ -30,7 +30,11 @@ it('parses routing fields, comments and Markdown body with either line ending', 
   expect(parseHubWorkflowMarkdown('x.md', raw('label: x\nrequires: []'))?.requires).toEqual([]);
 });
 
-it.each(['mode: readonly', 'label: ', 'label: ""', 'label: []', 'label: x\nmode: other',
+it.each(['manual', 'auto', 'approve'])('accepts close_policy %s', policy => {
+  expect(parseHubWorkflowMarkdown('x.md', raw('label: x\nclose_policy: ' + policy))?.closePolicy).toBe(policy);
+});
+
+it.each(['label: x\nclose_policy: invalid', 'label: x\nclose_policy:', 'mode: readonly', 'label: ', 'label: ""', 'label: []', 'label: x\nmode: other',
   'label: x\napprover_tier: other', 'label: x\nallow_bash: yes', 'label: x\ndefault: nope',
   'label: x\nrequires: [abc', 'label: x\nlabel: y', 'label: x\nmod: readonly',
 ])('rejects invalid frontmatter %j', fields => {

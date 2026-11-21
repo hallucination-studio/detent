@@ -20,6 +20,7 @@ import { buildSystemPrompt } from '../claude/prompts.js';
 import type { ClaudeRunner } from '../claude/runner.js';
 
 import type { DetentExtensions } from '../extensions.js';
+import { checkIssueClosure, createCloseIssueTool } from './close-issue.js';
 import { notifyHook, resolveApproval } from './lifecycle.js';
 
 export class SessionBusy extends Error {}
@@ -28,7 +29,7 @@ type Client = WorkspaceGitLab &
   Pick<
     GitLabClient,
     'createIssueNote' | 'updateIssueNote' | 'syncIssueStatusLabel' | 'getIssue' | 'hasApprovalPermission'
-  > & Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile'>>;
+  > & Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile' | 'closeIssue'>>;
 type Active = { controller: AbortController; ownsLease: boolean; gate?: PermissionGate };
 export class SessionOrchestrator {
   private active = new Map<string, Active>();
@@ -134,6 +135,7 @@ export class SessionOrchestrator {
     const { controller } = active;
     let sandbox: TurnSandbox | undefined;
     let streamer: NoteStreamer | undefined;
+    let issueClosed = false;
     try {
       const profile = await this.resolveTurnProfile(s);
       controller.signal.throwIfAborted();
@@ -162,12 +164,17 @@ export class SessionOrchestrator {
         await host.checkpoint(sandbox!, s.id);
       };
       const effectivePlan = plan || (profile?.readonly ?? false);
+      let closeRequested: { summary: string } | undefined;
+      const closeTool = profile && createCloseIssueTool(profile, request => { closeRequested = request; });
       const gate = new PermissionGate({
         extensionTools: [
           ...(this.extensions.tools ?? []),
           ...(this.extensions.capabilities ?? []).filter(pack => pack.enabled).flatMap(pack => pack.tools),
+          ...(closeTool ? [closeTool] : []),
         ],
-        profile,
+        profile: closeTool && profile?.enabledExtensionTools
+          ? { ...profile, enabledExtensionTools: [...profile.enabledExtensionTools, closeTool.name] }
+          : profile,
         onApprovalResolved: this.extensions.hooks?.onApprovalResolved,
         session: s,
         config: this.config,
@@ -200,7 +207,10 @@ export class SessionOrchestrator {
           prompt,
           controller,
           gate,
-          systemPrompt: profile?.extraSystemPrompt ? systemPrompt + '\n' + profile.extraSystemPrompt : systemPrompt,
+          systemPrompt: [
+            systemPrompt, profile?.extraSystemPrompt,
+            closeTool && '全部验收条件满足后调用 detent_close_issue 完结工单（含只读巡检模式，该工具已获授权）；汇报正文无需提及该工具名。',
+          ].filter(Boolean).join('\n'),
           tools: new WorkspaceTools(host, sandbox, s.id, effectivePlan),
           progress: (step) => streamer!.push(step),
           appendText: (delta) => streamer!.appendText(delta),
@@ -216,6 +226,18 @@ export class SessionOrchestrator {
         await this.repo.updateApprovalNoteId(approval.id, note.id);
         await this.state(s, 'WAITING_PLAN');
         await streamer.flush(renderPlanApprovalCard(result));
+      } else if (closeRequested && profile) {
+        // Tools may have created new work after the close request.
+        const checked = await checkIssueClosure(profile, { session: s, repo: this.repo, permissionMode: s.permissionMode });
+        if (!checked.ok) throw Error(checked.reason);
+        controller.signal.throwIfAborted();
+        await this.archiveWorktrees(s.id);
+        controller.signal.throwIfAborted();
+        await streamer.flush(result);
+        controller.signal.throwIfAborted();
+        await this.gitlab.closeIssue?.(s.hubProjectId, s.hubIssueIid);
+        issueClosed = true;
+        await this.state(s, 'DONE');
       } else {
         await streamer.flush(result);
         await this.state(s, 'IDLE');
@@ -224,7 +246,8 @@ export class SessionOrchestrator {
       if (completed) await notifyHook(async () => completed((await this.repo.getSession(s.id))!, result));
     } catch (error) {
       const cause = controller.signal.reason ?? error;
-      if (!active.ownsLease) throw cause;
+      // A status-sync failure after GitLab accepted the close cannot undo it.
+      if (issueClosed || !active.ownsLease) throw cause;
       if (sandbox) await host.checkpoint(sandbox, s.id);
       if (cause instanceof ColdHold) {
         await streamer?.flush('等待工具审批，审批后将恢复会话。');
@@ -250,14 +273,17 @@ export class SessionOrchestrator {
     this.active.get(s.id)?.controller.abort(new StopTurn());
     throw new SessionBusy('Waiting for turn to checkpoint and release');
   }
+  private async archiveWorktrees(sessionId: string) {
+    for (const tree of await this.repo.listActiveWorktrees(sessionId)) await this.repo.archiveWorktree(tree.id);
+  }
   async handleIssueClosed(project: number, iid: number) {
     const s = await this.repo.getSessionByIssue(project, iid);
     if (!s) return;
     await this.stop(s);
     await this.withLease(s, async (session) => {
       await this.expire(session);
-      for (const t of await this.repo.listActiveWorktrees(s.id)) await this.repo.archiveWorktree(t.id);
-      await this.state(session, 'IDLE');
+      await this.archiveWorktrees(session.id);
+      await this.state(session, 'DONE');
     });
   }
   async handleUserIntent(project: number, iid: number, intent: ParsedUserIntent) {

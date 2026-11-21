@@ -1,3 +1,5 @@
+import { renderNote } from './note-streamer.js';
+import { redactGitUrl } from './redact.js';
 import type { AppConfig } from '../config.js';
 import type { GitLabUser, SessionStatus } from '../types.js';
 
@@ -52,9 +54,10 @@ const labels: Record<SessionStatus, string> = {
   WAITING_TOOL: 'claude::waiting-approval',
   CODING: 'claude::coding',
   IDLE: 'claude::idle',
+  DONE: 'claude::done',
   FAILED: 'claude::failed',
 };
-export const redactGitUrl = (text: string) => text.replace(/(https?:\/\/oauth2:)[^\s/@]+@/gi, '$1***@');
+export { redactGitUrl };
 class GitLabError extends Error {
   constructor(readonly status: number) {
     super('GitLab HTTP ' + status);
@@ -114,11 +117,14 @@ export class GitLabClient {
   getIssue(project: number, iid: number) {
     return this.json<Issue>(this.project(project) + '/issues/' + iid);
   }
+  async closeIssue(project: number, iid: number): Promise<void> {
+    await this.request(this.project(project) + '/issues/' + iid, 'PUT', { state_event: 'close' });
+  }
   createIssueNote(p: number, i: number, body: string) {
-    return this.json<{ id: number }>(this.notes(p, i), 'POST', { body: redactGitUrl(body) });
+    return this.json<{ id: number }>(this.notes(p, i), 'POST', { body: renderNote(body) });
   }
   async updateIssueNote(p: number, i: number, n: number, body: string) {
-    await this.request(this.notes(p, i) + '/' + n, 'PUT', { body: redactGitUrl(body) });
+    await this.request(this.notes(p, i) + '/' + n, 'PUT', { body: renderNote(body) });
   }
   async syncIssueStatusLabel(p: number, i: number, status: SessionStatus) {
     const label = labels[status];

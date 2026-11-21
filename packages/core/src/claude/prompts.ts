@@ -3,9 +3,9 @@ import { schemas } from '../workspace/mcp-tools.js';
 import { renderSummary } from '../gitlab/note-streamer.js';
 
 function permissionPrompt(readonly: boolean, mode: IssueSessionRow['permissionMode']) {
-  if (readonly) return '本轮仅允许只读操作，请直接返回检查结果。';
-  if (mode === 'plan') return '当前只读。可以检出现有分支以分析需求。请直接返回跨项目实施方案，交由 GitLab 审批。';
-  return '已获方案审批。仅在 projects 下修改获批范围内的项目，使用 detent_commit_and_push 推送提交。';
+  if (readonly) return '本轮仅允许只读检查（不可修改文件或仓库）。完成检查后直接输出精炼结论，不要提及 plan 模式。';
+  if (mode === 'plan') return '当前为方案阶段（只读）。直接输出精炼方案正文并结束本轮，系统会自动生成方案审批卡；严禁用 AskUserQuestion 询问“是否批准方案”。仅在缺少关键业务信息无法规划时才使用 AskUserQuestion。';
+  return '已获方案审批。检出仓库位于相对路径 projects/<directory_name>（每轮临时目录会重建，勿硬编码绝对路径或使用 cd && / ; 复合命令）。读写与检索优先用 Read/Glob/Grep/Edit/Write，提交用 detent_commit_and_push，查状态仅用单条 git -C projects/<dir> status|diff|log|branch。';
 }
 
 export function buildSystemPrompt(
@@ -23,8 +23,8 @@ export function buildSystemPrompt(
       session.issueTitle,
     '每个 Issue 对应一个会话，可关联多个项目和 MR。',
     permissionPrompt(readonly, session.permissionMode),
-    '使用 AskUserQuestion 向用户提问，通过以下 MCP 工具操作工作区。',
+    '输出要求：面向研发/运维工程师，结论先行、精炼干练（方案 15–25 行内，汇报 10–20 行内，善用短列表或短表格）。不要向用户提及内部工具名、“已排期关闭”、“自动关单关键词”或沙箱路径等系统细节。',
     ...Object.entries(schemas).map(([name, shape]) => name + ' (' + Object.keys(shape).join(', ') + ')'),
     renderSummary(trees, mrs),
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }

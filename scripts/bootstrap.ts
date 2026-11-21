@@ -145,7 +145,7 @@ async function main() {
   }
   const labels = await all<{ name: string }>(root + '/labels');
   for (const name of ['claude::planning', 'claude::waiting-approval', 'claude::coding', 'claude::idle',
-    'claude::failed', 'delivery::audit', 'delivery::env-change', 'delivery::code', 'delivery::release']) {
+    'claude::failed', 'claude::done', 'delivery::audit', 'delivery::env-change', 'delivery::code', 'delivery::release']) {
     if (!labels.some(l => l.name === name)) await json(root + '/labels', 'POST', { name, color: '#356288' });
   }
   for (const entry of list(env.DETENT_HUB_MEMBERS)) {

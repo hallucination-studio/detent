@@ -75,7 +75,7 @@ DETENT_TARGET_PROJECTS=apps/web,ops/ansible-infra DETENT_HUB_MEMBERS=dev:30,sre:
 npm run bootstrap -- --env-out .env
 ```
 
-默认 Hub 为 `ai/workspace-hub`，可通过 `DETENT_HUB_PROJECT` 指定其他路径，或用 `GITLAB_HUB_PROJECT_ID` 指定已有项目。脚本预置 `CLAUDE.md`、四份 `workflows/*.md` 流程、四份 Issue 模板及九个标签。重复运行时保留 Hub 中已有文件，并复用同一输出文件中的 PAT 和 Webhook 密钥。MySQL、Anthropic 和 JumpServer 参数可以通过环境变量传入，也可编辑生成的 `.env`（权限 0600）。构建后执行 `node --env-file=.env packages/delivery/dist/server.js` 即可加载配置并启动交付服务。手动配置步骤如下。
+默认 Hub 为 `ai/workspace-hub`，可通过 `DETENT_HUB_PROJECT` 指定其他路径，或用 `GITLAB_HUB_PROJECT_ID` 指定已有项目。脚本预置 `CLAUDE.md`、四份 `workflows/*.md` 流程、四份 Issue 模板及十个标签。重复运行时保留 Hub 中已有文件，并复用同一输出文件中的 PAT 和 Webhook 密钥。MySQL、Anthropic 和 JumpServer 参数可以通过环境变量传入，也可编辑生成的 `.env`（权限 0600）。构建后执行 `node --env-file=.env packages/delivery/dist/server.js` 即可加载配置并启动交付服务。手动配置步骤如下。
 
 ### 1. 准备“工作区仓库（Workspace Hub Repo）”
 1. 在 GitLab CE v18.3.0 中创建一个专门用于承载研发会话的工作区仓库（例如 `ai/workspace-hub`），记录其 **Project ID**（填入环境变量 `GITLAB_HUB_PROJECT_ID`）。
@@ -99,17 +99,38 @@ npm run bootstrap -- --env-out .env
 
 ---
 
-## 离线交付 E2E
+## 确定性交付 E2E
 
-准备 Node.js 20.12+、已安装的 npm 依赖、含 `git-http-backend` 的 Git，以及本地已缓存的 Docker 镜像 `mysql:8.0`，执行 `npm run e2e:offline`。脚本对一个 Hub 和两个目标仓库重复运行 bootstrap，检查凭证与客户修改的 SOP。三个场景共用同一个数据库，运行真实的 Delivery 与 Claude Code 进程。
+两种模式都使用真实的 bootstrap、Delivery Pod、Claude Code 二进制和 MySQL 8.0。所有模型请求均由本地 Anthropic SSE 服务响应，JumpServer 替身校验上传的 Playbook ZIP。准备 Node.js 20.12+ 和项目 npm 依赖后运行：
 
-1. 零 JumpServer 配置启动。无标签 Issue 收到流程菜单，环境变更 Issue 收到缺能力指引，两者的 Anthropic 请求数均为零。
-2. 在同一 Pod 运行期间修改 `workflows/release.md` 的 Tag 前缀。开发者批准方案，维护者批准发版，检查真实 Git Tag 与 Release 的 SHA。
-3. 启用 JumpServer，持久化方案后重启 Pod。恢复会话并推送 Playbook，待人工合并 MR 和生产审批后执行，验证审计行、`/status`、增量消息与沙箱清理。
+```bash
+# 离线 GitLab 使用 Git 和 git-http-backend
+npm run e2e:offline
 
-如需复用本地 MySQL 8.0，设置 `E2E_MYSQL_HOST=127.0.0.1`。可选的 `E2E_MYSQL_PORT`、`E2E_MYSQL_USER`、`E2E_MYSQL_PASSWORD`、`E2E_MYSQL_DATABASE` 分别默认为 `3306`、`root`、空密码和 `detent`。请使用专用测试库。脚本会创建 Detent 所需的表，结束时清理本次测试的会话数据。
+# 本地 GitLab CE 18.3.0，预先导出 E2E_GITLAB_ADMIN_TOKEN
+E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab
+```
+
+真实模式下，GitLab 公布的 HTTP 克隆地址应与 `E2E_GITLAB_URL` 同源。允许 GitLab 容器向 `host.docker.internal` 投递项目 Webhook。使用其他路由时，以 `E2E_DETENT_PUBLIC_URL` 指定 GitLab 可访问的地址，以 `E2E_POD_PORT` 指定对应的宿主监听端口。每次运行保留独立的 `e2e-*/workspace-hub` 和三个目标项目供复核，并撤销临时令牌。
+
+两种模式均重复运行 bootstrap，检查九份 Hub 文件、十个标签、Webhook、凭证及客户自定义 SOP，并执行相同的六个场景。
+
+1. 无标签和缺能力的 Issue 收到对应指引，保持打开和 `IDLE`，模型请求数为零。
+2. 跨库代码交付生成两个 MR。两个和一个 MR 待合并时均拒绝关单，最后一个合并后关单并归档两个 Worktree。
+3. 在线修改发版 SOP，维护者批准后创建锁定 SHA 的 Tag 和 Release。
+4. 在线新增热修复 SOP，仅打 Tag，随后须单独获得生产档位的关单审批。
+5. 只读巡检确认 `web01` 上 nginx 状态后关单，审批记录为零。
+6. 环境变更在 Pod 重启后恢复方案。人工合并 Ansible MR 并批准生产执行，随后校验 ZIP、执行审计、变更后巡检和沙箱清理。
+
+完成的流程均检查 GitLab `closed`、`claude::done` 与 MySQL `DONE`。默认使用本地缓存的 `mysql:8.0` 镜像启动容器。如需复用本地 MySQL 8.0，设置 `E2E_MYSQL_HOST=127.0.0.1`。可选的 `E2E_MYSQL_PORT`、`E2E_MYSQL_USER`、`E2E_MYSQL_PASSWORD`、`E2E_MYSQL_DATABASE` 分别默认为 `3306`、`root`、空密码和 `detent`。请使用专用测试库。脚本会创建 Detent 所需的表，结束时清理本次测试的会话数据。
 
 ## Issue 内交互使用手册
+
+### 工单闭环
+
+Hub SOP 通过 `close_policy: manual | auto | approve` 选择关单策略。默认 `manual` 由人工关单。`auto` 允许 Claude 通过 `detent_close_issue` 登记关单请求。`approve` 还须通过对应审批档位的关单卡。
+
+申请时和成功轮次末尾均检查四道守卫：受治理流程的方案已批准、其他待审项已处理、会话中无打开的 MR、扩展钩子 `canCloseIssue` 放行。Delivery 有执行记录时要求最新状态为 `SUCCESS`。轮次成功保存 transcript 和工作区后，编排器复核守卫、刷新最终报告、归档 Worktree、关闭 Issue 并同步 `DONE` / `claude::done`。
 
 ### 完整工作流示例
 1. **提出需求（新建 Issue）**：

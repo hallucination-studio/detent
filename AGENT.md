@@ -31,7 +31,7 @@ Stage 1 的装配入口为 `createDetentApp(config, extensions)`。工具按每�
 
 扩展使用 `defineExtensionTool` 注册不同 Schema 的工具。`always_approve` 放行后，执行前的 `guard` 与 `execute` 从本次调用的 `ctx.approvalId` 取得审批单 ID。轮次和审批共用 `resolveTurnProfile({ session, repo, gitlab })`，可按 Issue 标签选择策略。`matchWebhookEvent` 同步返回队列键和处理函数，由 WebhookQueue 调度。业务表通过 `onInitSchema(pool)` 在 Core 建表后复用同一连接池初始化。
 
-Stage 2 的 Delivery 合并事件处理器按目标项目 ID 和 MR IID 查找所有关联会话。在各自的 `resumeSession.beforeRun` 租约内原子记录合并 SHA、合并人和时间。仅首次更新写入 Hub Issue 通知。会话正在等待方案或工具审批时，回调返回 `false` 并保留待审单；其余会话用 `default` 权限模式续跑。
+Stage 2 的 Delivery 合并事件处理器按目标项目 ID 和 MR IID 查找所有关联会话。在各自的 `resumeSession.beforeRun` 租约内原子记录合并 SHA、合并人和时间。仅首次更新写入 Hub Issue 通知。会话正在等待方案或工具审批时，回调返回 `false` 并保留待审单；已关闭的会话仅记录合并信息，其余会话用 `default` 权限模式续跑。
 
 Stage 3 的只读和自动工具在 `preflight` 执行守卫。生产任务在发卡前、批准后复核，提交前重读当前会话 MR。巡检与执行凭证分开配置，缺少所需凭证即拒绝。资产黑名单同时约束巡检和执行。结果查询必须由注入的 `DeliveryExecutionTracker` 验证会话归属。审批卡渲染、执行与归属判断均读取仓储。
 
@@ -41,11 +41,19 @@ Stage 3 的只读和自动工具在 `preflight` 执行守卫。生产任务在�
 
 `DetentCapabilityPack` 以 `enabled` 表达能力是否就绪，未启用的包通过 `setupHint` 提供配置指引。Delivery 的 `jumpserver` 包可空。默认启用的 `gitlab-release` 包提供只读的 `detent_list_tags` 和须审批的 `detent_create_release`，发布审批绑定项目、Tag 和完整提交 SHA。旧 Hub 无 SOP 时沿用兼容路由，未配置 JumpServer 时默认代码交付。
 
-`npm run bootstrap` 只补齐缺失的 Hub 规范、流程、Issue 模板和标签，复用同一输出文件内的凭证。`npm run e2e:offline` 在同一个 MySQL 8.0 实例上验证三条链路：缺流程与缺能力时零模型调用、运行中修改 SOP 后发版、重启 Pod 后继续受治理的环境变更。
+`npm run bootstrap` 只补齐缺失的 Hub 规范、流程、Issue 模板和标签，复用同一输出文件内的凭证。
 
 `jms_run_ansible_job` 与 `detent_create_release` 的待审单仅能在当前流程非只读且显式启用该工具时获批。两者始终校验生产审批人，`approver_tier: prod` 的流程对所有工具审批执行同样校验。方案审批沿用普通项目权限。生产审批要求 `DELIVERY_PROD_APPROVERS` 名单加项目成员门槛，或在名单为空时满足 `DELIVERY_PROD_MIN_ACCESS_LEVEL`（默认 40）。
 
 `delivery_executions` 通过 `onInitSchema(pool)` 在 Core 表之后、调用方建表之前初始化。所有权、执行状态和审批单关联均以仓储为准，审批卡渲染也从仓储读取 MR。禁止 Delivery 另建池或在 Pod 内缓存业务状态。结果查询更新审计，`renderStatusExtra` 将当前会话的执行记录加入 `/status`。环境变量全集与 Hub 规范见 [.env.example](.env.example) 和 [工作区示例](examples/hub-workspace/CLAUDE.md)。
+
+### V4 工单闭环（Stage 8）
+
+Hub SOP 的 `close_policy` 默认 `manual`。`auto` 和 `approve` 启用每轮的 `detent_close_issue`，其中 `approve` 按流程审批人等级发卡。readonly 角色使用 SDK default 模式，禁用 Edit/Write，在 disableBash 时禁用 Bash；PermissionGate 与 WorkspaceTools 始终强制工作区只读。关单工具仅登记本轮请求。编排器在轮次成功、transcript 与工作区已保存后复核方案、待审单、未合并 MR 和 `TurnProfile.canCloseIssue`，先归档 Worktree，再刷新最终评论，随后关闭 Issue 并同步 `DONE` / `claude::done`。Delivery 要求最新执行记录为 `SUCCESS`。人工关单同样归档并进入 `DONE`。
+
+### Stage 9 确定性 E2E
+
+`npm run e2e:offline` 使用回环 GitLab 与 git-http-backend。导出 `E2E_GITLAB_ADMIN_TOKEN` 后，`E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab` 使用独立命名空间和真实 GitLab CE 18.3.0 的 API、用户及 Webhook。两个目标共用同一套六场景：菜单与缺能力、跨库双 MR、在线定制发版、新增热修复与关单审批、只读巡检、跨 Pod 环境变更。真实 Claude Code 进程的模型请求全部发往本地确定性 SSE 替身。用 GitLab Issue、审批人身份、MySQL 状态和归档记录验收闭环。
 
 ## 二、 质量门禁：本地提交前检查与推送前 OpenCodeReview 委托审查（必须遵守）
 

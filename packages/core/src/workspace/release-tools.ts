@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { defineExtensionTool, type AnyDetentExtensionTool, type DetentCapabilityPack } from '../extensions.js';
-import type { GitLabClient } from '../gitlab/client.js';
+import { escapeTableCell, renderNote } from '../gitlab/note-streamer.js';
+import { redactGitUrl, type GitLabClient } from '../gitlab/client.js';
 
 export type ReleaseGitLab = Pick<GitLabClient,
   'getProject' | 'listTags' | 'getCommit' | 'getTag' | 'listPipelinesBySha' | 'createTag' | 'createRelease'
@@ -53,20 +54,22 @@ export function createGitLabReleaseTools({ gitlab, blockFailedPipeline }: Releas
       },
       async renderApprovalCard(approvalId, input) {
         const p = await gitlab.getProject(input.project);
-        const notes = input.release_notes ?? '';
-        const summary = Array.from(notes);
-        const fields = [
-          '审批单 ' + approvalId, '目标仓库 ' + p.path_with_namespace, 'Tag 名称 ' + input.tag_name,
-          '锁定 Commit SHA ' + input.commit_sha.toLowerCase(),
-          '发布模式 ' + (input.tag_only ? '仅创建 Git Tag' : '创建 Git Tag + GitLab Release'),
-          'Release 名称 ' + (input.release_name ?? input.tag_name),
-          'Release Notes 摘要 ' + (summary.length > 512 ? summary.slice(0, 512).join('') + '…' : notes || '（无）'),
-        ];
-        return [
-          '### GitLab 发布审批', '',
-          ...fields.flatMap(field => field.split(/\r\n?|\n/).map(line => '    ' + line)), '',
-          '请点 👍 或回复 `/approve` 放行。点 👎 或回复 `/reject <原因>` 拒绝。',
-        ].join('\n');
+        const notes = Array.from(redactGitUrl(input.release_notes ?? '').trim());
+        const preview = notes.slice(0, 512).join('') + (notes.length > 512 ? '…' : '');
+        const mode = input.tag_only ? '仅创建 Git Tag' : '创建 Git Tag + GitLab Release';
+        const name = input.release_name;
+        const table = [
+          '| 项目 | 内容 |', '| :--- | :--- |',
+          '| 目标仓库 | ' + escapeTableCell(p.path_with_namespace, 'code') + ' |',
+          '| Tag / 模式 | ' + escapeTableCell(input.tag_name, 'code') + '（' + mode + '） |',
+          '| 锁定提交 | ' + escapeTableCell(input.commit_sha.toLowerCase(), 'code') + ' |',
+          !input.tag_only && name && name !== input.tag_name && '| Release 名称 | ' + escapeTableCell(name) + ' |',
+        ].filter(Boolean).join('\n');
+        return renderNote([
+          '### 🚀 GitLab 发布审批', table,
+          preview && '<details><summary>Release Notes 预览</summary>\n\n' + preview + '\n\n</details>',
+          '> 👍 或 `/approve` 放行 · 👎 或 `/reject <原因>` 拒绝 · <sub>审批单 `' + approvalId + '`</sub>',
+        ].filter(Boolean).join('\n\n'));
       },
       async execute(input, ctx) {
         if (!ctx.approvalId) throw Error('发布缺少审批单');

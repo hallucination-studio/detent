@@ -96,7 +96,7 @@ DETENT_TARGET_PROJECTS=apps/web,ops/ansible-infra DETENT_HUB_MEMBERS=dev:30,sre:
 npm run bootstrap -- --env-out .env
 ```
 
-The default Hub is `ai/workspace-hub`. Set `DETENT_HUB_PROJECT` to another path or `GITLAB_HUB_PROJECT_ID` to an existing project ID. Bootstrap seeds `CLAUDE.md`, four SOPs under `workflows/`, four Issue templates, and nine labels. Rerunning with the same output file reuses the bot PAT and webhook secret and preserves existing Hub files. Supply MySQL, Anthropic, and JumpServer settings through the environment or edit the resulting mode-0600 file.
+The default Hub is `ai/workspace-hub`. Set `DETENT_HUB_PROJECT` to another path or `GITLAB_HUB_PROJECT_ID` to an existing project ID. Bootstrap seeds `CLAUDE.md`, four SOPs under `workflows/`, four Issue templates, and ten labels. Rerunning with the same output file reuses the bot PAT and webhook secret and preserves existing Hub files. Supply MySQL, Anthropic, and JumpServer settings through the environment or edit the resulting mode-0600 file.
 
 For manual GitLab setup, copy [`.env.example`](./.env.example) and fill in your credentials:
 
@@ -145,17 +145,40 @@ node --env-file=.env packages/delivery/dist/server.js
 
 ---
 
-## Offline delivery E2E
+## Deterministic delivery E2E
 
-With Node.js 20.12+, installed npm dependencies, Git (including `git-http-backend`), and a locally cached `mysql:8.0` Docker image, run `npm run e2e:offline`. The harness runs the bootstrap CLI twice against a Hub and two target repositories, checks that credentials and a customer edit survive, and exercises three scenarios against one database with the real Delivery and Claude Code processes.
+Both targets run the real bootstrap CLI, Delivery pods and Claude Code binary against MySQL 8.0. A loopback Anthropic SSE server scripts every model turn, and a local JumpServer fixture checks the uploaded playbook ZIP. Use Node.js 20.12+ and installed npm dependencies.
 
-1. A pod with no JumpServer configuration posts the workflow menu and missing-capability guidance on separate Issues with zero Anthropic requests.
-2. On that same pod, a live edit to `workflows/release.md` sets the tag prefix. A developer approves the plan, a maintainer approves publication, and the harness checks the Git tag and Release against the approved SHA.
-3. A JumpServer-enabled pod persists a plan and restarts. The resumed session pushes a playbook, waits for a human MR merge and production approval, then verifies execution, the audit row, `/status`, transcript continuity, and sandbox cleanup.
+```bash
+# Offline GitLab uses Git and git-http-backend
+npm run e2e:offline
 
-To use an existing local MySQL 8.0 instance, set `E2E_MYSQL_HOST=127.0.0.1`. The optional `E2E_MYSQL_PORT`, `E2E_MYSQL_USER`, `E2E_MYSQL_PASSWORD`, and `E2E_MYSQL_DATABASE` default to `3306`, `root`, an empty password, and `detent`. Use a dedicated test database. The harness creates the Detent tables and removes its session rows during teardown.
+# Local GitLab CE 18.3.0 with E2E_GITLAB_ADMIN_TOKEN exported
+E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab
+```
+
+Set the live URL to the origin GitLab advertises for HTTP clones. Allow the GitLab container to send project webhooks to `host.docker.internal`. For another route, set `E2E_DETENT_PUBLIC_URL` to the address GitLab can reach and `E2E_POD_PORT` to the corresponding host listener port. Each live run leaves its own `e2e-*/workspace-hub` and three target projects for inspection and revokes its temporary tokens.
+
+Bootstrap runs twice and checks nine Hub files, ten labels, hooks, and preservation of credentials and a customized SOP. Both targets exercise the same six scenarios.
+
+1. Unlabeled and missing-capability Issues receive guidance and stay open and idle with zero model requests.
+2. Code delivery writes to two repositories. Closure is denied with two open MRs and again with one. The second merge triggers closure and archives both worktrees.
+3. A live edit to the release SOP publishes a pinned tag and Release after maintainer approval.
+4. A new hotfix SOP publishes only a tag and requires separate production-tier closure approval.
+5. Readonly audit verifies nginx on `web01` and closes with zero approval rows.
+6. Environment change resumes its plan after a pod restart. A human merges the Ansible MR and approves execution. The suite checks the pinned ZIP, successful execution audit, post-change inspection and empty sandbox.
+
+The two blocked Issues remain open. Each completed workflow verifies GitLab `closed` and `claude::done` alongside MySQL `DONE`.
+
+By default the suite starts a container from a locally cached `mysql:8.0` image. To use an existing local MySQL 8.0 instance, set `E2E_MYSQL_HOST=127.0.0.1`. The optional `E2E_MYSQL_PORT`, `E2E_MYSQL_USER`, `E2E_MYSQL_PASSWORD`, and `E2E_MYSQL_DATABASE` default to `3306`, `root`, an empty password, and `detent`. Use a dedicated test database. The harness creates the Detent tables and removes its session rows during teardown.
 
 ## Interactive Issue Workflow
+
+### Issue closure
+
+Hub SOPs select `close_policy: manual | auto | approve`. The default, `manual`, leaves closure to a human. With `auto`, Claude can request closure through `detent_close_issue`. With `approve`, that request also needs a closure card approved at the SOP’s configured tier.
+
+Four guards apply at request time and again at turn completion. A governed plan needs approval, other pending approvals must be resolved, all open session MRs must be merged, and `canCloseIssue` must allow closure. Delivery requires the latest execution to be `SUCCESS` when one exists. The successful turn saves its transcript and workspace, rechecks the guards, posts the final report, archives worktrees, closes the Issue and records `DONE` / `claude::done`.
 
 ### End-to-End Example
 

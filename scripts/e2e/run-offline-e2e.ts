@@ -10,13 +10,15 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { parseEnv, promisify } from 'node:util';
 import mysql, { type RowDataPacket } from 'mysql2/promise';
 import { createOfflineAnthropic } from './offline-anthropic.js';
+import { gitlabApi } from './gitlab-driver.js';
+import { liveGitLab } from './live-gitlab.js';
 import { offlineGitLab } from './offline-gitlab.js';
 import { offlineJumpServer } from './offline-jumpserver.js';
 
 const run = promisify(execFile);
 const loopback = '127.0.0.1';
-async function listen(server: Server) {
-  server.listen(0, loopback);
+async function listen(server: Server, port = 0, host = loopback) {
+  server.listen(port, host);
   await once(server, 'listening');
   return (server.address() as AddressInfo).port;
 }
@@ -67,8 +69,7 @@ async function main() {
       }
     });
     const port = await listen(server);
-    cleanup.push(() => close(server));
-    return 'http://' + loopback + ':' + port;
+    return { baseUrl: 'http://' + loopback + ':' + port, close: () => close(server) };
   }
 
   async function stopPod() {
@@ -83,12 +84,18 @@ async function main() {
   }
 
   try {
-    const gitlab = offlineGitLab(tmp), jms = offlineJumpServer();
-    const gitUrl = await serve(gitlab.handle);
-    const jmsUrl = await serve(jms.handle);
-    const anthropic = createOfflineAnthropic();
-    const anthropicUrl = await serve(anthropic.handle);
     const env = process.env;
+    if (env.npm_lifecycle_event === 'e2e:gitlab') assert.ok(env.E2E_GITLAB_URL, 'Set E2E_GITLAB_URL for live GitLab');
+    const gitlab = env.E2E_GITLAB_URL ? liveGitLab(env.E2E_GITLAB_URL) : await offlineGitLab(tmp, serve);
+    cleanup.push(gitlab.close);
+    await gitlab.ensureUsers();
+    const { web: webRepo, api: apiRepo, ansible: ansibleRepo } = gitlab.targetProjects;
+    const jms = offlineJumpServer({ ansibleRepo });
+    const jmsServer = await serve(jms.handle);
+    cleanup.push(jmsServer.close);
+    const anthropic = createOfflineAnthropic({ webRepo, apiRepo, ansibleRepo });
+    const mock = await serve(anthropic.handle);
+    cleanup.push(mock.close);
     const external = env.E2E_MYSQL_HOST;
     const host = external || loopback;
     assert.ok([loopback, 'localhost', '::1'].includes(host), 'E2E_MYSQL_HOST must be local');
@@ -116,39 +123,36 @@ async function main() {
     assert.match(ready.version, /^8\.0\./);
 
     const reservation = createServer();
-    const podPort = await listen(reservation);
+    const podPort = await listen(reservation, Number(env.E2E_POD_PORT ?? 0), gitlab.podHost);
     cleanup.push(async () => { if (reservation.listening) await close(reservation); });
-    const publicUrl = 'http://' + loopback + ':' + podPort;
+    const publicUrl = gitlab.detentPublicUrl(podPort);
     const sandbox = join(tmp, 'sandboxes'), envFile = join(tmp, '.env');
     const localEnv = { PATH: env.PATH, HOME: tmp, TMPDIR: tmp };
     const provision = (extra: Record<string, string> = {}) => run(join(process.cwd(), 'node_modules/.bin/tsx'), ['scripts/bootstrap.ts', '--env-out', envFile], {
-      env: { ...localEnv, GITLAB_BASE_URL: gitUrl, GITLAB_ADMIN_TOKEN: gitlab.admin, DETENT_PUBLIC_URL: publicUrl,
-        DETENT_TARGET_PROJECTS: 'apps/web,ops/ansible-infra', DETENT_HUB_MEMBERS: 'dev:30,sre:40',
-        HOST: loopback, PORT: String(podPort), EPHEMERAL_ROOT: sandbox, MYSQL_HOST: host, MYSQL_PORT: String(port),
+      env: { ...localEnv, GITLAB_BASE_URL: gitlab.baseUrl, GITLAB_ADMIN_TOKEN: gitlab.adminToken, DETENT_PUBLIC_URL: publicUrl,
+        DETENT_HUB_PROJECT: gitlab.hubProjectPath, DETENT_TARGET_PROJECTS: [webRepo, apiRepo, ansibleRepo].join(','),
+        DETENT_HUB_MEMBERS: gitlab.devUsername + ':30,' + gitlab.sreUsername + ':40',
+        DETENT_BOT_USERNAME: 'e2e-detent-bot', DETENT_BOT_EMAIL: 'e2e-detent-bot@detent.local',
+        DETENT_BOT_TOKEN_EXPIRES_AT: new Date(Date.now() + 86400000).toISOString().slice(0, 10),
+        HOST: gitlab.podHost, PORT: String(podPort), EPHEMERAL_ROOT: sandbox, MYSQL_HOST: host, MYSQL_PORT: String(port),
         MYSQL_USER: user, MYSQL_PASSWORD: password, MYSQL_DATABASE: database, ANTHROPIC_API_KEY: 'offline-api-key',
-        ANTHROPIC_BASE_URL: anthropicUrl, ...extra },
-      timeout: 60000,
+        ANTHROPIC_BASE_URL: mock.baseUrl, ...extra },
+      timeout: 180000,
     });
     await provision();
     const config = parseEnv(await readFile(envFile, 'utf8'));
     assert.equal((await stat(envFile)).mode & 0o777, 0o600);
     assert.equal(config.GITLAB_ADMIN_TOKEN, undefined);
     const hub = Number(config.GITLAB_HUB_PROJECT_ID);
-    async function gitlabGet(path: string) {
-      const res = await fetch(gitUrl + '/api/v4' + path, { headers: { 'PRIVATE-TOKEN': gitlab.admin } });
-      assert.equal(res.status, 200, path);
-      return res.json();
-    }
-    const projects: { id: number; path_with_namespace: string }[] = await gitlabGet('/projects');
-    assert.equal(projects.length, 3);
-    assert.equal(projects.find(p => p.id === hub)?.path_with_namespace, 'ai/workspace-hub');
-    const target = projects.find(p => p.path_with_namespace === 'ops/ansible-infra')!;
-    const web = projects.find(p => p.path_with_namespace === 'apps/web')!;
+    const admin = gitlabApi(gitlab.baseUrl, gitlab.adminToken);
+    if (env.E2E_GITLAB_URL) cleanup.push(() => admin.request('/personal_access_tokens/self', 'DELETE', undefined, config.GITLAB_TOKEN));
+    const project = (path: string) => admin.json<{ id: number; path_with_namespace: string }>('/projects/' + encodeURIComponent(path));
+    const projects = await Promise.all([gitlab.hubProjectPath, webRepo, apiRepo, ansibleRepo].map(project));
+    const [hubProject, web, api, target] = projects;
+    assert.equal(hubProject.id, hub);
+    assert.equal(new Set(projects.map(p => p.id)).size, 4);
     const releasePath = 'workflows/release.md';
-    async function hubFile(path: string) {
-      const file = await gitlabGet('/projects/' + hub + '/repository/files/' + encodeURIComponent(path) + '?ref=main');
-      return Buffer.from(file.content, 'base64').toString();
-    }
+    const hubFile = (path: string) => gitlab.getFile(hub, path);
     const templates = ['CLAUDE.md'];
     for (const name of ['audit', 'code-delivery', 'env-change', 'release'])
       templates.push('workflows/' + name + '.md', '.gitlab/issue_templates/' + name + '.md');
@@ -156,41 +160,53 @@ async function main() {
       assert.equal(await hubFile(path), await readFile(join('examples/hub-workspace', path), 'utf8'), path);
 
     const savedSop = await hubFile(releasePath) + '\nInclude the change ticket in release notes.\n';
-    await gitlab.updateFile(hub, releasePath, savedSop, 'Document team release notes');
-    const jmsEnv = { JUMPSERVER_BASE_URL: jmsUrl, JUMPSERVER_READONLY_TOKEN: jms.readonly, JUMPSERVER_JOB_TOKEN: jms.job };
+    await gitlab.upsertFile(hub, releasePath, savedSop, 'Document team release notes');
+    const jmsEnv = { JUMPSERVER_BASE_URL: jmsServer.baseUrl, JUMPSERVER_READONLY_TOKEN: jms.readonly, JUMPSERVER_JOB_TOKEN: jms.job };
     await provision(jmsEnv);
     const withJms = parseEnv(await readFile(envFile, 'utf8'));
     assert.deepEqual({ ...withJms }, { ...config, ...jmsEnv }, 'Bootstrap changed existing settings or credentials');
     assert.equal(await hubFile(releasePath), savedSop, 'Bootstrap overwrote the customer workflow');
-    const labels: { name: string }[] = await gitlabGet('/projects/' + hub + '/labels');
-    assert.deepEqual(labels.map(l => l.name).sort(), ['claude::coding', 'claude::failed', 'claude::idle', 'claude::planning',
-      'claude::waiting-approval', 'delivery::audit', 'delivery::code', 'delivery::env-change', 'delivery::release']);
+    const labels = await admin.json<{ name: string }[]>('/projects/' + hub + '/labels?per_page=100');
+    for (const name of ['claude::coding', 'claude::done', 'claude::failed', 'claude::idle', 'claude::planning',
+      'claude::waiting-approval', 'delivery::audit', 'delivery::code', 'delivery::env-change', 'delivery::release'])
+      assert.ok(labels.some(label => label.name === name), 'Missing Hub label ' + name);
     for (const p of projects) {
-      const hooks = await gitlabGet('/projects/' + p.id + '/hooks');
+      const hooks = await admin.json<{ url: string; issues_events: boolean; note_events: boolean; emoji_events: boolean;
+        merge_requests_events: boolean; pipeline_events: boolean; push_events: boolean }[]>('/projects/' + p.id + '/hooks');
       assert.equal(hooks.length, 1);
       assert.equal(hooks[0].url, publicUrl + '/webhooks/gitlab');
+      assert.equal(hooks[0].issues_events, p.id === hub);
+      assert.equal(hooks[0].note_events, p.id === hub);
+      assert.equal(hooks[0].emoji_events, p.id === hub);
+      assert.equal(hooks[0].merge_requests_events, p.id !== hub);
       assert.equal(hooks[0].pipeline_events, p.id !== hub);
       assert.equal(hooks[0].push_events, false);
     }
     async function startPod(id: string, settings: NodeJS.ProcessEnv) {
+      assert.equal(settings.ANTHROPIC_BASE_URL, mock.baseUrl, 'Claude Code requires the loopback mock');
       pod = spawn(process.execPath, ['packages/delivery/dist/server.js'], {
         env: { ...localEnv, ...settings, POD_ID: id }, stdio: ['ignore', 'inherit', 'inherit'], detached: true,
       });
       pod.on('error', error => { failure = error; });
       await until(id + ' health check', async () => {
-        const res = await fetch(publicUrl + '/healthz').catch(() => undefined);
+        const res = await fetch('http://' + loopback + ':' + podPort + '/healthz').catch(() => undefined);
         return res?.ok && (await res.json()).podId === id;
       });
     }
     await close(reservation);
-    const fixtures = () => rows('SELECT id FROM issue_sessions WHERE hub_project_id=? AND hub_issue_iid BETWEEN 1 AND 4', [hub]);
-    let ownsIssues = false;
+    const issueIds: number[] = [];
+    async function openIssue(title: string, description = '', label?: string) {
+      const iid = await gitlab.openIssue(hub, { title, description, labels: label ? [label] : [] });
+      issueIds.push(iid);
+      return iid;
+    }
     if (external) cleanup.push(async () => {
-      if (!ownsIssues) return;
+      if (!issueIds.length) return;
       const cx = await db.getConnection();
       try {
         await cx.beginTransaction();
-        for (const fixture of await fixtures()) {
+        const [owned] = await cx.query<RowDataPacket[]>('SELECT id FROM issue_sessions WHERE hub_project_id=? AND hub_issue_iid IN (?)', [hub, issueIds]);
+        for (const fixture of owned) {
           for (const table of ['delivery_executions', 'approval_requests', 'session_merge_requests', 'session_worktrees', 'session_messages'])
             await cx.query('DELETE FROM ' + table + ' WHERE session_id=?', [fixture.id]);
           await cx.query('DELETE FROM issue_sessions WHERE id=?', [fixture.id]);
@@ -204,107 +220,163 @@ async function main() {
     cleanup.push(stopPod);
     const noJms = Object.fromEntries(Object.entries(config).filter(([key]) => !key.startsWith('JUMPSERVER_')));
     await startPod('detent-pod-nojms', noJms);
-    assert.deepEqual(await fixtures(), [], 'Fixture Issues already exist');
-    ownsIssues = true;
-    async function state(iid: number, status: string) {
+    assert.deepEqual(await rows('SELECT id FROM issue_sessions WHERE hub_project_id=? LIMIT 1', [hub]), [], 'Hub already has sessions');
+    const notes = (iid: number) => gitlab.listIssueNotes(hub, iid);
+    const award = (iid: number, approval: RowDataPacket, actor: 'dev' | 'sre') =>
+      gitlab.awardThumbsUp(hub, iid, approval.gitlab_note_id, actor);
+    const records = (session: string, table: string) => rows('SELECT * FROM ' + table + ' WHERE session_id=?', [session]);
+    async function state(iid: number, status: string, afterSeq = -1) {
       return until('#' + iid + ' ' + status, async () => {
         const [s] = await rows('SELECT * FROM issue_sessions WHERE hub_project_id=? AND hub_issue_iid=?', [hub, iid]);
-        if (s?.status === 'FAILED') throw Error('Delivery failed: ' + gitlab.issueNotes(iid).at(-1));
-        if (s?.status === status && (status === 'WAITING_TOOL' || !s.locked_by_pod)) return s;
+        if (s?.status === 'FAILED') throw Error('Delivery failed: ' + (await notes(iid)).map(n => n.body).join('\n'));
+        if (s?.status === status && s.last_message_seq > afterSeq && (status === 'WAITING_TOOL' || !s.locked_by_pod)) return s;
       });
     }
 
+    async function done(iid: number) {
+      const s = await state(iid, 'DONE');
+      const issue = await gitlab.getIssue(hub, iid);
+      assert.equal(issue.state, 'closed');
+      assert.ok(issue.labels.includes('claude::done'));
+      return s;
+    }
+    async function pendingCard(iid: number, tool: string, fields: string[]) {
+      const s = await state(iid, tool === 'Plan' ? 'WAITING_PLAN' : 'WAITING_TOOL');
+      const card = await until(tool + ' pending card', async () => {
+        const [row] = await rows("SELECT * FROM approval_requests WHERE session_id=? AND tool_name=? AND status='PENDING'", [s.id, tool]);
+        return row?.gitlab_note_id && row;
+      });
+      const body = (await notes(iid)).find(n => n.id === card.gitlab_note_id)?.body;
+      for (const field of fields) assert.ok(body?.includes(field), 'Missing card field ' + field);
+      return card;
+    }
     async function rejectDeveloper(iid: number, approval: RowDataPacket) {
-      gitlab.membershipChecks.length = 0;
-      await gitlab.awardEmoji(iid, approval.gitlab_note_id, 'dev');
-      await until('developer RBAC lookup', () => gitlab.membershipChecks.includes(hub + '/2'));
+      const checks = gitlab.membershipChecks;
+      if (checks) checks.length = 0;
+      await award(iid, approval, 'dev');
+      if (checks) await until('developer RBAC lookup', () => checks.includes(hub + '/2'));
+      else await delay(1500);
       assert.equal((await rows('SELECT status FROM approval_requests WHERE id=?', [approval.id]))[0].status, 'PENDING');
     }
 
-    anthropic.resetRequests();
-    const unlabeled = await gitlab.openIssue(hub, { title: 'Choose a workflow', description: '', labels: [] });
+    const unlabeled = await openIssue('Choose a workflow');
     await state(unlabeled, 'IDLE');
+    assert.equal((await gitlab.getIssue(hub, unlabeled)).state, 'opened');
     assert.equal(anthropic.getRequests(), 0);
-    const [menu] = gitlab.issueNotes(unlabeled);
+    const menu = (await notes(unlabeled)).map(n => n.body).join('\n');
     assert.match(menu, /delivery::audit\b/);
     assert.match(menu, /delivery::env-change .*缺少能力包：jumpserver/);
     assert.match(menu, /delivery::release .*已就绪/);
     assert.match(menu, /delivery::code .*已就绪/);
-    const missing = await gitlab.openIssue(hub, { title: 'Inspect web01', description: '', labels: ['delivery::env-change'] });
+    const missing = await openIssue('Inspect web01', '', 'delivery::env-change');
     await state(missing, 'IDLE');
+    assert.equal((await gitlab.getIssue(hub, missing)).state, 'opened');
     assert.equal(anthropic.getRequests(), 0);
-    const [guidance] = gitlab.issueNotes(missing);
+    const guidance = (await notes(missing)).map(n => n.body).join('\n');
     assert.match(guidance, /jumpserver：.*JUMPSERVER_BASE_URL/);
     const alternatives = guidance.split('\n').find(line => line.includes('已就绪的工作流标签')) ?? '';
     for (const label of ['delivery::release', 'delivery::code']) assert.ok(alternatives.includes(label));
     console.log('Workflow menu and missing-capability guidance posted with zero Anthropic requests.');
 
-    const customReleaseWorkflow = [
-      '---', 'label: delivery::release', 'mode: governed', 'requires: [gitlab-release]', 'approver_tier: prod', '---',
-      'CUSTOM_RELEASE_TAG_PREFIX: rel-', 'List existing tags, then request approval to publish the pinned commit.', '',
-    ].join('\n');
-    await gitlab.updateFile(hub, releasePath, customReleaseWorkflow, 'Customize release tag convention');
-    const webSha = gitlab.headSha(web.id);
-    assert.match(webSha, /^[a-f0-9]{40}$/);
-    const release = await gitlab.openIssue(hub, { title: 'Publish the web service', description: 'Release apps/web at ' + webSha,
-      labels: ['delivery::release'] });
-    const planned = await state(release, 'WAITING_PLAN');
-    const [releasePlan] = await rows('SELECT * FROM approval_requests WHERE session_id=? AND approval_type=?', [planned.id, 'PLAN']);
-    const planBody = gitlab.notes.get(releasePlan.gitlab_note_id)!.body;
-    for (const field of ['rel-1.0.0', webSha]) assert.ok(planBody.includes(field));
-    await gitlab.awardEmoji(release, releasePlan.gitlab_note_id, 'dev');
-    await state(release, 'WAITING_TOOL');
-    const [publish] = await rows('SELECT * FROM approval_requests WHERE session_id=? AND tool_name=?', [planned.id, 'detent_create_release']);
-    const releaseCard = gitlab.notes.get(publish.gitlab_note_id)!.body;
-    for (const field of ['GitLab 发布审批', 'apps/web', 'rel-1.0.0', webSha]) assert.ok(releaseCard.includes(field));
-    await rejectDeveloper(release, publish);
-    assert.equal(gitlab.tagCommit(web.id, 'rel-1.0.0'), undefined);
-    assert.deepEqual(gitlab.releases.get(web.id), []);
-    await gitlab.awardEmoji(release, publish.gitlab_note_id, 'sre');
-    await state(release, 'IDLE');
-    const [published] = await rows('SELECT status, decided_by FROM approval_requests WHERE id=?', [publish.id]);
-    assert.equal(published.status, 'APPROVED');
-    assert.equal(published.decided_by, 'sre');
-    assert.equal(gitlab.tagCommit(web.id, 'rel-1.0.0'), webSha);
-    assert.deepEqual(gitlab.releases.get(web.id), [{ tag_name: 'rel-1.0.0', name: 'Release rel-1.0.0',
-      description: 'Live customized release workflow verified.', commit: { id: webSha },
-      _links: { self: gitUrl + '/apps/web/-/releases/rel-1.0.0' } }]);
-    assert.ok(gitlab.issueNotes(release).some(note => note.includes('Release rel-1.0.0 published for apps/web.')));
-    assert.deepEqual(await readdir(sandbox), []);
-    console.log('Live Hub release SOP verified on the same pod. Maintainer approved the pinned tag and release.');
+    const code = await openIssue('Deliver hello.txt', 'Update ' + webRepo + ' and ' + apiRepo, 'delivery::code');
+    await award(code, await pendingCard(code, 'Plan', [webRepo, apiRepo]), 'dev');
+    const review = await state(code, 'IDLE');
+    const mrs = await records(review.id, 'session_merge_requests');
+    assert.deepEqual(mrs.map(m => m.target_project_id).sort(), [web.id, api.id].sort());
+    assert.ok(mrs.every(m => m.mr_state === 'opened'));
+    const reviewNote = (await notes(code)).find(n => n.body.includes('Please review and merge both MRs'));
+    assert.ok(reviewNote && mrs.every(m => reviewNote.body.includes(m.mr_web_url)));
+    assert.equal((await gitlab.getIssue(hub, code)).state, 'opened');
+    const firstMr = mrs.find(m => m.target_project_id === web.id)!;
+    const secondMr = mrs.find(m => m.target_project_id === api.id)!;
+    await gitlab.mergeMergeRequest(firstMr.target_project_id, firstMr.mr_iid);
+    const waitingForMerge = await state(code, 'IDLE', review.last_message_seq);
+    assert.ok((await notes(code)).some(n => n.body.includes('Waiting for the remaining MR to merge.')));
+    assert.equal((await records(review.id, 'session_merge_requests')).filter(m => m.mr_state === 'opened').length, 1);
+    assert.equal((await gitlab.getIssue(hub, code)).state, 'opened');
+    await gitlab.mergeMergeRequest(secondMr.target_project_id, secondMr.mr_iid);
+    assert.ok((await done(code)).last_message_seq > waitingForMerge.last_message_seq);
+    const trees = await records(review.id, 'session_worktrees');
+    assert.equal(trees.length, 2);
+    assert.ok(trees.every(t => t.status === 'ARCHIVED' && t.branch_name === 'feat/issue-' + code));
+    for (const p of [web, api]) assert.equal(await gitlab.getFile(p.id, 'hello.txt'), 'Hello from ' + p.path_with_namespace + '!\n');
+    console.log('Cross-repo Issue closed after both human merges.');
 
+    const shaToPublish = await gitlab.headSha(web.id);
+    for (const workflow of ['release', 'hotfix']) {
+      const hotfix = workflow === 'hotfix';
+      const label = 'delivery::' + workflow;
+      const tag = hotfix ? 'hotfix-1.0.1' : 'rel-1.0.0';
+      const marker = hotfix ? 'CUSTOM_HOTFIX_WORKFLOW: hotfix-' : 'CUSTOM_RELEASE_TAG_PREFIX: rel-';
+      if (hotfix) await gitlab.ensureLabel(hub, label);
+      const sop = ['---', 'label: ' + label, 'mode: governed', 'requires: [gitlab-release]', 'approver_tier: prod',
+        'close_policy: ' + (hotfix ? 'approve' : 'auto'), '---', marker,
+        'List tags and publish the pinned commit after approval.', ''].join('\n');
+      await gitlab.upsertFile(hub, 'workflows/' + workflow + '.md', sop, 'Customize ' + workflow + ' workflow');
+      const iid = await openIssue('Publish ' + tag, 'Publish ' + webRepo + ' at ' + shaToPublish, label);
+      await award(iid, await pendingCard(iid, 'Plan', [tag, shaToPublish]), 'dev');
+      const publish = await pendingCard(iid, 'detent_create_release', ['GitLab 发布审批', webRepo, tag, shaToPublish]);
+      await rejectDeveloper(iid, publish);
+      assert.equal(await gitlab.getTagCommit(web.id, tag), null);
+      assert.equal(await gitlab.getRelease(web.id, tag), null);
+      await award(iid, publish, 'sre');
+      if (hotfix) {
+        const closure = await pendingCard(iid, 'detent_close_issue', ['工单闭环关闭审批', tag]);
+        assert.equal(await gitlab.getTagCommit(web.id, tag), shaToPublish);
+        await rejectDeveloper(iid, closure);
+        assert.equal((await gitlab.getIssue(hub, iid)).state, 'opened');
+        await award(iid, closure, 'sre');
+      }
+      const published = await done(iid);
+      const report = hotfix ? 'Hotfix tag approved and verified.' : 'Release ' + tag + ' published for ' + webRepo;
+      assert.ok((await notes(iid)).some(n => n.body.includes(report)));
+      assert.equal(await gitlab.getTagCommit(web.id, tag), shaToPublish);
+      assert.deepEqual(await gitlab.getRelease(web.id, tag), hotfix ? null : { tag_name: tag, name: 'Release ' + tag,
+        description: 'Live customized release workflow verified.', commitSha: shaToPublish });
+      for (const approval of await records(published.id, 'approval_requests')) {
+        assert.equal(approval.status, 'APPROVED');
+        assert.equal(approval.decided_by, approval.tool_name === 'Plan' ? gitlab.devUsername : gitlab.sreUsername);
+      }
+      console.log('Verified live ' + workflow + ' SOP, production approvals and closed Issue.');
+    }
     await stopPod();
     await startPod('detent-pod-1', withJms);
-    const change = await gitlab.openIssue(hub, { title: 'Reload nginx on web01',
-      description: 'Prepare and verify a reviewed nginx reload.', labels: ['delivery::env-change'] });
-    assert.deepEqual([unlabeled, missing, release, change], [1, 2, 3, 4]);
+    const inspection = await openIssue('Diagnose nginx on web01', '', 'delivery::audit');
+    const inspected = await done(inspection);
+    assert.deepEqual(await records(inspected.id, 'approval_requests'), []);
+    assert.equal(jms.inspections.length, 1);
+    assert.ok((await notes(inspection)).some(n => n.body.includes('Diagnostic report: nginx is active on web01.')));
+
+    const change = await openIssue('Reload nginx on web01', 'Prepare and verify a reviewed nginx reload.', 'delivery::env-change');
     const first = await state(change, 'WAITING_PLAN');
     const id = first.id;
-    const records = (table: string) => rows('SELECT * FROM ' + table + ' WHERE session_id=?', [id]);
     const transcript = () => rows('SELECT seq, raw_json_line FROM session_messages WHERE session_id=? ORDER BY seq', [id]);
     const prefix = await transcript();
     assert.ok(prefix.length > 0 && prefix.length === first.last_message_seq);
-    const [plan] = await records('approval_requests');
+    const [plan] = await records(id, 'approval_requests');
     assert.equal(plan.approval_type, 'PLAN');
-    assert.match(gitlab.notes.get(plan.gitlab_note_id)!.body, /Claude 实施方案审批/);
-    assert.equal(jms.inspections.length, 1);
+    await pendingCard(change, 'Plan', ['### 📋 实施方案审批']);
+    assert.equal(jms.inspections.length, 2);
     assert.deepEqual(await readdir(sandbox), []);
     console.log('Plan persisted. Restarting the delivery pod.');
     await stopPod();
     await startPod('detent-pod-2', withJms);
-    await gitlab.awardEmoji(change, plan.gitlab_note_id, 'dev');
+    await award(change, plan, 'dev');
     const coding = await state(change, 'IDLE');
     assert.equal(coding.claude_session_id, first.claude_session_id);
     assert.ok(coding.last_message_seq > first.last_message_seq);
-    assert.ok((await transcript()).some(row => row.raw_json_line.includes('尚未合并')), 'Missing pre-merge rejection');
-    const [mr] = await records('session_merge_requests');
+    const preMerge = await transcript();
+    for (const reason of ['尚未合并', '未合并的 MR'])
+      assert.ok(preMerge.some(row => row.raw_json_line.includes(reason)), 'Missing pre-merge rejection: ' + reason);
+    assert.equal((await gitlab.getIssue(hub, change)).state, 'opened');
+    const [mr] = await records(id, 'session_merge_requests');
     assert.equal(mr.mr_state, 'opened');
     assert.equal(mr.mr_iid, 1);
     assert.equal(mr.target_project_id, target.id);
-    const [worktree] = await records('session_worktrees');
+    const [worktree] = await records(id, 'session_worktrees');
     assert.equal(worktree.id, mr.worktree_id);
     assert.equal(worktree.branch_name, 'change/issue-' + change);
-    assert.equal((await records('approval_requests')).length, 1);
+    assert.equal((await records(id, 'approval_requests')).length, 1);
     assert.deepEqual(jms.uploads, []);
     assert.deepEqual(jms.executions, []);
     console.log('MR opened after restart. Premature execution denied.');
@@ -312,30 +384,33 @@ async function main() {
     const sha = await gitlab.mergeMergeRequest(target.id, 1);
     const waiting = await state(change, 'WAITING_TOOL');
     assert.match(waiting.locked_by_pod, /^detent-pod-2\//);
-    const [merged] = await records('session_merge_requests');
+    const [merged] = await records(id, 'session_merge_requests');
     assert.equal(merged.merge_commit_sha, sha);
     assert.equal(merged.mr_state, 'merged');
-    assert.equal(merged.merged_by, 'sre');
+    assert.equal(merged.merged_by, gitlab.sreUsername);
     assert.notEqual(sha, worktree.last_commit_sha, 'Expected a distinct merge commit');
-    const approvals = await records('approval_requests');
+    const approvals = await records(id, 'approval_requests');
     assert.equal(approvals.length, 2);
-    assert.equal(approvals.find(a => a.id === plan.id)?.decided_by, 'dev');
+    assert.equal(approvals.find(a => a.id === plan.id)?.decided_by, gitlab.devUsername);
     const production = approvals.find(a => a.tool_name === 'jms_run_ansible_job')!;
-    const card = gitlab.notes.get(production.gitlab_note_id)!.body;
-    for (const field of ['生产变更执行审批', sha, 'web01', 'deploy/nginx-reload.yml', mr.mr_web_url]) assert.ok(card.includes(field));
+    await pendingCard(change, 'jms_run_ansible_job', ['生产变更执行审批', sha, 'web01', 'deploy/nginx-reload.yml', mr.mr_web_url]);
+    await gitlab.postNote(hub, change, '/status');
+    const status = await until('/status reply', async () => (await notes(change)).find(n => n.body.startsWith('WAITING_TOOL\n')));
+    for (const field of [ansibleRepo + '!1', 'merged @ ' + sha.slice(0, 8), production.id]) assert.ok(status.body.includes(field));
     await rejectDeveloper(change, production);
     assert.deepEqual(jms.uploads, []);
     assert.deepEqual(jms.executions, []);
 
-    await gitlab.awardEmoji(change, production.gitlab_note_id, 'sre');
-    const final = await state(change, 'IDLE');
+    await award(change, production, 'sre');
+    const final = await done(change);
+    assert.deepEqual((await records(id, 'session_worktrees')).map(t => t.status), ['ARCHIVED']);
     assert.equal(final.claude_session_id, first.claude_session_id);
     const [decision] = await rows('SELECT * FROM approval_requests WHERE id=?', [production.id]);
-    assert.equal(decision.decided_by, 'sre');
+    assert.equal(decision.decided_by, gitlab.sreUsername);
     assert.equal(decision.status, 'APPROVED');
     assert.deepEqual(jms.uploads, [sha]);
-    assert.equal(jms.inspections.length, 2);
-    const audits = await records('delivery_executions');
+    assert.equal(jms.inspections.length, 3);
+    const audits = await records(id, 'delivery_executions');
     assert.equal(audits.length, 1);
     const [audit] = audits;
     assert.deepEqual(jms.executions, [audit.jumpserver_job_id]);
@@ -346,11 +421,7 @@ async function main() {
     assert.equal(audit.status, 'SUCCESS');
     assert.match(audit.output_summary, /nginx reloaded/);
     assert.ok(audit.finished_at);
-    assert.ok(gitlab.issueNotes(change).some(n => n.includes('Reload verified on web01')));
-    await gitlab.postNote(change, '/status');
-    const status = await until('/status reply', () => gitlab.issueNotes(change).find(n => n.startsWith('IDLE\n')));
-    for (const field of ['ops/ansible-infra!1', 'merged @ ' + sha.slice(0, 8), '交付执行记录', 'env-change',
-      'deploy/nginx-reload.yml', 'SUCCESS', audit.jumpserver_job_url, production.id]) assert.ok(status.includes(field));
+    assert.ok((await notes(change)).some(n => n.body.includes('Reload verified on web01')));
     const history = await transcript();
     assert.deepEqual(history.slice(0, prefix.length), prefix);
     assert.equal(history.length, final.last_message_seq);

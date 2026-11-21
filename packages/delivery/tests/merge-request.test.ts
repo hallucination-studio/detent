@@ -184,3 +184,18 @@ it('ignores other MR actions, inconsistent state and untracked merges', async ()
   expect(mergeNotes()).toHaveLength(0);
   expect(run).toHaveBeenCalledOnce();
 });
+
+it('records a merge after Issue closure without resuming the session', async () => {
+  const { post, queue, session, repo, run, approveAndCreateMr, mergeNotes } = await setup();
+  const mr = await approveAndCreateMr();
+  await post({ object_kind: 'issue', project: hub, user, object_attributes: { ...issue, action: 'close' } });
+  await queue.drain();
+  await post(merge);
+  await queue.drain();
+  expect(await repo.findMergeRequest(2, 5)).toMatchObject([{
+    id: mr.id, mrState: 'merged', mergeCommitSha: sha, mergedBy: user.username,
+  }]);
+  expect((await repo.getSession(session.id))?.status).toBe('DONE');
+  expect(mergeNotes()).toHaveLength(0);
+  expect(run).toHaveBeenCalledTimes(2);
+});

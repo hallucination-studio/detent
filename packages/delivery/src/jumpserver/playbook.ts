@@ -14,7 +14,8 @@ export async function playbookUpload(
   const project = encodeURIComponent(request.repository);
   const url = new URL(gitlab.gitlabBaseUrl.replace(/\/$/, '') + '/api/v4/projects/' + project + '/repository/archive.zip');
   url.searchParams.set('sha', request.commitSha);
-  const res = await fetch(url, { headers: { 'PRIVATE-TOKEN': gitlab.gitlabToken }, redirect: 'error', signal });
+  // GitLab's HotlinkingDetector rejects archive downloads carrying Node fetch's default Sec-Fetch-Mode: cors.
+  const res = await fetch(url, { headers: { 'PRIVATE-TOKEN': gitlab.gitlabToken }, mode: 'same-origin', redirect: 'error', signal });
   if (!res.ok || !res.body) throw Error('GitLab archive HTTP ' + res.status);
 
   // Bound both the download and inflation before allocating the working tree.

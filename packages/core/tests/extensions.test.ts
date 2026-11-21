@@ -217,17 +217,23 @@ it('accepts extension webhooks while work is pending and retries busy handlers i
   expect(handle).toHaveBeenCalledTimes(2);
 });
 
-it('passes the profile name to tools and forces readonly SDK options in a writable session', async () => {
-  const { gate, execute, ctx } = await setup('default', 'readonly', { name: 'Reviewer', readonly: true });
+it.each(['plan', 'default'] as const)('uses the default SDK mode and locks readonly tools in %s sessions', async mode => {
+  const { gate, execute, ctx } = await setup(mode, 'readonly', { name: 'Reviewer', readonly: true });
   const { config, controller, session, workspaceRoot } = ctx;
   await gate.invokeExtension(toolId, input);
   expect(execute).toHaveBeenCalledWith(input, expect.objectContaining({ profileName: 'Reviewer' }));
-  const sandbox = { workspaceRoot, rootDir: '/', claudeHome: '/home' };
+  const sandbox = { workspaceRoot, rootDir: '/turn-test', claudeHome: '/home' };
   const tools = new WorkspaceTools(new EphemeralSandbox(config, ctx.repo, ctx.gitlab), sandbox, session.id);
+  const progress = vi.fn();
   await new SdkClaudeRunner(config).run({ gate, controller, session, sandbox, tools, resume: false,
-    prompt: 'inspect', systemPrompt: '', progress: vi.fn() });
-  expect(vi.mocked(query).mock.lastCall![0].options).toMatchObject({
-    permissionMode: 'plan', disallowedTools: expect.arrayContaining(['Edit', 'Write']),
+    prompt: 'inspect', systemPrompt: '', progress });
+  const options = vi.mocked(query).mock.lastCall![0].options!;
+  const command = 'git -C ' + workspaceRoot + '/projects/app status ' + workspaceRoot + ' ' + 'x'.repeat(100);
+  await options.canUseTool!('Bash', { command }, { signal: controller.signal });
+  expect(progress).toHaveBeenCalledWith(expect.stringMatching(/^Bash git -C projects\/app status \. x+…$/));
+  expect(progress.mock.calls[0][0]).toHaveLength(100);
+  expect(options).toMatchObject({
+    permissionMode: 'default', disallowedTools: expect.arrayContaining(['Edit', 'Write']),
   });
   for (const policy of ['coding_auto', 'always_approve'] as const) {
     const { gate } = await setup('default', policy, { readonly: true });

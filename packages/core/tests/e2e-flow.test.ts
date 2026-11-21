@@ -307,6 +307,7 @@ it.each([[1, 333], [300, 15000]])('renews a %is lease every %ims', async (ttl, i
     } finally {
       release();
       await closing;
+      expect((await repo.getSession(s.id))?.status).toBe('DONE');
     }
   } finally {
     vi.useRealTimers();
@@ -469,7 +470,7 @@ it('publishes readonly results directly and includes extension status before app
     expect(await repo.getLatestApproval(s.id)).toBeNull();
     expect(gitlab.notes.at(-1)).toContain('Inspection complete');
     await dispatchWebhook(app, note('/status'));
-    expect(gitlab.notes.at(-1)).toMatch(/### Merge Requests\n\nReview for #42\n\n无待审批项$/);
+    expect(gitlab.notes.at(-1)).toBe('IDLE\n\nReview for #42\n\n无待审批项');
   } finally {
     await rm(root, { recursive: true, force: true });
   }

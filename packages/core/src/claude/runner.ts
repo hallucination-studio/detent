@@ -33,7 +33,10 @@ export class SdkClaudeRunner implements ClaudeRunner {
     const { session, sandbox, gate } = t;
     const id = session.claudeSessionId!;
     const canUseTool = (name: string, input: Record<string, unknown>) => {
-      t.progress(name + (typeof input.command === 'string' ? ' ' + input.command : ''));
+      const label = redactGitUrl(name + (typeof input.command === 'string' ? ' ' + input.command : ''))
+        .replaceAll(sandbox.workspaceRoot + '/', '').replaceAll(sandbox.workspaceRoot, '.')
+        .replaceAll(sandbox.rootDir, '.').replace(/\s+/g, ' ').trim();
+      t.progress(label.length > 100 ? label.slice(0, 99) + '…' : label);
       return gate.canUseTool(name, input);
     };
     const invoke = async (name: ToolName, input: Record<string, unknown>) => {
@@ -109,7 +112,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
           cwd: sandbox.workspaceRoot,
           abortController: t.controller,
           env,
-          permissionMode: gate.readonly ? 'plan' : session.permissionMode,
+          permissionMode: gate.readonly ? 'default' : session.permissionMode,
           resume: t.resume ? id : undefined,
           extraArgs: {
             'setting-sources': 'user',

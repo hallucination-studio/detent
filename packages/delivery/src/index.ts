@@ -1,5 +1,5 @@
 import {
-  createDetentApp, createGitLabReleaseCapability, GitLabClient, loadConfig,
+  createDecisionClient, createDetentApp, createGitLabReleaseCapability, GitLabClient, loadConfig,
   type AppConfig, type DetentCapabilityPack, type DetentExtensions, type ReleaseGitLab,
 } from '@detent/core';
 import { createDeliveryTurnProfileResolver } from './agents/profiles.js';
@@ -30,6 +30,7 @@ export interface DeliveryOptions extends DetentExtensions {
 
 export function createDeliveryApp(config: AppConfig = loadConfig(), options: DeliveryOptions = {}): ReturnType<typeof createDetentApp> {
   const { deliveryConfig = loadDeliveryConfig(), jumpserverClient, gitlabClient, executionTracker, ...extensions } = options;
+  const decision = extensions.decisionClient ?? createDecisionClient(config);
   const client = jumpserverClient ?? (deliveryConfig.jumpserverBaseUrl ? new HttpJumpServerClient(deliveryConfig, config) : undefined);
   const auditRepo = executionTracker ? undefined : new MySqlDeliveryAuditRepository();
   const tracker = executionTracker ?? auditRepo;
@@ -42,13 +43,13 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
   const jumpserver: DetentCapabilityPack = {
     name: 'jumpserver', enabled: !!client,
     setupHint: '请配置 JUMPSERVER_BASE_URL 及独立的只读/任务中心凭证（JUMPSERVER_READONLY_* 与 JUMPSERVER_JOB_*）',
-    tools: client ? createJumpServerTools({ client, config: deliveryConfig, tracker }) : [],
+    tools: client ? createJumpServerTools({ client, config: deliveryConfig, tracker, decision }) : [],
   };
   const packs = new Map<string, DetentCapabilityPack>();
   for (const pack of [release, jumpserver, ...(extensions.capabilities ?? [])]) packs.set(pack.name.trim().toLowerCase(), pack);
   const capabilities = [...packs.values()];
   return createDetentApp(config, {
-    ...extensions, capabilities,
+    ...extensions, capabilities, decisionClient: decision,
     resolveTurnProfile: createDeliveryTurnProfileResolver(deliveryConfig, {
       async canCloseIssue({ session }) {
         const rows = await tracker?.listSessionExecutions?.(session.id);

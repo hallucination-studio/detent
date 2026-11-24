@@ -6,7 +6,7 @@ async function main() {
   const config = loadConfig();
   const app = createDetentApp(config);
   const report = (error: unknown) =>
-    console.error(redactGitUrl(error instanceof Error ? error.message : String(error)));
+    console.error(redactGitUrl(error instanceof Error ? error.message : String(error), process.env.JEV_API_KEY?.trim()));
   try {
     await app.listen({ host: config.host, port: config.port });
     for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => void app.close().catch(report));
@@ -16,6 +16,6 @@ async function main() {
   }
 }
 main().catch((error: unknown) => {
-  console.error(redactGitUrl(error instanceof Error ? error.message : String(error)));
+  console.error(redactGitUrl(error instanceof Error ? error.message : String(error), process.env.JEV_API_KEY?.trim()));
   process.exitCode = 1;
 });

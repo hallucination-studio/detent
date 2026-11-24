@@ -18,7 +18,7 @@ export function createDetentApp(config: AppConfig, extensions: DetentExtensions 
   const repo = new MySqlDetentRepository(pool);
   const orchestrator = new SessionOrchestrator(config, repo, client, new SdkClaudeRunner(config), extensions);
   const report = (error: unknown) =>
-    console.error(redactGitUrl(error instanceof Error ? error.message : String(error)));
+    console.error(redactGitUrl(error instanceof Error ? error.message : String(error), config.jevApiKey));
   const queue = new WebhookQueue((event) => dispatchWebhook(orchestrator, event), report);
   const app = createWebhookApp(
     config, client, (id, event) => queue.submit(id, event),

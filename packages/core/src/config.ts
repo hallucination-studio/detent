@@ -31,6 +31,16 @@ const ConfigSchema = z.object({
   anthropicBaseUrl: z.string().optional(),
   claudeModel: z.string().default('claude-sonnet-4-20250514'),
   claudeMaxTurns: z.coerce.number().int().default(40),
+  jevProvider: z.enum(['off', 'bailian', 'typesafe', 'custom']).default('off'),
+  jevBaseUrl: z.string().url().refine(value => {
+    if (!URL.canParse(value)) return false;
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && !/[?#]/.test(value);
+  }, 'Expected an HTTP(S) service URL without credentials, query or fragment').optional(),
+  jevApiKey: z.string().optional(),
+  jevModel: z.string().optional(),
+  jevThreshold: z.coerce.number().min(0.5).max(0.99).default(0.9),
+  jevTimeoutMs: z.coerce.number().int().positive().max(30000).default(2500),
   safeBashPrefixes: z
     .string()
     .default('git status,git diff,git log,git branch')
@@ -45,7 +55,7 @@ const ConfigSchema = z.object({
 export type AppConfig = z.infer<typeof ConfigSchema>;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
-  return ConfigSchema.parse({
+  const config = ConfigSchema.parse({
     port: env.PORT,
     host: env.HOST,
     podId: env.POD_ID,
@@ -72,6 +82,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     anthropicBaseUrl: env.ANTHROPIC_BASE_URL,
     claudeModel: env.CLAUDE_MODEL,
     claudeMaxTurns: env.CLAUDE_MAX_TURNS,
+    jevProvider: env.JEV_PROVIDER?.trim().toLowerCase() || 'off',
+    jevBaseUrl: env.JEV_BASE_URL?.trim() || undefined,
+    jevApiKey: env.JEV_API_KEY?.trim() || undefined,
+    jevModel: env.JEV_MODEL?.trim() || undefined,
+    jevThreshold: env.JEV_THRESHOLD,
+    jevTimeoutMs: env.JEV_TIMEOUT_MS,
     safeBashPrefixes: env.SAFE_BASH_PREFIXES,
   });
+  if (config.jevProvider === 'off') return config;
+  if (config.jevProvider === 'typesafe') config.jevBaseUrl ??= 'https://api.typesafe.ai/v1/systemone';
+  if (!config.jevBaseUrl) throw Error('JEV_BASE_URL is required for this provider');
+  if (config.jevProvider !== 'custom' && !config.jevApiKey) throw Error('JEV_API_KEY is required for this provider');
+  config.jevModel ??= config.jevProvider === 'bailian' ? 'decision-model-preview' : 'jev-latest';
+  return config;
 }

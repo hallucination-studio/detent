@@ -3,7 +3,7 @@ import { query } from '@anthropic-ai/claude-code';
 import { strFromU8, strToU8, unzipSync, zipSync } from 'fflate';
 import { afterEach, expect, it, vi } from 'vitest';
 import { z } from 'zod';
-import { loadConfig, type PermissionMode } from '@detent/core';
+import { loadConfig, type DecisionClient, type PermissionMode } from '@detent/core';
 import { SdkClaudeRunner } from '../../core/src/claude/runner.js';
 import { PermissionGate } from '../../core/src/claude/permission-gate.js';
 import { GitLabClient } from '../../core/src/gitlab/client.js';
@@ -199,7 +199,7 @@ it('validates literal read commands, normalized prefix boundaries and relative Y
   expect(validatePlaybookPath('site/reload-nginx.yaml')).toEqual({ ok: true });
 });
 
-async function setup(mode: PermissionMode = 'default', config: DeliveryConfig = loadDeliveryConfig(env), tracking = true) {
+async function setup(mode: PermissionMode = 'default', config: DeliveryConfig = loadDeliveryConfig(env), tracking = true, decision?: DecisionClient) {
   const repo = new InMemoryDetentRepository();
   const session = await repo.getOrCreateSession(1, 2, 'Change');
   session.permissionMode = mode;
@@ -216,7 +216,7 @@ async function setup(mode: PermissionMode = 'default', config: DeliveryConfig = 
     runAnsibleJob: vi.fn<JumpServerClient['runAnsibleJob']>().mockResolvedValue(submission),
     getJobResult: vi.fn<JumpServerClient['getJobResult']>().mockResolvedValue(result),
   };
-  const tools = createJumpServerTools({ client, config, tracker: tracking ? tracker : undefined });
+  const tools = createJumpServerTools({ client, config, decision, tracker: tracking ? tracker : undefined });
   const gitlab = { createIssueNote: vi.fn(async (_p: number, _i: number, _card: string) => ({ id: 12 })), syncIssueStatusLabel: vi.fn() };
   const core = loadConfig({});
   const controller = new AbortController();
@@ -349,4 +349,36 @@ it('excludes every JumpServer environment variable from the Claude SDK child env
   expect(Object.keys(child).filter(key => key.startsWith('JUMPSERVER_'))).toEqual([]);
   for (const value of [env.JUMPSERVER_JOB_TOKEN, env.JUMPSERVER_READONLY_ACCESS_KEY_SECRET, env.JUMPSERVER_READONLY_ACCESS_KEY_ID])
     expect(Object.values(child)).not.toContain(value);
+});
+
+it('evaluates eligible remote diagnostics once, preserves quoted arguments and checks assets', async () => {
+  const decide = vi.fn<DecisionClient['decide']>().mockResolvedValue({
+    effect: { type: 'choice', choice: 'pure_readonly' }, zero_side_effect: { type: 'noul', noul: 0.96 }, impact: { type: 'score', score: 0.6 },
+  });
+  const { gate, client } = await setup('plan', loadDeliveryConfig(env), true, { provider: 'custom', threshold: 0.9, decide });
+  const tool = asTool('readonly_inspect');
+  await gate.invokeExtension(tool, { asset_ids: ['web01'], command: 'uptime' });
+  for (const command of [
+    'systemctl restart nginx', 'rm -rf /tmp/x', 'sudo uptime', 'cat /etc/shadow', 'kubectl get secrets',
+    'curl -X POST http://127.0.0.1/', 'curl -sI https://evil.example/', 'curl -sI http://localhost@evil.example/',
+    "curl http://localhost/ '|' uptime https://evil.example/", 'cat /etc/nginx/.env', 'cat /etc//shadow',
+    'ps aux | tee log', 'nginx -t -g daemon', 'kubectl get pods -o go-template-file=x', 'ss -K',
+    'df --sync', 'sed -i s/a/b/ f', 'find . -exec ls', "awk 'system(cmd)'",
+  ]) expect(await gate.canUseTool(tool, { asset_ids: ['web01'], command }), command).toMatchObject({ behavior: 'deny' });
+  expect(decide).not.toHaveBeenCalled();
+  for (const command of ['ss -lntp', 'journalctl -u nginx -n 20', 'ps aux | grep nginx',
+    "ps aux | grep 'two  words'", 'curl -sI http://127.0.0.1/healthz']) {
+    await gate.invokeExtension(tool, { asset_ids: ['web01'], command });
+    expect(decide.mock.lastCall?.[0]).toEqual({ surface: 'remote_jumpserver_readonly_inspect', command });
+    expect(client.runReadonlyInspect).toHaveBeenLastCalledWith({ assetIds: ['web01'], account: 'readonly', command });
+  }
+  expect(decide).toHaveBeenCalledTimes(5);
+  await expect(gate.invokeExtension(tool, { asset_ids: ['restricted'], command: 'ss -lntp' })).rejects.toThrow('黑名单');
+  for (const [choice, noul, score] of [['state_mutating', 1, 0], ['pure_readonly', 0.89, 0], ['pure_readonly', 1, 0.61]] as const) {
+    decide.mockResolvedValueOnce({ effect: { type: 'choice', choice }, zero_side_effect: { type: 'noul', noul }, impact: { type: 'score', score } });
+    await expect(gate.invokeExtension(tool, { asset_ids: ['web01'], command: 'ss -lntp' })).rejects.toThrow('delivery::env-change');
+  }
+  decide.mockRejectedValueOnce(Error('provider timeout'));
+  await expect(gate.invokeExtension(tool, { asset_ids: ['web01'], command: 'ss -lntp' })).rejects.toThrow('delivery::env-change');
+  expect(client.runReadonlyInspect).toHaveBeenCalledTimes(6);
 });

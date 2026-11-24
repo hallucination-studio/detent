@@ -1,3 +1,4 @@
+import type { DecisionClient } from './decision/jev-client.js';
 import type { z } from 'zod';
 import type { Pool } from 'mysql2/promise';
 import type { DetentRepository } from './db/repository.js';
@@ -80,6 +81,7 @@ export type WebhookExtension = (event: ExtensionWebhookEvent) => {
 } | null;
 
 export interface DetentExtensions {
+  decisionClient?: DecisionClient;
   tools?: readonly AnyDetentExtensionTool[];
   capabilities?: readonly DetentCapabilityPack[];
   renderStatusExtra?(session: IssueSessionRow): Promise<string | null | undefined>;

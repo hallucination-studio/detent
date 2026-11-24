@@ -38,7 +38,7 @@ It is built as a **two-package layered monorepo**:
   Decouples an Issue session from a single repository or single MR. Within one Workspace Hub Issue, Claude Code autonomously clones relevant target repositories, manages `0..N` Git worktrees, opens `0..N` Merge Requests across projects, and tracks GitLab Pipelines.
 - **Dual-Layer Approval Gates (and Three-Gate Production Compliance)**
   - **Plan Gate (Macro)**: New Issues start in read-only `plan` mode to explore code and post an implementation plan card. Coding begins only after a human reacts with 👍 or comments `/approve`.
-  - **Runtime Hook Gate (Micro)**: Integrates with Claude Code `canUseTool`. Routine file reads/writes and built-in `detent_*` tools run smoothly, while risky operations (non-allowlisted `Bash` commands, `AskUserQuestion`) pause and post an approval card controlled via 👍/👎 or `/approve` / `/reject`.
+  - **Runtime Hook Gate (Micro)**: Integrates with Claude Code `canUseTool`. Routine file reads/writes and built-in `detent_*` tools run smoothly, while risky operations (`Bash` commands requiring review, `AskUserQuestion`) pause and post an approval card controlled via 👍/👎 or `/approve` / `/reject`.
   - **Production Hard Guards (`@detent/delivery`)**: Before running an Ansible job via JumpServer, code-level guards enforce that the target MR is `merged` with a matching `merge_commit_sha`, enforce production approver lists/access levels, and isolate read-only vs. execution credentials.
 - **100% Stateless Pods (Zero PVC / Zero Local Disk)**
   Each turn executes inside an ephemeral `/tmp/detent-sandboxes/turn-<uuid>` directory that is deleted (`rm -rf`) immediately after the turn finishes. Across turns, pod restarts, or horizontal scaling, Detent hydrates Claude `.jsonl` history from MySQL and reconstructs multi-repo workspaces via shallow clones plus stored binary `uncommitted_diff` patches.
@@ -112,6 +112,12 @@ Minimum required variables for `@detent/core`:
 | **MySQL** | `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE` |
 | **Claude** | `ANTHROPIC_API_KEY`, `CLAUDE_MODEL` |
 
+### Optional Jev risk assessment
+
+Local Bash uses deterministic hard gates, a static allowlist, then optional System One assessment for eligible commands. A confident read-only result can run in any Bash-enabled mode. Coding also permits low-impact workspace development. Uncertain results and provider failures require a human in coding and deny execution in plan or readonly mode. Accepted decisions appear in the Issue trace.
+
+Set `JEV_PROVIDER` to `bailian`, `typesafe`, or `custom` to enable assessment. Bailian's Decision Model API requires the workspace endpoint and a key. The default is `off`. The server keeps the key out of Claude's environment, logs, and Issue notes. Delivery shares the client for readonly inspection, with a hard command filter, asset checks, and the readonly account. Plan, release, production job, and approval-based closure retain human authorization. [Provider examples](./.env.example)
+
 ### 3. Run the Service
 
 Load environment variables and start either the standalone core runtime or the governed delivery control plane:
@@ -184,7 +190,7 @@ Four guards apply at request time and again at turn completion. A governed plan 
 
 1. **Open an Issue** in the Workspace Hub repo (e.g., Issue `#42`: *"Upgrade JWT verification to v2 across `backend/order-service` and `infra/api-gateway`"*).
 2. **Approve the Plan (Layer 1)**: Detent labels the Issue `claude::planning`, analyzes the target repositories in read-only mode, posts a Plan Approval Card, and switches the label to `claude::waiting-approval`. React with **👍** (or comment `/approve`) to start coding, or reply with feedback to iterate on the plan.
-3. **Approve Sensitive Tool Calls (Layer 2)**: Standard workspace edits run automatically. Non-allowlisted `Bash` commands or `AskUserQuestion` prompts post a Tool Approval Card. React with **👍** (`/approve`) to allow or **👎** (`/reject <reason>`) to deny and feed the reason back to Claude.
+3. **Approve Sensitive Tool Calls (Layer 2)**: Standard workspace edits run automatically. `Bash` commands requiring review or `AskUserQuestion` prompts post a Tool Approval Card. React with **👍** (`/approve`) to allow or **👎** (`/reject <reason>`) to deny and feed the reason back to Claude.
 4. **Multi-Repo MRs & Follow-Up Turns**: Claude pushes branches, creates MRs across target repos, and summarizes links and pipeline status in the comment footer. Keep commenting on the Issue anytime before closing to continue the exact same session seamlessly.
 
 ### Commands & Reactions Reference

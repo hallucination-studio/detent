@@ -38,7 +38,7 @@ Detent 采用 **双包分层架构**：
    - **彻底解耦 Issue 与单一仓库/单一 MR**：在同一个 Issue Session 中，由 Claude Code 自主决定拉取哪几个 GitLab 业务仓库、创建几个 Worktree（`0..N`）、提交几个跨项目或同项目的 Merge Request（`0..N`），并支持联动 GitLab Pipeline。
 2. **双层审批门禁（Dual-Layer Approval Gate）**
    - **宏观需求/方案审批（Plan Gate）**：新建 Issue 默认先进入只读 `plan` 模式探索代码并输出《实施方案审批卡》，人工在 Issue 中点 👍 或回复 `/approve` 后才进入编码执行。
-   - **微观运行时工具审批（Hook Gate）**：对接 Claude Code `canUseTool`，编码阶段沙箱内常规文件读写与内置 `detent_*` 工作区工具自动放行，高危操作（如非白名单 `Bash` 命令、`AskUserQuestion`）实时向 Issue 投递【工具执行审批卡片】，支持点 👍/👎 或 `/approve`、`/reject` 控制。
+   - **微观运行时工具审批（Hook Gate）**：对接 Claude Code `canUseTool`，编码阶段沙箱内常规文件读写与内置 `detent_*` 工作区工具自动放行，高危操作（如需审批的 `Bash` 命令、`AskUserQuestion`）实时向 Issue 投递【工具执行审批卡片】，支持点 👍/👎 或 `/approve`、`/reject` 控制。
 3. **100% 无状态 Pod 架构（Stateless Pod，零 PVC / 零本地磁盘依赖）**
    - Pod 仅在单轮对话执行期使用 `/tmp/detent-sandboxes/turn-<uuid>` 临时沙箱（轮次结束即焚 `rm -rf`）。
    - 跨轮次、跨 Pod 负载均衡或容器重启时，自动从 **MySQL 增量消息表** 水合 Claude `.jsonl` 会话上下文，并从 **GitLab 远端分支 + MySQL `uncommitted_diff` 补丁** 秒级浅克隆还原多项目工作区。
@@ -141,7 +141,7 @@ Hub SOP 通过 `close_policy: manual | auto | approve` 选择关单策略。默�
    - Detent 自动打上 `claude::planning` 标签，Claude 分析代码后输出《实施方案审批卡片》，标签变为 `claude::waiting-approval`。
    - 您只需在该条方案评论下 **点一个 👍**（或评论 `/approve`），Claude 立即进入 `claude::coding` 模式；若方案不满意，直接评论修改意见即可让 Claude 重新调整方案。
 3. **审批运行时高危工具（第二层 Hook 审批）**：
-   - 编码过程中，Claude 常规读写文件自动放行；当执行非白名单 `Bash` 命令或向您提问时，Issue 下会弹出【工具执行审批卡片】。
+   - 编码过程中，Claude 常规读写文件自动放行；当执行需审批的 `Bash` 命令或向您提问时，Issue 下会弹出【工具执行审批卡片】。
    - 对该卡片 **点 👍**（或评论 `/approve`）即可放行继续；**点 👎**（或评论 `/reject <原因>`）则拒绝执行并将原因反馈给 Claude。
 4. **跨项目多 MR 与多轮迭代**：
    - Claude 完成修改后会在 `backend/order-service` 和 `infra/api-gateway` 分别推送分支并创建 MR，将所有 MR 链接与 Pipeline 状态汇总在评论底部。
@@ -190,6 +190,12 @@ Webhook 返回 `202` 表示事件已进入当前进程的内存队列。正常�
 - `GITLAB_BASE_URL` / `GITLAB_TOKEN` / `GITLAB_WEBHOOK_SECRET` / `GITLAB_HUB_PROJECT_ID`
 - `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE`
 - `ANTHROPIC_API_KEY` / `CLAUDE_MODEL`
+
+### 可选 Jev 风控
+
+本地 Bash 先执行确定性硬门禁和静态白名单校验，再由 System One 评估符合条件的命令。只读或 Plan 模式仅放行高置信度的纯只读操作，编码模式还可放行仅影响临时工作区的开发命令。遇到超时、无效响应、低置信度或超出影响上限时，编码模式转人工审批，巡检和只读模式直接拒绝。放行记录写入 Issue 折叠轨迹。
+
+`JEV_PROVIDER` 默认为 `off`，支持阿里云百炼 Decision Model API、TypeSafe 和自托管兼容服务。百炼使用工作区端点和 API Key。密钥由服务端持有，Claude 子进程、日志和评论均隔离脱敏。Delivery 复用同一客户端评估只读巡检，并校验命令、资产和只读账号。方案、发布、生产任务和审批关单继续执行人工授权。[配置示例](./.env.example)
 
 ### 启动交付服务
 

@@ -1,8 +1,8 @@
-import { defineExtensionTool, escapeMarkdownCell, neutralizeQuickActions, redactGitUrl, type AnyDetentExtensionTool, type ExtensionToolContext } from '@detent/core';
+import { defineExtensionTool, escapeMarkdownCell, neutralizeQuickActions, redactGitUrl, type AnyDetentExtensionTool, type ExtensionToolContext, type DecisionClient } from '@detent/core';
 import { z } from 'zod';
 import { redactSecrets, type DeliveryConfig } from '../config.js';
 import type { JobResultResponse, JumpServerClient } from './client.js';
-import { findBlockedAssets, normalizeInspectCommand, validatePlaybookPath, validateReadonlyInspectCommand } from './guards.js';
+import { evaluateRemoteInspectCommand, findBlockedAssets, isHardBlockedRemoteInspectCommand, normalizeInspectCommand, validatePlaybookPath, validateReadonlyInspectCommand } from './guards.js';
 
 export interface DeliveryExecutionRecord {
   sessionId: string;
@@ -43,8 +43,8 @@ async function verifyMerge(input: JobInput, ctx: ExtensionToolContext, blockFail
   return { ok: true as const, mr };
 }
 
-export function createJumpServerTools({ client, config, tracker }: {
-  client: JumpServerClient; config: DeliveryConfig; tracker?: DeliveryExecutionTracker;
+export function createJumpServerTools({ client, config, tracker, decision }: {
+  client: JumpServerClient; config: DeliveryConfig; tracker?: DeliveryExecutionTracker; decision?: DecisionClient;
 }): AnyDetentExtensionTool[] {
   const checkAssets = (ids: string[]) => findBlockedAssets(ids, config.blockedAssets).length
     ? deny('目标资产在黑名单中，禁止操作') : allow;
@@ -58,14 +58,17 @@ export function createJumpServerTools({ client, config, tracker }: {
     defineExtensionTool({
       name: 'jms_readonly_inspect', description: '使用只读账号在目标资产执行白名单巡检命令', policy: 'readonly',
       // Validate raw characters/length before trim can discard a newline or an oversized suffix.
-      schema: { asset_ids: assets(50), command: z.string().max(512).regex(/^[\w ./=:@%+,~^\t-]+$/).trim().min(1) },
+      schema: { asset_ids: assets(50), command: z.string().max(512).regex(/^[^\r\n\0]+$/).trim().min(1) },
       async guard(input) {
         const command = validateReadonlyInspectCommand(input.command, config.inspectAllowPrefixes);
-        return command.ok ? checkAssets(input.asset_ids) : command;
+        if (!decision) return command.ok ? checkAssets(input.asset_ids) : command;
+        if (!isHardBlockedRemoteInspectCommand(input.command) &&
+            (command.ok || await evaluateRemoteInspectCommand(decision, input.command))) return checkAssets(input.asset_ids);
+        return deny('未通过只读巡检风控。变更操作请使用 delivery::env-change 提交 Ansible MR 并审批。');
       },
       execute(input) {
         return client.runReadonlyInspect({
-          assetIds: input.asset_ids, command: normalizeInspectCommand(input.command), account: config.jumpserverReadonlyAccount,
+          assetIds: input.asset_ids, command: decision ? input.command.trim() : normalizeInspectCommand(input.command), account: config.jumpserverReadonlyAccount,
         });
       },
     }),

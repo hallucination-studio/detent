@@ -1,3 +1,5 @@
+import { bashWriteOperation, evaluateLocalBash, isHardGatedLocalBash } from '../decision/bash-guard.js';
+import type { DecisionClient } from '../decision/jev-client.js';
 import { lstat, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -13,7 +15,7 @@ import { allowedInPlan, isWorkspaceTool } from '../workspace/mcp-tools.js';
 import { resolveApproval } from '../orchestrator/lifecycle.js';
 
 type Input = Record<string, unknown>;
-type GateResult = PermissionResult & { approvalId?: string };
+type GateResult = PermissionResult & { approvalId?: string; jevConfidence?: number };
 type Decision = 'APPROVED' | 'REJECTED';
 const deny = (message: string): PermissionResult => ({ behavior: 'deny', message });
 export class ColdHold extends Error {
@@ -94,7 +96,20 @@ async function contained(root: string, value: unknown, write: boolean) {
     return false;
   }
 }
+// A rejected static path check (including a symlink into the host) must not
+// become eligible through the semantic fallback. Check quoted operands intact.
+async function bashOperandsContained(command: string, root: string) {
+  const write = bashWriteOperation.test(command);
+  const words = command.match(/"[^"]*"|'[^']*'|[^\s"'|&;<>]+/g) ?? [];
+  for (const word of new Set(words)) {
+    const operand = word.replace(/^['"]|['"]$/g, '').replace(/^[^=]+=|^-[A-Za-z](?=\/)/, '');
+    if (operand && operand !== '/dev/null' && !await contained(root, operand, write)) return false;
+  }
+  return true;
+}
+
 interface GateContext {
+  decision?: DecisionClient;
   config: AppConfig;
   repo: DetentRepository;
   gitlab: Pick<GitLabClient, 'createIssueNote' | 'syncIssueStatusLabel'>;
@@ -173,7 +188,7 @@ export class PermissionGate {
     }
     return { behavior: 'allow', updatedInput: input };
   }
-  async preflight(name: string, input: Input): Promise<PermissionResult | 'ask'> {
+  async preflight(name: string, input: Input): Promise<GateResult | 'ask' | { riskNote: string }> {
     const { session: s, config, workspaceRoot, controller } = this.ctx;
     controller.signal.throwIfAborted();
     const effectiveReadOnly = s.permissionMode === 'plan' || this.readonly;
@@ -223,7 +238,20 @@ export class PermissionGate {
         return deny('此模式或路径不允许文件操作');
       return allow;
     }
-    if (name === 'Bash' && await safeCommand(input.command, config.safeBashPrefixes, effectiveReadOnly, workspaceRoot)) return allow;
+    if (name === 'Bash') {
+      const { command, description } = input;
+      if (!effectiveReadOnly && this.previousDecision(name, input)) return 'ask';
+      if (typeof command === 'string' && !isHardGatedLocalBash(command, workspaceRoot)) {
+        if (await safeCommand(command, config.safeBashPrefixes, effectiveReadOnly, workspaceRoot)) return allow;
+        if (this.ctx.decision && await bashOperandsContained(command, workspaceRoot)) {
+          const evaluation = await evaluateLocalBash(this.ctx.decision, command, description, effectiveReadOnly);
+          controller.signal.throwIfAborted();
+          if (evaluation.allowed) return { ...allow, jevConfidence: evaluation.confidence };
+          if (!effectiveReadOnly) return { riskNote: evaluation.riskNote };
+          return deny(evaluation.riskNote);
+        }
+      }
+    }
     if (isWorkspaceTool(name) && (!effectiveReadOnly || allowedInPlan(name))) return allow;
     if (name === 'ExitPlanMode' && effectiveReadOnly) return deny('请直接输出方案，由 GitLab 用户审批。');
     if (effectiveReadOnly && name !== 'AskUserQuestion') return deny('当前模式仅允许只读操作');
@@ -236,7 +264,7 @@ export class PermissionGate {
   }
   private async decide(name: string, input: Input): Promise<GateResult> {
     const policy = await this.preflight(name, input);
-    if (policy !== 'ask') return policy;
+    if (policy !== 'ask' && !('riskNote' in policy)) return policy;
     const { session: s, config, repo, gitlab, controller } = this.ctx;
     const plan = s.permissionMode === 'plan';
     const extension = this.extensionTools.get(name);
@@ -255,7 +283,7 @@ export class PermissionGate {
     );
     try {
       const card = await extension?.renderApprovalCard?.(a.id, input, this.extensionContext)
-        ?? renderToolApprovalCard(a, this.ctx.workspaceRoot);
+        ?? renderToolApprovalCard(a, this.ctx.workspaceRoot, policy === 'ask' ? undefined : policy.riskNote);
       const note = await gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, renderNote(card));
       await repo.updateApprovalNoteId(a.id, note.id);
     } catch (error) {

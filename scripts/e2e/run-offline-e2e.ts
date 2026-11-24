@@ -13,6 +13,7 @@ import { createOfflineAnthropic } from './offline-anthropic.js';
 import { gitlabApi } from './gitlab-driver.js';
 import { liveGitLab } from './live-gitlab.js';
 import { offlineGitLab } from './offline-gitlab.js';
+import { offlineJev } from './offline-jev.js';
 import { offlineJumpServer } from './offline-jumpserver.js';
 
 const run = promisify(execFile);
@@ -96,6 +97,9 @@ async function main() {
     const anthropic = createOfflineAnthropic({ webRepo, apiRepo, ansibleRepo });
     const mock = await serve(anthropic.handle);
     cleanup.push(mock.close);
+    const jev = offlineJev();
+    const jevServer = await serve(jev.handle);
+    cleanup.push(jevServer.close);
     const external = env.E2E_MYSQL_HOST;
     const host = external || loopback;
     assert.ok([loopback, 'localhost', '::1'].includes(host), 'E2E_MYSQL_HOST must be local');
@@ -185,7 +189,8 @@ async function main() {
     async function startPod(id: string, settings: NodeJS.ProcessEnv) {
       assert.equal(settings.ANTHROPIC_BASE_URL, mock.baseUrl, 'Claude Code requires the loopback mock');
       pod = spawn(process.execPath, ['packages/delivery/dist/server.js'], {
-        env: { ...localEnv, ...settings, POD_ID: id }, stdio: ['ignore', 'inherit', 'inherit'], detached: true,
+        env: { ...localEnv, ...settings, POD_ID: id, JEV_PROVIDER: 'bailian',
+          JEV_BASE_URL: jevServer.baseUrl + '/compatible-mode/v1/systemone', JEV_API_KEY: 'offline-jev-key' }, stdio: ['ignore', 'inherit', 'inherit'], detached: true,
       });
       pod.on('error', error => { failure = error; });
       await until(id + ' health check', async () => {
@@ -287,6 +292,9 @@ async function main() {
     const reviewNote = (await notes(code)).find(n => n.body.includes('Please review and merge both MRs'));
     assert.ok(reviewNote && mrs.every(m => reviewNote.body.includes(m.mr_web_url)));
     assert.equal((await gitlab.getIssue(hub, code)).state, 'opened');
+    assert.ok(reviewNote.body.includes('Jev 放行'));
+    assert.ok(jev.requests.includes('pwd; ls -la') && jev.requests.some(command => command.startsWith('git -C ')));
+    assert.ok(!(await records(review.id, 'approval_requests')).some(a => a.tool_name === 'Bash'));
     const firstMr = mrs.find(m => m.target_project_id === web.id)!;
     const secondMr = mrs.find(m => m.target_project_id === api.id)!;
     await gitlab.mergeMergeRequest(firstMr.target_project_id, firstMr.mr_iid);
@@ -344,7 +352,8 @@ async function main() {
     const inspection = await openIssue('Diagnose nginx on web01', '', 'delivery::audit');
     const inspected = await done(inspection);
     assert.deepEqual(await records(inspected.id, 'approval_requests'), []);
-    assert.equal(jms.inspections.length, 1);
+    assert.deepEqual(jms.inspections, ['ss -lntp']);
+    assert.ok(jev.requests.includes('ss -lntp') && jev.requests.length >= 2);
     assert.ok((await notes(inspection)).some(n => n.body.includes('Diagnostic report: nginx is active on web01.')));
 
     const change = await openIssue('Reload nginx on web01', 'Prepare and verify a reviewed nginx reload.', 'delivery::env-change');
@@ -409,7 +418,7 @@ async function main() {
     assert.equal(decision.decided_by, gitlab.sreUsername);
     assert.equal(decision.status, 'APPROVED');
     assert.deepEqual(jms.uploads, [sha]);
-    assert.equal(jms.inspections.length, 3);
+    assert.deepEqual(jms.inspections, ['ss -lntp', 'systemctl status nginx', 'systemctl status nginx']);
     const audits = await records(id, 'delivery_executions');
     assert.equal(audits.length, 1);
     const [audit] = audits;

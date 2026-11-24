@@ -5,8 +5,8 @@ export function neutralizeQuickActions(text: string) {
   return text.replace(/\r\n?/g, '\n').replace(/^([^\S\n]*)\/(?=[A-Za-z_])/gm, '$1\\/');
 }
 
-export function renderNote(text: string) {
-  return neutralizeQuickActions(redactGitUrl(text));
+export function renderNote(text: string, secret?: string) {
+  return neutralizeQuickActions(redactGitUrl(text, secret));
 }
 
 function backtickFence(text: string, minimum: number) {
@@ -52,6 +52,7 @@ export function renderPlanApprovalCard(plan: string) {
 export function renderToolApprovalCard(
   a: Pick<ApprovalRequestRow, 'id' | 'toolName' | 'toolInput' | 'approvalType'>,
   workspaceRoot?: string,
+  riskNote?: string,
 ) {
   const { questions, command, description } = a.toolInput;
   if (a.approvalType === 'ASK_USER') {
@@ -72,6 +73,7 @@ export function renderToolApprovalCard(
       '### 🛡️ 命令执行审批',
       typeof description === 'string' && description && '**用途**：' + description,
       codeFence(shell, 'sh'),
+      riskNote && '**风控提示**：' + riskNote,
       footer,
     ].filter(Boolean).join('\n\n'));
   }
@@ -121,7 +123,7 @@ export class NoteStreamer {
         const trace = this.steps.length && [
           '<details><summary>🛠️ 已执行 ' + this.steps.length + ' 个步骤（点击展开轨迹）</summary>',
           '',
-          ...this.steps.map((s) => '- ' + s),
+          ...this.steps.map((s) => '- ' + escapeTableCell(s, 'code')),
           '',
           '</details>',
         ].join('\n');

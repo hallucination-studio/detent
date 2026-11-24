@@ -32,12 +32,18 @@ export class SdkClaudeRunner implements ClaudeRunner {
   async run(t: TurnInput) {
     const { session, sandbox, gate } = t;
     const id = session.claudeSessionId!;
-    const canUseTool = (name: string, input: Record<string, unknown>) => {
-      const label = redactGitUrl(name + (typeof input.command === 'string' ? ' ' + input.command : ''))
+    const canUseTool = async (name: string, input: Record<string, unknown>) => {
+      const label = redactGitUrl(name + (typeof input.command === 'string' ? ' ' + input.command : ''), this.config.jevApiKey)
         .replaceAll(sandbox.workspaceRoot + '/', '').replaceAll(sandbox.workspaceRoot, '.')
         .replaceAll(sandbox.rootDir, '.').replace(/\s+/g, ' ').trim();
-      t.progress(label.length > 100 ? label.slice(0, 99) + '…' : label);
-      return gate.canUseTool(name, input);
+      let summary = label.length > 100 ? label.slice(0, 99) + '…' : label;
+      try {
+        const { jevConfidence, ...result } = await gate.canUseTool(name, input);
+        if (jevConfidence !== undefined) summary = '⚡ ' + summary + '（Jev 放行 · ' + jevConfidence.toFixed(2) + '）';
+        return result;
+      } finally {
+        t.progress(summary);
+      }
     };
     const invoke = async (name: ToolName, input: Record<string, unknown>) => {
       const permission = await canUseTool(name, input);
@@ -155,12 +161,13 @@ export class SdkClaudeRunner implements ClaudeRunner {
       if (resultText === undefined) throw Error('Claude ended without a result');
       return resultText;
     } catch (error) {
-      if (!diagnostic.trim() || t.controller.signal.aborted) throw error;
-      let message = redactGitUrl(diagnostic.trim());
-      for (const secret of [this.config.anthropicApiKey, this.config.gitlabToken]) {
+      const original = error instanceof Error ? error.message : String(error);
+      const detail = t.controller.signal.aborted ? original : diagnostic.trim() || original;
+      let message = redactGitUrl(detail);
+      for (const secret of [this.config.anthropicApiKey, this.config.gitlabToken, this.config.jevApiKey]) {
         if (secret) message = message.replaceAll(secret, '***');
       }
-      throw Error(message, { cause: error });
+      throw Error(message);
     }
   }
 }

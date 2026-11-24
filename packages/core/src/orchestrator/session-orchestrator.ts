@@ -1,3 +1,4 @@
+import { createDecisionClient, type DecisionClient } from '../decision/jev-client.js';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { AppConfig } from '../config.js';
@@ -33,13 +34,16 @@ type Client = WorkspaceGitLab &
 type Active = { controller: AbortController; ownsLease: boolean; gate?: PermissionGate };
 export class SessionOrchestrator {
   private active = new Map<string, Active>();
+  private readonly decision?: DecisionClient;
   constructor(
     readonly config: AppConfig,
     readonly repo: DetentRepository,
     readonly gitlab: Client,
     private runner: ClaudeRunner,
     private extensions: DetentExtensions = {},
-  ) {}
+  ) {
+    this.decision = extensions.decisionClient ?? createDecisionClient(config);
+  }
   private resolveTurnProfile(session: IssueSessionRow) {
     return this.extensions.resolveTurnProfile?.({ session, repo: this.repo, gitlab: this.gitlab });
   }
@@ -167,6 +171,7 @@ export class SessionOrchestrator {
       let closeRequested: { summary: string } | undefined;
       const closeTool = profile && createCloseIssueTool(profile, request => { closeRequested = request; });
       const gate = new PermissionGate({
+        decision: this.decision,
         extensionTools: [
           ...(this.extensions.tools ?? []),
           ...(this.extensions.capabilities ?? []).filter(pack => pack.enabled).flatMap(pack => pack.tools),

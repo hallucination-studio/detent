@@ -113,6 +113,12 @@ flowchart TD
 
 ---
 
+### Jev 语义风控
+
+Core 的 `DecisionClient` 以一次 POST 提交 choice、noul、score 三问，兼容百炼 Decision Model API 和 TypeSafe System One。默认关闭。Bash 硬门禁优先，静态安全命令免网络请求。语义放行要求无外部影响概率达到阈值（默认 0.9），只读分类的影响分上限为 0.6，编码可接受工作区开发类且影响分不超过 1.4。其余结果和网络、协议错误在编码时发审批卡，在只读和 Plan 时拒绝。
+
+Delivery 共享同一实例。只读巡检可在静态白名单外评估诊断命令，要求纯只读、无副作用概率达标、影响分 ≤ 0.6；资产黑名单和只读账号始终生效。只读巡检失败直接拒绝。生产任务、发版、需审批的关单与 Plan 沿用人工审批和权限检查。服务端隔离 Jev 密钥，错误与评论脱敏。
+
 ### 2.2 `@detent/core` 暴露的 4 个极简扩展契约（供 `@detent/delivery` 及未来其他模块接入）
 
 为了保持 `@detent/core` 极度紧凑、不引入重型插件框架，仅定义以下 **4 个强类型接口**：
@@ -251,7 +257,7 @@ sequenceDiagram
 | 工具名 | 绑定凭证 | 治理级别 (`policy`) | 强制守卫 (`guard`) | 功能说明 |
 | :--- | :--- | :--- | :--- | :--- |
 | `jms_list_assets` | **只读 Token** | `readonly` | 仅限查询已授权节点/主机组 | 按搜索词或节点查询已授权资产的 ID、名称与地址 |
-| `jms_readonly_inspect` | **只读 Token** | `readonly` | 强制使用 JumpServer 只读系统用户 + 命令白名单校验（禁止写/改/删命令） | 通过 JumpServer 只读账号在目标环境执行只读巡检（如查配置、端口、进程、磁盘、健康检查） |
+| `jms_readonly_inspect` | **只读 Token** | `readonly` | 强制使用 JumpServer 只读系统用户 + 静态白名单或 Jev 只读判定（禁止写/改/删命令） | 通过 JumpServer 只读账号在目标环境执行只读巡检（如查配置、端口、进程、磁盘、健康检查） |
 | `jms_run_ansible_job` | **任务中心 Token** | **`always_approve`** | **1. 硬校验对应 Ansible MR 在 MySQL 中已 `merged` 且 `merge_commit_sha` 匹配**<br/>**2. 校验目标资产组不在黑名单**<br/>**3. 审批前与放行后双重校验** | 通过 JumpServer 任务中心（Ops Job Center）下发指定仓库、指定已合并 Commit 的 Ansible Playbook 任务，并通过注入的 tracker 记录实际执行 ID |
 | `jms_get_job_result` | **优先任务中心凭证，其次只读凭证** | `readonly` | 必须由 tracker 确认本 Session 拥有任务 ID；未配置则拒绝 | 轮询并拉取 JumpServer 任务中心执行状态、标准输出摘要及 JumpServer Web 审计链接 |
 

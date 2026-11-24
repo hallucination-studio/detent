@@ -121,10 +121,10 @@ export class GitLabClient {
     await this.request(this.project(project) + '/issues/' + iid, 'PUT', { state_event: 'close' });
   }
   createIssueNote(p: number, i: number, body: string) {
-    return this.json<{ id: number }>(this.notes(p, i), 'POST', { body: renderNote(body) });
+    return this.json<{ id: number }>(this.notes(p, i), 'POST', { body: renderNote(body, this.config.jevApiKey) });
   }
   async updateIssueNote(p: number, i: number, n: number, body: string) {
-    await this.request(this.notes(p, i) + '/' + n, 'PUT', { body: renderNote(body) });
+    await this.request(this.notes(p, i) + '/' + n, 'PUT', { body: renderNote(body, this.config.jevApiKey) });
   }
   async syncIssueStatusLabel(p: number, i: number, status: SessionStatus) {
     const label = labels[status];

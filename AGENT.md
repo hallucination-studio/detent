@@ -55,6 +55,10 @@ Hub SOP 的 `close_policy` 默认 `manual`。`auto` 和 `approve` 启用每轮�
 
 `npm run e2e:offline` 使用回环 GitLab 与 git-http-backend。导出 `E2E_GITLAB_ADMIN_TOKEN` 后，`E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab` 使用独立命名空间和真实 GitLab CE 18.3.0 的 API、用户及 Webhook。两个目标共用同一套六场景：菜单与缺能力、跨库双 MR、在线定制发版、新增热修复与关单审批、只读巡检、跨 Pod 环境变更。真实 Claude Code 进程的模型请求全部发往本地确定性 SSE 替身。用 GitLab Issue、审批人身份、MySQL 状态和归档记录验收闭环。
 
+### Jev 命令风控
+
+Core 持有通用 System One 客户端（百炼 Decision Model API、TypeSafe、custom）和沙箱 Bash 门禁。先硬拦截，再走静态规则，其余可评估命令通过分类、无副作用概率和影响分联合判断。评估失败一律收紧权限，编码转人工，只读或 Plan 拒绝。Delivery 通过 `DetentExtensions.decisionClient` 共享实例，仅为只读巡检扩展命令判断。密钥禁止进入 Claude 环境、日志和 Issue 评论。方案、生产执行、发版及 `close_policy: approve` 始终由人按权限审批。
+
 ## 二、 质量门禁：本地提交前检查与推送前 OpenCodeReview 委托审查（必须遵守）
 
 为了确保仓库长期保持 **结构紧凑、逻辑自洽、测试覆盖完整**，所有 AI Agent 与工程师在提交和推送代码前必须遵守以下两道门禁：

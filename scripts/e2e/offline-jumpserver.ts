@@ -11,7 +11,7 @@ export function offlineJumpServer({ ansibleRepo = 'ops/ansible-infra' } = {}) {
   function execute(role: string) {
     const id = randomUUID();
     tasks.set(id, role);
-    (role === job ? executions : inspections).push(id);
+    if (role === job) executions.push(id);
     return Response.json({ task_id: id });
   }
   const roles = new Map([['Bearer ' + readonly, readonly], ['Bearer ' + job, job]]);
@@ -48,7 +48,8 @@ export function offlineJumpServer({ ansibleRepo = 'ops/ansible-infra' } = {}) {
       if (body.type === 'adhoc') {
         assert.equal(body.module, 'shell');
         assert.equal(body.runas, 'readonly');
-        assert.equal(body.args, 'systemctl status nginx');
+        assert.ok(['ss -lntp', 'systemctl status nginx'].includes(body.args));
+        inspections.push(body.args);
         assert.equal(body.instant, true);
         return execute(role);
       }

@@ -25,7 +25,7 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
   if (!body.tools?.length) return text('Delivery request');
   const blocks = body.messages.flatMap(m => typeof m.content === 'string' ? [text(m.content)] : m.content);
   const prefix = 'mcp__detent__';
-  const toolName = (name: string) => name === 'Write' ? name : prefix + name;
+  const toolName = (name: string) => ['Write', 'Bash'].includes(name) ? name : prefix + name;
   const use = (name: string, input: object): Use => {
     assert.ok(body.tools?.some(t => t.name === toolName(name)), 'SDK did not advertise ' + toolName(name));
     return { type: 'tool_use', id: 'toolu_' + randomUUID(), name: toolName(name), input };
@@ -97,6 +97,16 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
     if (!checkout) return use('detent_checkout_worktree', { project, branch_name: branch });
     const directory: string = JSON.parse(success(checkout));
     assert.ok(directory.startsWith(project.split('/').at(-1) + '__'));
+    if (project === webRepo && system.includes('workflows/code-delivery.md')) {
+      const dir = 'projects/' + directory;
+      let shellHistory = history.slice(history.indexOf(checkout) + 1);
+      for (const command of ['pwd; ls -la', 'git -C ' + dir + ' status && git -C ' + dir + ' branch --show-current']) {
+        const shell = result('Bash', shellHistory);
+        if (!shell) return use('Bash', { command, description: 'Inspect the checked-out workspace' });
+        assert.ok(success(shell).includes(command.startsWith('pwd') ? 'projects' : branch));
+        shellHistory = shellHistory.slice(shellHistory.indexOf(shell) + 1);
+      }
+    }
     const write = result('Write', history);
     if (!write) {
       const context = system + '\n' + blocks.filter((b): b is Text => b.type === 'text').map(b => b.text).join('\n');
@@ -139,7 +149,7 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
     if (!assets) return use('jms_list_assets', {});
     assert.match(success(assets), /web01/);
     const status = result('jms_readonly_inspect');
-    if (!status) return use('jms_readonly_inspect', inspect);
+    if (!status) return use('jms_readonly_inspect', audit ? { ...inspect, command: 'ss -lntp' } : inspect);
     assert.match(success(status), /nginx active/);
     if (audit) return closeIssue('Readonly audit complete; nginx active on web01.', 'Diagnostic report: nginx is active on web01.');
     return text(plan);

@@ -16,3 +16,4 @@ export type {
   AnyDetentExtensionTool, ExtensionToolContext, ExtensionWebhookEvent, DetentCapabilityPack, DetentExtensions, DetentExtensionTool, SessionLifecycleHooks,
   IssueClosePolicy, ToolGovernancePolicy, TurnProfile, TurnProfileResolver, WebhookExtension,
 } from './extensions.js';
+export { createDecisionClient, resolveJevEndpoint, type DecisionClient, type DecisionQuestion, type DecisionAnswer, type JevProvider } from './decision/jev-client.js';

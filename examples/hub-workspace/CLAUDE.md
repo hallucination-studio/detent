@@ -1,6 +1,8 @@
 # 团队交付工作区
 
-在 Hub 创建 Issue 时选择对应模板。Issue 标签决定本轮使用的流程，步骤、审批档位和能力依赖见 `workflows/*.md`。团队可通过 MR 更新默认分支上的规范。
+在 Hub 创建 Issue 时可选用模板或添加 Agent 标签。`agents/<id>/AGENT.md` 定义职责、审批档位和能力依赖。Agent 按需读取自身 `agents/<id>/skills/` 下的 Skills 以及通过 `shared_skills` 引用的根目录 `skills/`。团队通过 MR 更新默认分支上的规范。
+
+未匹配标签时，已启用的 Jev 会根据工单和用户补充信息自动路由，并写回所选 Agent 的标签。需求不明确时，Triage 会只读分析并在 Issue 中追问。直接回复补充信息，或用 `/use <agent>` 选择或切换 Agent。
 
 ## 仓库目录
 

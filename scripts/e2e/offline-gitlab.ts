@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { randomInt, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, posix } from 'node:path';
 import { gitlabApi, projectActions, type E2EGitLabDriver } from './gitlab-driver.js';
 
 interface User { id: number; username: string }
@@ -48,7 +48,7 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
   const hooks = new Map<number, Hook[]>();
   const mrs = new Map<number, MR[]>();
   const issues = new Map<number, Issue>();
-  const notes = new Map<number, { issueIid: number; body: string }>();
+  const notes = new Map<number, { issueIid: number; body: string; author: User }>();
   const releases = new Map<number, Release[]>();
   const find = (ref: string | number) => projects.find(p => String(p.id) === String(ref) || p.path_with_namespace === ref);
   const repo = (p: Project) => join(root, p.path_with_namespace + '.git');
@@ -94,9 +94,10 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
   }
   async function note(issue: Issue, actor: User, body: string) {
     const id = notes.size + 1;
-    notes.set(id, { issueIid: issue.iid, body });
+    const author = { id: actor.id, username: actor.username };
+    notes.set(id, { issueIid: issue.iid, body, author });
     await dispatch(find(issue.project_id)!, 'note', 'note_events', actor, { id, noteable_type: 'Issue', action: 'create', note: body }, issue);
-    return { id, body };
+    return { id, body, author };
   }
 
   async function smartHttp(req: Request, url: URL) {
@@ -231,12 +232,13 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
           return reply({ file_path: path, encoding: 'base64', content: git(repo(p), 'cat-file', 'blob', object).toString('base64') });
         }
         if (type !== 'tree') return absent();
-        const entries = git(repo(p), 'ls-tree', '-z', object).toString().split('\0').filter(Boolean);
+        const flags = url.searchParams.get('recursive') === 'true' ? ['-r', '-t', '-z'] : ['-z'];
+        const entries = git(repo(p), 'ls-tree', ...flags, object).toString().split('\0').filter(Boolean);
         return reply(entries.map(entry => {
           const tab = entry.indexOf('\t');
           const [, type, id] = entry.slice(0, tab).split(' ');
-          const name = entry.slice(tab + 1);
-          return { id, name, type, path: path ? path + '/' + name : name };
+          const rel = entry.slice(tab + 1);
+          return { id, name: posix.basename(rel), type, path: path ? path + '/' + rel : rel };
         }));
       }
       if ((post || put) && item === 'files') {
@@ -319,8 +321,12 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
       }
       if (!sub) return reply(issue);
       if (sub === 'notes' && post && !child) return reply(await note(issue, actor, body.body));
-      if (sub === 'notes' && get && !child)
-        return reply([...notes].filter(([, n]) => n.issueIid === issue.iid).map(([id, n]) => ({ id, body: n.body })));
+      if (sub === 'notes' && get && !child) {
+        const issueNotes = [...notes].filter(([, n]) => n.issueIid === issue.iid);
+        if (url.searchParams.get('sort') !== 'asc') issueNotes.reverse();
+        const perPage = Number(url.searchParams.get('per_page') ?? 20);
+        return reply(issueNotes.slice(0, perPage).map(([id, { body, author }]) => ({ id, body, author })));
+      }
       const saved = notes.get(Number(child));
       if (sub === 'notes' && post && operation === 'award_emoji' && saved?.issueIid === issue.iid) {
         await dispatch(p, 'emoji', 'emoji_events', actor,
@@ -329,7 +335,7 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
       }
       if (sub === 'notes' && put && saved?.issueIid === issue.iid) {
         saved.body = body.body;
-        return reply({ id: Number(child), body: body.body });
+        return reply({ id: Number(child), body: saved.body, author: saved.author });
       }
     }
     if (section === 'merge_requests') {

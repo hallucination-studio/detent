@@ -4,9 +4,11 @@ import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import type { AppConfig } from '../config.js';
 import type { DetentRepository } from '../db/repository.js';
+import type { SandboxScope } from '../extensions.js';
 import type { GitLabClient } from '../gitlab/client.js';
 import { redactGitUrl } from '../gitlab/client.js';
 import type { IssueSessionRow, SessionWorktreeRow } from '../types.js';
+import { isHubPathSegment } from './hub-paths.js';
 
 export interface TurnSandbox {
   rootDir: string;
@@ -109,7 +111,7 @@ export class EphemeralSandbox {
       dir,
     ]);
   }
-  async prepareTurnSandbox(session: IssueSessionRow): Promise<TurnSandbox> {
+  async prepareTurnSandbox(session: IssueSessionRow, scope?: SandboxScope): Promise<TurnSandbox> {
     await fs.mkdir(this.config.ephemeralRoot, { recursive: true });
     const rootDir = path.join(await fs.realpath(this.config.ephemeralRoot), 'turn-' + randomUUID());
     await fs.mkdir(rootDir, { mode: 0o700 });
@@ -124,14 +126,40 @@ export class EphemeralSandbox {
       const hub = await this.gitlab.getProject(session.hubProjectId);
       const dir = path.join(rootDir, 'hub');
       await this.clone(s, hub.http_url_to_repo, this.config.gitlabHubDefaultBranch, dir);
-      for (const name of (await fs.readdir(dir)).filter(
-        (name) => ['CLAUDE.md', '.claude', 'workflows'].includes(name),
-      )) {
-        const source = path.join(dir, name);
-        await fs.cp(source, path.join(s.workspaceRoot, name), {
-          recursive: true,
-          filter: async (file) => !(await fs.lstat(file)).isSymbolicLink(),
-        });
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      const copy = (name: string) => fs.cp(path.join(dir, name), path.join(s.workspaceRoot, name), {
+        recursive: true,
+        filter: async (file) => !(await fs.lstat(file)).isSymbolicLink(),
+      });
+      const common = scope === undefined ? ['CLAUDE.md', '.claude', 'workflows'] : ['CLAUDE.md', '.claude'];
+      for (const entry of entries) {
+        if (common.includes(entry.name)) await copy(entry.name);
+      }
+      const agentDir = scope?.agentDir;
+      if (agentDir && isHubPathSegment(agentDir) && entries.some(entry => entry.name === 'agents' && entry.isDirectory())) {
+        const agents = await fs.readdir(path.join(dir, 'agents'), { withFileTypes: true });
+        if (agents.some(entry => entry.name === agentDir && entry.isDirectory())) await copy(path.join('agents', agentDir));
+      }
+      const sharedSkills = new Set(scope?.sharedSkills?.filter(isHubPathSegment).map(name => name.toLowerCase()));
+      if (sharedSkills.size && entries.some(entry => entry.name === 'skills' && entry.isDirectory())) {
+        const skills = await fs.readdir(path.join(dir, 'skills'), { withFileTypes: true });
+        // Match normalized names while preserving the Hub's spelling for Read paths.
+        const names = skills.filter(entry => entry.isDirectory() && isHubPathSegment(entry.name)).map(entry => entry.name).sort();
+        for (const skill of sharedSkills) {
+          const matches = names.filter(name => name.toLowerCase() === skill);
+          let selected = matches[0];
+          if (matches.length > 1) {
+            // If directories differ only by case, follow the manifest used by the loader.
+            for (const name of matches) {
+              const children = await fs.readdir(path.join(dir, 'skills', name), { withFileTypes: true });
+              if (children.some(entry => entry.name === 'SKILL.md' && !entry.isDirectory())) {
+                selected = name;
+                break;
+              }
+            }
+          }
+          if (selected) await copy(path.join('skills', selected));
+        }
       }
       await fs.rm(dir, { recursive: true, force: true });
       for (const t of await this.repo.listActiveWorktrees(session.id)) {

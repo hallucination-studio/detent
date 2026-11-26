@@ -4,6 +4,8 @@ import type { Pool } from 'mysql2/promise';
 import type { DetentRepository } from './db/repository.js';
 import type { GitLabClient } from './gitlab/client.js';
 import type { SessionOrchestrator } from './orchestrator/session-orchestrator.js';
+import type { McpCapabilityConfig } from './extensions/mcp-bridge.js';
+import type { WorkflowApproverTier } from './workflows/hub-workflows.js';
 import type { ApprovalRequestRow, ApprovalType, IssueSessionRow, PermissionMode } from './types.js';
 
 export type ToolGovernancePolicy = 'readonly' | 'coding_auto' | 'always_approve';
@@ -39,18 +41,26 @@ export interface DetentCapabilityPack {
   name: string;
   setupHint?: string;
   enabled: boolean;
+  approverTier?: WorkflowApproverTier;
   tools: readonly AnyDetentExtensionTool[];
 }
 
 export type IssueClosePolicy = 'manual' | 'auto' | 'approve';
 
+export interface SandboxScope {
+  agentDir?: string;
+  sharedSkills?: readonly string[];
+}
+
 export interface TurnProfile {
   closePolicy?: IssueClosePolicy;
   canCloseIssue?(ctx: { session: IssueSessionRow; repo: DetentRepository }): Promise<{ ok: true } | { ok: false; reason: string }>;
   blockedMessage?: string;
+  routingNotice?: string;
   name?: string;
   readonly?: boolean;
   extraSystemPrompt?: string;
+  sandboxScope?: SandboxScope;
   enabledExtensionTools?: readonly string[];
   disableBash?: boolean;
   canApprove?(params: {
@@ -66,7 +76,11 @@ export type TurnProfileResolver = (ctx: {
   session: IssueSessionRow;
   repo: DetentRepository;
   gitlab: Pick<GitLabClient, 'getIssue' | 'hasApprovalPermission'> &
-    Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile'>>;
+    Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile' | 'listIssueNotes' | 'updateIssueLabels' | 'isBotUser'>>;
+  capabilities?: readonly DetentCapabilityPack[];
+  purpose?: 'turn' | 'approval';
+  prompt?: string;
+  decision?: DecisionClient;
 }) => TurnProfile | Promise<TurnProfile>;
 
 export interface SessionLifecycleHooks {
@@ -84,6 +98,7 @@ export interface DetentExtensions {
   decisionClient?: DecisionClient;
   tools?: readonly AnyDetentExtensionTool[];
   capabilities?: readonly DetentCapabilityPack[];
+  mcpCapabilities?: readonly McpCapabilityConfig[];
   renderStatusExtra?(session: IssueSessionRow): Promise<string | null | undefined>;
   onInitSchema?(pool: Pool): Promise<void>;
   resolveTurnProfile?: TurnProfileResolver;

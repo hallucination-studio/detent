@@ -17,6 +17,12 @@ interface Issue {
   labels: string[];
   state: 'opened' | 'closed';
 }
+export interface IssueNote {
+  id: number;
+  body: string;
+  system?: boolean;
+  author?: { id: number; username: string };
+}
 interface MergeRequest {
   iid: number;
   title: string;
@@ -120,17 +126,33 @@ export class GitLabClient {
   async closeIssue(project: number, iid: number): Promise<void> {
     await this.request(this.project(project) + '/issues/' + iid, 'PUT', { state_event: 'close' });
   }
+  async listIssueNotes(project: number, iid: number, limit = 20): Promise<IssueNote[]> {
+    const perPage = Number.isNaN(limit) ? 20 : Math.min(100, Math.max(1, Math.trunc(limit)));
+    const query = new URLSearchParams({ sort: 'desc', per_page: String(perPage) });
+    const notes = await this.json<IssueNote[]>(this.notes(project, iid) + '?' + query);
+    return notes.slice(0, perPage).reverse();
+  }
   createIssueNote(p: number, i: number, body: string) {
     return this.json<{ id: number }>(this.notes(p, i), 'POST', { body: renderNote(body, this.config.jevApiKey) });
   }
   async updateIssueNote(p: number, i: number, n: number, body: string) {
     await this.request(this.notes(p, i) + '/' + n, 'PUT', { body: renderNote(body, this.config.jevApiKey) });
   }
+  async updateIssueLabels(project: number, iid: number, changes: { add?: readonly string[]; remove?: readonly string[] }): Promise<void> {
+    const clean = (values: readonly string[] = []) => [...new Set(values.map(label => label.trim()).filter(Boolean))];
+    const add = clean(changes.add);
+    const remove = clean(changes.remove);
+    if (!add.length && !remove.length) return;
+    await this.request(this.project(project) + '/issues/' + iid, 'PUT', {
+      ...(add.length && { add_labels: add.join(',') }),
+      ...(remove.length && { remove_labels: remove.join(',') }),
+    });
+  }
   async syncIssueStatusLabel(p: number, i: number, status: SessionStatus) {
     const label = labels[status];
-    await this.request(this.project(p) + '/issues/' + i, 'PUT', {
-      add_labels: label,
-      remove_labels: [...new Set(Object.values(labels))].filter((l) => l !== label).join(','),
+    await this.updateIssueLabels(p, i, {
+      add: [label],
+      remove: Object.values(labels).filter(l => l !== label),
     });
   }
   getProject(p: string | number) {
@@ -151,8 +173,10 @@ export class GitLabClient {
   listProjects(search = '') {
     return this.pages<Project>('/projects', { membership: 'true', search });
   }
-  listRepositoryTree(project: number, dirPath: string, ref: string): Promise<TreeEntry[]> {
-    return onNotFound(this.pages<TreeEntry>(this.project(project) + '/repository/tree', { path: dirPath, ref }), []);
+  listRepositoryTree(project: number, dirPath: string, ref: string, recursive = false): Promise<TreeEntry[]> {
+    return onNotFound(this.pages<TreeEntry>(this.project(project) + '/repository/tree', {
+      path: dirPath, ref, ...(recursive && { recursive: 'true' }),
+    }), []);
   }
   async getRepositoryFile(project: number, filePath: string, ref: string) {
     const path = this.project(project) + '/repository/files/' + encodeURIComponent(filePath);

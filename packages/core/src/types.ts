@@ -99,6 +99,7 @@ export type ParsedIntentType =
   | 'ABORT'
   | 'RESET'
   | 'STATUS'
+  | 'USE'
   | 'PROMPT';
 
 export interface ParsedUserIntent {

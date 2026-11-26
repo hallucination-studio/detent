@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { redactGitUrl } from '../gitlab/redact.js';
+import { isHubScopePath } from '../workspace/hub-paths.js';
 import type { DecisionClient, DecisionQuestion } from './jev-client.js';
 
 // Unknown executables (including remote infrastructure clients) require a human.
@@ -12,8 +13,18 @@ const localPrograms = new Set((
   'mkdir rmdir touch cp mv rm tee sed awk perl jq date which whoami uname'
 ).split(/\s+/));
 const dangerous = /\b(?:sudo|su|doas|chmod|chown|mount|umount|mkfs|dd|kill|pkill|killall|shutdown|reboot|crontab|systemctl|service|launchctl|curl|wget|ssh|scp|sftp|rsync|nc|ncat|netcat|socat|telnet|ftp|nmap|twine|gh|glab|docker|podman|kubectl|helm|terraform|pulumi|eval|exec|printenv)\b/;
-const protectedPath = /(?:^|[^\w.-])(?:claude\.md|workflows|\.git|\.claude|\.mcp\.json)(?:$|[^\w.-])/i;
-export const bashWriteOperation = />|\b(?:tee|rm|mv|cp|sed|perl|python3?|node|chmod|chown|touch|mkdir|rmdir|truncate|install|patch|apply|checkout|restore|reset|clean|output|write|format|fmt)\b/;
+const protectedPath = /(?:^|[^\w.-])(?:claude\.md|workflows|agents|skills|\.git|\.claude|\.mcp\.json)(?:$|[^\w.-])/i;
+const legacyProtectedPath = /(?:^|[^\w.-])(?:claude\.md|workflows|\.git|\.claude|\.mcp\.json)(?:$|[^\w.-])/i;
+export const bashWriteOperation = />|\b(?:tee|rm|mv|cp|ln|unlink|dd|sed|perl|python3?|node|chmod|chown|touch|mkdir|rmdir|truncate|install|patch|apply|checkout|restore|reset|clean|output|write|format|fmt)\b/;
+
+export function bashOperands(command: string) {
+  const words = command.match(/(?:[^\s"'|&;<>]|"[^"]*"|'[^']*')+/g) ?? [];
+  return words.flatMap(word => {
+    const literal = word.replace(/"([^"]*)"|'([^']*)'/g, (_match, double, single) => double ?? single);
+    const argument = literal.replace(/^(?:(?:--?[\w-]+|[a-zA-Z_]\w*)=|-[A-Za-z](?=\/))/, '');
+    return argument !== literal ? [literal, argument] : [literal];
+  });
+}
 
 export function isHardGatedLocalBash(command: unknown, workspaceRoot: string) {
   if (typeof command !== 'string' || !command.trim() || command.length > 2000 ||
@@ -29,7 +40,11 @@ export function isHardGatedLocalBash(command: unknown, workspaceRoot: string) {
     const relative = path.relative(workspaceRoot, target);
     if (target !== '/dev/null' && (relative === '..' || relative.startsWith('../') || path.isAbsolute(relative))) return true;
   }
-  if (protectedPath.test(literal) && bashWriteOperation.test(literal)) return true;
+  if (protectedPath.test(literal) && bashWriteOperation.test(literal)) {
+    if (legacyProtectedPath.test(literal)) return true;
+    // Agent and skill names are protected at the Hub root. Project paths may use the same names.
+    if (bashOperands(command).some(operand => isHubScopePath(path.relative(workspaceRoot, path.resolve(workspaceRoot, operand))))) return true;
+  }
   return literal.split(/&&|\|\||[;|\n]/).some(segment => {
     const words = segment.trim().split(/\s+/);
     if (words[0] === 'env') words.shift();

@@ -18,6 +18,17 @@ it('paginates the repository tree and decodes UTF-8 Markdown at the requested re
   expect(urls[2].searchParams.get('ref')).toBe('stable/v1');
 });
 
+it('sends the recursive tree flag on every page when requested', async () => {
+  const entry = { name: 'AGENT.md', path: 'agents/a/AGENT.md', id: 'a', type: 'blob' };
+  const http = vi.fn<typeof fetch>()
+    .mockResolvedValueOnce(Response.json([], { headers: { 'x-next-page': '2' } }))
+    .mockResolvedValueOnce(Response.json([entry]));
+  const gitlab = new GitLabClient(loadConfig({}), http);
+  expect(await gitlab.listRepositoryTree(11, 'agents', 'stable/v1', true)).toEqual([entry]);
+  expect(http.mock.calls.map(([url]) => Object.fromEntries(new URL(String(url)).searchParams))).toEqual(['1', '2'].map(page =>
+    ({ path: 'agents', ref: 'stable/v1', recursive: 'true', page, per_page: '100' })));
+});
+
 it('maps only HTTP 404 to absent resources', async () => {
   const http = vi.fn().mockResolvedValue(new Response(null, { status: 404 }));
   const gitlab = new GitLabClient(loadConfig({}), http);
@@ -54,3 +65,33 @@ it('encodes tag, commit and pipeline lookups and sends release writes through th
     ['POST', tag], ['POST', release],
   ]);
 });
+
+it('adds and removes distinct trimmed Issue labels and skips empty writes', async () => {
+  const http = vi.fn<typeof fetch>(async () => new Response(null, { status: 204 }));
+  const client = new GitLabClient(loadConfig({}), http);
+  await client.updateIssueLabels(5, 42, { add: [' agent::image-sync ', '', 'agent::image-sync'], remove: [' old ', 'previous', 'old'] });
+  await client.updateIssueLabels(5, 42, { add: ['agent::audit'] });
+  await client.updateIssueLabels(5, 42, { remove: ['agent::audit'] });
+  await client.updateIssueLabels(5, 42, {});
+  await client.updateIssueLabels(5, 42, { add: ['   '], remove: [] });
+  expect(http.mock.calls.map(([url, init]) => [new URL(String(url)).pathname, init?.method, JSON.parse(String(init?.body))])).toEqual([
+    ['/api/v4/projects/5/issues/42', 'PUT', { add_labels: 'agent::image-sync', remove_labels: 'old,previous' }],
+    ['/api/v4/projects/5/issues/42', 'PUT', { add_labels: 'agent::audit' }],
+    ['/api/v4/projects/5/issues/42', 'PUT', { remove_labels: 'agent::audit' }],
+  ]);
+});
+
+it.each([[undefined, 20], [2, 2], [0, 1], [400, 100], [3.8, 3], [NaN, 20]])(
+  'reads a single bounded notes page for limit %s and returns it chronologically', async (limit, perPage) => {
+    const notes = Array.from({ length: 101 }, (_, index) => ({
+      id: 101 - index, body: 'comment ' + index, system: index === 1, author: { id: 10, username: 'human' },
+    }));
+    const http = vi.fn<typeof fetch>().mockResolvedValue(Response.json(notes, { headers: { 'x-next-page': '2' } }));
+    const client = new GitLabClient(loadConfig({}), http);
+    expect(await client.listIssueNotes(5, 42, limit)).toEqual(notes.slice(0, perPage).reverse());
+    expect(http).toHaveBeenCalledExactlyOnceWith(
+      expect.stringMatching(`/api/v4/projects/5/issues/42/notes\\?sort=desc&per_page=${perPage}$`),
+      expect.objectContaining({ method: 'GET' }),
+    );
+  },
+);

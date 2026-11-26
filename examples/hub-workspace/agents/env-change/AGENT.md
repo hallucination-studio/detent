@@ -5,6 +5,7 @@ requires: [jumpserver]
 close_policy: auto
 approver_tier: prod
 description: 受治理生产环境变更（JumpServer 巡检 + Ansible MR + 二次审批执行）
+routing_hint: 用 Ansible 修改环境配置或服务状态，合并变更 MR 后申请生产执行
 ---
 
 # 生产环境变更

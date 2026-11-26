@@ -1,6 +1,7 @@
 import { expect, it, vi } from 'vitest';
-import { createDetentApp, defineExtensionTool, loadConfig, SessionOrchestrator, type DetentExtensions } from '@detent/core';
+import { createDetentApp, defineExtensionTool, GitLabClient, loadConfig, SessionOrchestrator, type DetentExtensions } from '@detent/core';
 import { InMemoryDetentRepository } from '../../core/tests/memory-repository.js';
+import { mockMcpServer } from '../../core/tests/mock-mcp-server.js';
 import { createDeliveryApp, loadDeliveryConfig, type JumpServerClient } from '../src/index.js';
 
 // Exercise real app composition and HTTP routing with only the external I/O replaced.
@@ -190,5 +191,86 @@ it('requires the latest execution to succeed and preserves the caller’s close 
     expect(await check()).toEqual({ ok: false, reason: 'verification incomplete' });
   } finally {
     await app.close();
+  }
+});
+
+it('enforces the live MCP pack production tier for an Agent with standard SOP approvals', async () => {
+  const tools = ['inspect', 'mirror'].map(name => ({ name, inputSchema: { type: 'object' } }));
+  const server = await mockMcpServer((rpc, response) => {
+    if (rpc.method === 'notifications/initialized') {
+      response.writeHead(204).end();
+      return;
+    }
+    const result = rpc.method === 'initialize'
+      ? { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'fixture', version: '1.0.0' } }
+      : { tools };
+    response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, result }));
+  });
+  vi.stubGlobal('fetch', server.http);
+  vi.spyOn(GitLabClient.prototype, 'initBotIdentity').mockResolvedValue();
+  vi.spyOn(GitLabClient.prototype, 'getIssue').mockResolvedValue({
+    id: 88, iid: 42, title: 'Mirror container image', description: null, labels: ['agent::image-sync'], state: 'opened',
+  });
+  vi.spyOn(GitLabClient.prototype, 'listRepositoryTree').mockImplementation(async (_project, dir) =>
+    dir === 'agents' ? [{ id: 'agent', name: 'AGENT.md', path: 'agents/image-sync/AGENT.md', type: 'blob' }] : [],
+  );
+  let markdown = '---\nrequires: [harbor-sync]\napprover_tier: standard\n---\nMirror the requested image.';
+  vi.spyOn(GitLabClient.prototype, 'getRepositoryFile').mockImplementation(async () => markdown);
+  const permission = vi.spyOn(GitLabClient.prototype, 'hasApprovalPermission')
+    .mockImplementation(async (_project, access, minimum = 30) => access >= minimum);
+  let capture!: (orchestrator: SessionOrchestrator) => void;
+  const orchestratorReady = new Promise<SessionOrchestrator>(resolve => { capture = resolve; });
+  const app = createDeliveryApp(loadConfig({ GITLAB_WEBHOOK_SECRET: 'hook' }), {
+    deliveryConfig: loadDeliveryConfig({}),
+    mcpCapabilities: [{
+      name: 'harbor-sync', approverTier: 'prod', toolPolicies: { inspect: 'readonly' },
+      transport: { type: 'streamable-http', url: server.url },
+    }],
+    matchWebhookEvent: () => ({ key: 'bridge', async handle(orchestrator) { capture(orchestrator); } }),
+  });
+  try {
+    await app.ready();
+    expect(server.requests.map(request => request.rpc.method)).toEqual(['initialize', 'notifications/initialized', 'tools/list']);
+    expect((await app.inject({
+      method: 'POST', url: '/webhooks/gitlab', headers: { 'x-gitlab-token': 'hook' }, payload: { object_kind: 'bridge' },
+    })).statusCode).toBe(202);
+    const orchestrator = await orchestratorReady;
+    const repo = new InMemoryDetentRepository();
+    const session = await repo.getOrCreateSession(1, 42, 'Mirror image');
+    let pending = await repo.createApprovalRequest(session.id, 'TOOL_USE', 'harbor-sync__mirror', {});
+    vi.spyOn(orchestrator.repo, 'getSessionByIssue').mockResolvedValue(session);
+    vi.spyOn(orchestrator.repo, 'getLatestPendingApproval').mockImplementation(async () => pending);
+    const resolve = vi.spyOn(orchestrator.repo, 'resolveApprovalRequest').mockResolvedValue(false);
+    const approve = (userId: number) => orchestrator.handleUserIntent(1, 42, { type: 'APPROVE', userId, username: 'user' + userId });
+
+    await approve(30);
+    expect(permission).toHaveBeenLastCalledWith(1, 30, 40);
+    expect(resolve).not.toHaveBeenCalled();
+    await approve(40);
+    expect(permission).toHaveBeenLastCalledWith(1, 40, 40);
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(pending.id, 'APPROVED', 'user40', undefined);
+
+    // A readonly-policy tool in the pack still receives production approval checks.
+    pending = await repo.createApprovalRequest(session.id, 'TOOL_USE', 'harbor-sync__inspect', {});
+    await approve(40);
+    expect(resolve).toHaveBeenLastCalledWith(pending.id, 'APPROVED', 'user40', undefined);
+    resolve.mockClear();
+    permission.mockClear();
+    markdown = '---\nrequires: [harbor-sync]\nmode: readonly\n---\nInspect the image.';
+    await approve(40);
+    markdown = '---\nrequires: []\n---\nPlan a standalone change.';
+    await approve(40);
+    expect(permission).not.toHaveBeenCalled();
+    expect(resolve).not.toHaveBeenCalled();
+
+    pending = await repo.createApprovalRequest(session.id, 'PLAN', 'Plan', {});
+    await approve(30);
+    expect(permission).toHaveBeenCalledExactlyOnceWith(1, 30);
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(pending.id, 'APPROVED', 'user30', undefined);
+  } finally {
+    await app.close();
+    await server.close();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   }
 });

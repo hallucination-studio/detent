@@ -1,6 +1,7 @@
 import {
-  loadHubWorkflows, matchHubWorkflow,
-  type DetentCapabilityPack, type TurnProfile, type TurnProfileResolver, type WorkflowApproverTier,
+  buildTriageSystemPrompt, escapeMarkdownCell, findMatchingHubAgents, loadHubAgents, matchHubAgent, redactGitUrl,
+  renderAgentSystemPrompt, resolveHubAgentCapabilities, routeHubAgent,
+  type AgentRouteResult, type DecisionClient, type DetentCapabilityPack, type TurnProfile, type TurnProfileResolver, type WorkflowApproverTier,
 } from '@detent/core';
 import type { DeliveryConfig } from '../config.js';
 
@@ -14,6 +15,7 @@ type ResolverContext = Parameters<TurnProfileResolver>[0];
 interface ProfileOptions {
   hubDefaultBranch?: string;
   capabilities?: readonly DetentCapabilityPack[];
+  decisionClient?: DecisionClient;
   resolveTurnProfile?: TurnProfileResolver;
   canCloseIssue?: TurnProfile['canCloseIssue'];
 }
@@ -22,29 +24,66 @@ function blocked(name: string, blockedMessage: string): WorkflowProfile {
   return { name, blockedMessage, readonly: true, disableBash: true, enabledExtensionTools: [] };
 }
 
-async function hubProfile({ session, gitlab }: ResolverContext, options: ProfileOptions): Promise<WorkflowProfile> {
+function agentProfile(result: ReturnType<typeof matchHubAgent>): WorkflowProfile {
+  if (result.kind === 'blocked')
+    return blocked(result.agent?.file.replace(/^workflows\//, 'workflow:') ?? 'unmatched', result.message);
+  const { agent, enabledToolNames } = result;
+  const readonly = agent.mode === 'readonly';
+  // The audit table stores up to 64 characters. The prompt retains the full source path.
+  const name = Array.from(agent.id).slice(0, 64).join('');
+  return {
+    name, readonly, closePolicy: agent.closePolicy,
+    disableBash: readonly || !(agent.allowBash ?? (agent.approverTier === 'standard')),
+    enabledExtensionTools: enabledToolNames, extraSystemPrompt: renderAgentSystemPrompt(agent),
+    ...(agent.source === 'agents' && { sandboxScope: { agentDir: agent.agentDir, sharedSkills: agent.sharedSkills } }),
+    approverTier: agent.approverTier,
+  };
+}
+
+async function hubProfile(ctx: ResolverContext, options: ProfileOptions, capabilities: readonly DetentCapabilityPack[]): Promise<WorkflowProfile> {
+  const { session, gitlab, repo, purpose, prompt } = ctx;
   const issue = await gitlab.getIssue(session.hubProjectId, session.hubIssueIid);
-  const loaded = await loadHubWorkflows(gitlab, session.hubProjectId, options.hubDefaultBranch ?? 'main');
-  const capabilities = options.capabilities ?? [];
-  if (loaded.present) {
-    const result = matchHubWorkflow(loaded.workflows, issue.labels, capabilities, loaded.invalidFiles);
-    if (result.kind === 'blocked')
-      return blocked(result.workflow ? 'workflow:' + result.workflow.file : 'unmatched', result.message);
-    const { workflow, enabledToolNames } = result;
-    const readonly = workflow.mode === 'readonly';
-    // The audit table stores up to 64 characters. The prompt retains the full source path.
-    const name = Array.from(workflow.file.replace(/\.md$/i, '')).slice(0, 64).join('');
+  const { present, agents, invalidFiles } = await loadHubAgents(gitlab, session.hubProjectId, options.hubDefaultBranch ?? 'main');
+  if (present) {
+    if (purpose === 'approval' || findMatchingHubAgents(agents, issue.labels).length)
+      return agentProfile(matchHubAgent(agents, issue.labels, capabilities, invalidFiles));
+
+    const decision = ctx.decision ?? options.decisionClient;
+    let routed: AgentRouteResult = { kind: 'triage', reason: 'Jev 意图路由未启用' };
+    if (decision) {
+      const notes = await gitlab.listIssueNotes?.(session.hubProjectId, session.hubIssueIid).catch(() => []) ?? [];
+      const recentMessages = notes.filter(note => !note.system && !gitlab.isBotUser?.(note.author?.id, note.author?.username))
+        .map(note => note.body.trim()).filter(Boolean);
+      const currentPrompt = prompt?.trim();
+      if (currentPrompt && currentPrompt !== recentMessages.at(-1) &&
+          currentPrompt !== (issue.title + '\n' + (issue.description ?? '')).trim()) recentMessages.push(currentPrompt);
+      routed = await routeHubAgent(decision, agents, { title: issue.title, description: issue.description, labels: issue.labels, recentMessages });
+    }
+    if (routed.kind === 'matched') {
+      const { agent, confidence } = routed;
+      const profile = agentProfile(resolveHubAgentCapabilities(agent, agents, capabilities, invalidFiles));
+      if (profile.blockedMessage) return profile;
+
+      // A new sticky route starts in Plan even if the Issue had an approved route before.
+      await repo.updateSessionState(session.id, { permissionMode: 'plan' });
+      session.permissionMode = 'plan';
+      await gitlab.updateIssueLabels?.(session.hubProjectId, session.hubIssueIid, { add: [agent.label] });
+      return {
+        ...profile,
+        routingNotice: redactGitUrl(`> 🧭 已由 Jev 自动路由至 Agent ${escapeMarkdownCell(agent.id, 'code')}（置信度 ${confidence.toFixed(2)}，标签 ${escapeMarkdownCell(agent.label, 'code')}）。如需切换，请修改 Issue 标签或回复 \`/use <agent>\`。`),
+      };
+    }
+    if (agents.some(agent => agent.isDefault)) return agentProfile(matchHubAgent(agents, [], capabilities, invalidFiles));
+
     return {
-      name, readonly, closePolicy: workflow.closePolicy,
-      disableBash: readonly || !(workflow.allowBash ?? (workflow.approverTier === 'standard')),
-      enabledExtensionTools: enabledToolNames, extraSystemPrompt: '当前工作流：workflows/' + workflow.file + '\n\n' + workflow.body,
-      approverTier: workflow.approverTier,
+      name: 'triage', readonly: true, disableBash: true, closePolicy: 'manual', enabledExtensionTools: [], sandboxScope: {},
+      extraSystemPrompt: buildTriageSystemPrompt(agents, capabilities, { ...routed, invalidFiles }),
     };
   }
 
   const labels = issue.labels.map(label => label.trim().toLowerCase());
   const jumpserver = capabilities.find(pack => pack.name.trim().toLowerCase() === 'jumpserver');
-  const jumpserverEnabled = options.capabilities === undefined || jumpserver?.enabled;
+  const jumpserverEnabled = jumpserver?.enabled ?? (options.capabilities === undefined);
   if (labels.includes('delivery::audit')) {
     const enabled = jumpserver?.tools.filter(tool => tool.policy === 'readonly').map(tool => tool.name) ?? inspectTools;
     return { name: 'ReadonlyAuditAgent', readonly: true, disableBash: true,
@@ -76,7 +115,17 @@ export function createDeliveryTurnProfileResolver(config: DeliveryConfig, option
     return gitlab.hasApprovalPermission(projectId, userId, config.prodMinAccessLevel);
   }
   return async ctx => {
-    const selected: WorkflowProfile = options.resolveTurnProfile ? await options.resolveTurnProfile(ctx) : await hubProfile(ctx, options);
+    const packs = new Map<string, DetentCapabilityPack>();
+    for (const pack of [...(options.capabilities ?? []), ...(ctx.capabilities ?? [])]) {
+      const name = pack.name.trim().toLowerCase();
+      if (!packs.has(name)) packs.set(name, pack);
+    }
+    const capabilities = [...packs.values()];
+    const selected: WorkflowProfile = options.resolveTurnProfile
+      ? await options.resolveTurnProfile({ ...ctx, capabilities })
+      : await hubProfile(ctx, options, capabilities);
+    const packProdTools = new Set(capabilities.filter(pack => pack.enabled && pack.approverTier === 'prod')
+      .flatMap(pack => pack.tools.map(tool => tool.name)));
     return {
       ...selected,
       ...(!selected.blockedMessage && canCloseIssue && {
@@ -91,9 +140,12 @@ export function createDeliveryTurnProfileResolver(config: DeliveryConfig, option
         const { projectId, userId, username, approvalType, toolName } = params;
         const plan = approvalType === 'PLAN' || toolName === 'Plan';
         if (!plan && toolName === 'detent_close_issue' && selected.closePolicy !== 'approve') return false;
-        const prodTool = !plan && prodTools.has(toolName);
-        if (prodTool && (selected.readonly || (selected.enabledExtensionTools !== undefined && !selected.enabledExtensionTools.includes(toolName))))
-          return false;
+        const packProdTool = packProdTools.has(toolName);
+        const prodTool = !plan && (packProdTool || prodTools.has(toolName));
+        if (prodTool) {
+          const enabled = selected.enabledExtensionTools?.includes(toolName) ?? !packProdTool;
+          if (selected.readonly || !enabled) return false;
+        }
         const prod = prodTool || (!plan && approvalType === 'TOOL_USE' && selected.approverTier === 'prod');
         const permitted = prod
           ? await canApproveProd(ctx.gitlab, projectId, userId, username)

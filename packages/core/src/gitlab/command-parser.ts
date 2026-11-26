@@ -7,6 +7,7 @@ const commands = {
   abort: 'ABORT',
   reset: 'RESET',
   status: 'STATUS',
+  use: 'USE',
 } as const;
 export function parseNoteIntent({
   noteBody,
@@ -14,11 +15,12 @@ export function parseNoteIntent({
   ...actor
 }: Actor & { noteBody: string; sessionStatus: SessionStatus }): ParsedUserIntent {
   const body = noteBody.trim();
-  const match = /^\/(approve|reject|plan|abort|reset|status)(?:\s+([\s\S]+))?$/i.exec(body);
+  const match = /^\/(approve|reject|plan|abort|reset|status|use)(?:\s+([\s\S]+))?$/i.exec(body);
   if (match) {
     const type = commands[match[1].toLowerCase() as keyof typeof commands];
-    if (!match[2] || ['PLAN', 'APPROVE', 'REJECT'].includes(type))
-      return { ...actor, type, comment: match[2] };
+    const args = match[2];
+    if (args ? ['PLAN', 'APPROVE', 'REJECT', 'USE'].includes(type) : type !== 'USE')
+      return { ...actor, type, comment: args };
   }
   if (
     ['WAITING_PLAN', 'WAITING_TOOL'].includes(sessionStatus) &&

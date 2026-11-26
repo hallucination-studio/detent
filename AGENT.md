@@ -35,9 +35,9 @@ Stage 2 的 Delivery 合并事件处理器按目标项目 ID 和 MR IID 查找�
 
 Stage 3 的只读和自动工具在 `preflight` 执行守卫。生产任务在发卡前、批准后复核，提交前重读当前会话 MR。巡检与执行凭证分开配置，缺少所需凭证即拒绝。资产黑名单同时约束巡检和执行。结果查询必须由注入的 `DeliveryExecutionTracker` 验证会话归属。审批卡渲染、执行与归属判断均读取仓储。
 
-### V3 基线（Stage 5–7）
+### V3 兼容基线（Stage 5–7）
 
-每轮与每次审批从 Hub 默认分支重读 `workflows/*.md`，按当前 Issue 标签选择 SOP 并检查 `requires`。沙箱内的 Hub `CLAUDE.md` 和顶层 `workflows/` 受写保护。未匹配流程、流程冲突或能力缺失时，`TurnProfile.blockedMessage` 在创建沙箱和调用 Claude 前将引导写入 Issue，会话回到 `IDLE`。
+V3 从 Hub 默认分支加载 `workflows/*.md`，按当前 Issue 标签选择 SOP 并检查 `requires`。沙箱内的 Hub `CLAUDE.md` 和顶层 `workflows/` 受写保护。`TurnProfile.blockedMessage` 在创建沙箱和调用 Claude 前将引导写入 Issue，会话回到 `IDLE`。V5 的无标签路由与澄清见下文。
 
 `DetentCapabilityPack` 以 `enabled` 表达能力是否就绪，未启用的包通过 `setupHint` 提供配置指引。Delivery 的 `jumpserver` 包可空。默认启用的 `gitlab-release` 包提供只读的 `detent_list_tags` 和须审批的 `detent_create_release`，发布审批绑定项目、Tag 和完整提交 SHA。旧 Hub 无 SOP 时沿用兼容路由，未配置 JumpServer 时默认代码交付。
 
@@ -53,11 +53,19 @@ Hub SOP 的 `close_policy` 默认 `manual`。`auto` 和 `approve` 启用每轮�
 
 ### Stage 9 确定性 E2E
 
-`npm run e2e:offline` 使用回环 GitLab 与 git-http-backend。导出 `E2E_GITLAB_ADMIN_TOKEN` 后，`E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab` 使用独立命名空间和真实 GitLab CE 18.3.0 的 API、用户及 Webhook。两个目标共用同一套六场景：菜单与缺能力、跨库双 MR、在线定制发版、新增热修复与关单审批、只读巡检、跨 Pod 环境变更。真实 Claude Code 进程的模型请求全部发往本地确定性 SSE 替身。用 GitLab Issue、审批人身份、MySQL 状态和归档记录验收闭环。
+`npm run e2e:offline` 使用回环 GitLab 与 git-http-backend。导出 `E2E_GITLAB_ADMIN_TOKEN` 后，`E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab` 使用独立命名空间和真实 GitLab CE 18.3.0 的 API、用户及 Webhook。两种目标共用缺能力引导、镜像同步、跨库双 MR、在线定制发版、旧热修复与关单审批、只读巡检和跨 Pod 环境变更场景。真实 Claude Code 使用本地 Anthropic SSE 替身，Jev、JumpServer 与外部 MCP 也使用回环替身。用 GitLab Issue、审批人身份、MySQL 状态和归档记录验收闭环。
 
 ### Jev 命令风控
 
 Core 持有通用 System One 客户端（百炼 Decision Model API、TypeSafe、custom）和沙箱 Bash 门禁。先硬拦截，再走静态规则，其余可评估命令通过分类、无副作用概率和影响分联合判断。评估失败一律收紧权限，编码转人工，只读或 Plan 拒绝。Delivery 通过 `DetentExtensions.decisionClient` 共享实例，仅为只读巡检扩展命令判断。密钥禁止进入 Claude 环境、日志和 Issue 评论。方案、生产执行、发版及 `close_policy: approve` 始终由人按权限审批。
+
+### V5 Multi-Agent Hub、Jev 路由与外部 MCP 能力包
+
+每轮从 Hub 默认分支发现 `agents/<id>/AGENT.md`、Agent 私有 Skills 和经 `shared_skills` 引用的共享 Skills。只将选定 Agent 及其引用的 Skills 放入工作区，提示词列出 Skill 摘要供 `Read` 按需加载。写保护覆盖根目录的 `CLAUDE.md`、`agents/`、`skills/` 和 `workflows/`。同 ID 的新版 Agent 优先，其余 `workflows/*.md` 继续可用。Bootstrap 递归补齐缺失的模板文件。
+
+有匹配标签时按当前 Hub 定义选 Agent。普通轮次无匹配标签时可由 Jev 结合工单与非 Bot 用户评论路由。高置信度且能力齐备时先持久化 Plan，再写回 Agent 标签。无法明确匹配且无默认 Agent 时进入只读 Triage，询问补充信息后回到 `IDLE`。`/use` 在租约内作废旧待审单并持久化 Plan 重置，再替换 Agent 标签。`purpose === 'approval'` 只按现有标签或默认 Agent 解析授权，严禁触发 Jev 或 Triage。
+
+服务端通过 `DETENT_MCP_CAPABILITIES_FILE` 加载 Streamable HTTP 能力包，由 Agent 的 `requires` 选用。代理工具默认 `always_approve`，由既有 Plan 与工具门禁治理。认证信息由服务端解析，代理对工具元数据、审批卡、调用结果和错误脱敏。Delivery 对 `approverTier: prod` 包的工具审批强制校验生产权限，SOP 的 `approver_tier: standard` 无法降级。
 
 ## 二、 质量门禁：本地提交前检查与推送前 OpenCodeReview 委托审查（必须遵守）
 

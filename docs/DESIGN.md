@@ -4,7 +4,7 @@ Detent 的名称来自飞机油门杆上点火前的机械止动槽。受治理 
 
 > [!IMPORTANT]
 > **总体定位**：本项目采用 **双包分层架构（`@detent/core` + `@detent/delivery`）**，并在 V3 演进为 **“硬安全边界由代码兜底 + 软交付流程由 Hub 仓库 SOP 驱动 + 运维能力包可空可插拔”**：
-> 1. **`@detent/core`（通用基础架构包）**：将配置的 GitLab CE v18.3.0 **工作区仓库（Workspace Hub Repo）** 打造为 100% 无状态、多项目、纯增量 MySQL 持久化的 Claude Code 会话中枢（`1 GitLab Issue = 1 Claude Code Session`，解耦 `0..N` 个跨项目 Worktree 与 `0..N` 个 MR，支持双层审批、Hub `workflows/*.md` SOP 加载、可空能力包预检与通用 GitLab Release 原子工具）。**保持零业务耦合，可独立复用或开源。**
+> 1. **`@detent/core`（通用基础架构包）**：将配置的 GitLab CE v18.3.0 **工作区仓库（Workspace Hub Repo）** 打造为 100% 无状态、多项目、纯增量 MySQL 持久化的 Claude Code 会话中枢（`1 GitLab Issue = 1 Claude Code Session`，解耦 `0..N` 个跨项目 Worktree 与 `0..N` 个 MR，支持双层审批、Hub Agent 与兼容 SOP 加载、可空能力包预检与通用 GitLab Release 工具）。**保持零业务耦合，可独立复用或开源。**
 > 2. **`@detent/delivery`（受治理 AI 变更交付中枢拓展模块）**：基于 `@detent/core` 的标准扩展点构建，将 JumpServer + Ansible 封装为**可选/可空能力包（`jumpserver`）**，并随 Hub 模板预置开箱即用的标准交付 SOP（`release` / `env-change` / `code-delivery` / `audit`）。客户可直接编辑 Hub 仓库 Markdown 定制流程，无需 JumpServer 也可独立运行发版与代码交付，或接入自有执行 MCP。
 
 ---
@@ -45,7 +45,7 @@ detent/
 ```mermaid
 flowchart TD
     subgraph GitLab["GitLab CE v18.3.0"]
-        Hub_Repo["工作区仓库 (Workspace Hub Repo)<br/>Issues = 交付工单 / Claude Sessions<br/>存放各交付 Agent 规范 CLAUDE.md / 约束规则"]
+        Hub_Repo["工作区仓库 (Workspace Hub Repo)<br/>Issues = 交付工单 / Claude Sessions<br/>存放 CLAUDE.md、Agent 定义与 Skills"]
         Target_Repos["业务配置与 Ansible 脚本仓库群<br/>(ansible-infra / k8s-config / app-repo...)<br/>承载代码版本 / 人工 Review & Merge / Pipelines"]
         GL_Webhook["Webhooks<br/>(Hub Issue/Note/Emoji + 目标库 MR Merge & Pipeline)"]
         GL_API["GitLab REST API v4"]
@@ -53,7 +53,7 @@ flowchart TD
 
     subgraph DeliveryApp["Detent 无状态 Pod 集群 (K8s Replicas 1..N, 无 PVC)"]
         subgraph DeliveryPkg["@detent/delivery (生产变更交付拓展模块)"]
-            Agent_Router["多交付 Agent 路由<br/>(按 Issue 标签/模板加载规范与审批策略)"]
+            Agent_Router["多 Agent 路由<br/>(显式标签、Jev 自动路由与 Triage)"]
             MR_Hook["MR 合并事件处理器<br/>(目标库 Merge -> 自动唤醒原 Issue Session)"]
             Policy_Guard["交付合规硬守卫<br/>(强校验 MR=merged & SHA 一致 / 禁裸连 SSH)"]
             JMS_Tools["JumpServer MCP 工具集<br/>(只读巡检账号 | 任务中心执行账号)"]
@@ -347,6 +347,8 @@ erDiagram
 
 ### 5.2 Hub 仓库标准目录与 `workflows/*.md` 契约
 
+以下为 V3 兼容布局。新 Hub 使用第七节的 Agent 与 Skill 目录。
+
 ```text
 workspace-hub/
 ├── CLAUDE.md                         # 全局上下文：团队仓库清单、环境/资产表、通用约定
@@ -420,7 +422,7 @@ description: 标准仓库发版流程
    - **场景 4（老 Hub 仓库尚无 `workflows/` 目录）**：平滑兼容回退——仅启用服务端实际已配置的能力包，按 `CLAUDE.md` 工作（若无 `jumpserver` 能力则绝不注入 JumpServer/Ansible 提示词）。
 
 4. **初始化脚本非破坏性预置（`scripts/bootstrap.ts`）**：
-   - `npm run bootstrap` 自动将 `examples/hub-workspace/` 下的 `CLAUDE.md`、`workflows/*.md` 及 `.gitlab/issue_templates/*.md` 幂等写入 Hub 仓库默认分支（**文件已存在则跳过，绝不覆盖客户自定义修改**），并自动创建 `delivery::release` 标签。
+   - `npm run bootstrap` 将 `examples/hub-workspace/` 下的模板递归补齐到 Hub 默认分支，保留已有文件，并补齐内置标签。
 
 ---
 
@@ -449,6 +451,52 @@ V4 通过 **3 层组合机制** 实现安全可控的 Issue 闭环：
 
 ### 6.2 全 SOP 确定性 Mock-LLM 验收体系（双目标模式）
 
-为避免依赖外部模型 API 的波动与费用，同时保证全部标准 SOP 与客户自定义 SOP 都得到真实闭环验收，E2E 统一采用 **本地确定性 Mock Anthropic SSE 服务驱动真实 `@anthropic-ai/claude-code` 二进制进程**，并支持双目标复用同一套 6 场景测试套件：
+为避免依赖外部模型 API，E2E 采用本地确定性 Mock Anthropic SSE 服务驱动真实 `@anthropic-ai/claude-code` 进程。双目标复用同一套场景，V5 扩展见第七节。
 - **`npm run e2e:offline`**：离线 GitLab（含真实 `git-http-backend`）+ 离线 JumpServer + Mock Anthropic + 真实 MySQL 8.0 Docker + 真实 `bootstrap.ts` + 真实 `packages/delivery/dist/server.js`。
 - **`npm run e2e:gitlab`**：直连真实本地 GitLab CE v18.3.0（如 `http://127.0.0.1:8080`）+ 真实 MySQL 8.0 + Mock Anthropic + Mock JumpServer，零模型 API 费用、100% 确定性验收真实 GitLab API/Webhook/Tag/Release/Issue 自动闭环。
+
+---
+
+## 七、 V5 架构演进：Multi-Agent Hub 仓库、单 Agent Skills、Jev + Triage 智能路由与声明式外部 MCP 代理
+
+### 7.1 Hub 目录与单 Agent 工作区
+
+Core 从 Hub 默认分支递归读取 `agents/` 和 `skills/`。`agents/<id>/AGENT.md` 沿用 V3 的流程字段，标签默认 `agent::<id>`，可通过 `description` 和 `routing_hint` 提供 Jev 路由依据。`shared_skills` 引用根目录 `skills/<skill>/SKILL.md`，同 Agent 的私有 Skill 则位于 `agents/<id>/skills/<skill>/SKILL.md`。Skill 用 `name` 和 `description` 声明索引。旧的 `workflows/<name>.md` 按同一套路由，若同 ID 有新版 Agent 则优先加载新版入口。
+
+编排器为选定的 V5 Agent 拷贝 Hub 的 `CLAUDE.md`、`.claude/`、该 Agent 目录及其声明的共享 Skills。系统提示词包含 Agent 正文和 Skill 的名称、描述与路径，Claude 以 `Read` 按需获取 Skill 正文。沙箱跳过符号链接并保护根目录的 `CLAUDE.md`、`agents/`、`skills/` 与 `workflows/`。Issue 仍复用同一个 Session 和已登记的业务 Worktree。示例包含四个原有交付 Agent 和 `image-sync`，Bootstrap 递归补齐目录及 `agent::image-sync` 等标签，并跳过已有文件。[Hub 示例](../examples/hub-workspace/CLAUDE.md)
+
+### 7.2 Jev 自动路由、Triage 与人工切换
+
+1. Delivery 每轮重读 Hub 定义及 Issue 标签。匹配标签时按确定性规则选择，唯一的只读匹配优先于其他匹配，其余冲突返回引导。缺失 `requires` 时在创建沙箱前返回能力名、配置指引和就绪选项。
+2. 无匹配标签的普通轮次使用同一个 `DecisionClient` 评估 `hub_agent_routing`。输入包括工单标题、描述、非状态标签和最多四条去重后的近期用户消息，排除 Bot 与系统评论。三问校验是否存在唯一候选、`clear_match` 是否达到 `JEV_ROUTING_THRESHOLD`（默认 0.8）及 `ambiguity` 是否不超过 1.2。
+3. 高置信度且能力已就绪时，编排器在当前租约内先将权限模式持久化为 `plan`，再写回 Agent 标签，本轮评论附路由提示。后续轮次按该标签选择。路由未命中、低置信度或 Jev 不可用时可回退到默认 Agent。没有默认 Agent 时，Triage 以只读模式运行，无扩展能力工具，询问缺失信息并回到 `IDLE`。用户补充信息后可再次路由。
+4. 具备项目普通审批权限的成员可用 `/use <id 或标签> [补充需求]` 切换。旧轮次停止后，编排器在租约内作废待审单，先持久化 Plan 重置，再替换 Agent 标签并启动新轮次。`purpose === 'approval'` 只按现有标签或默认 Agent 重读授权，无 Jev 调用或 Triage 轮次。
+
+### 7.3 声明式外部 MCP 能力包
+
+`createDetentApp` 在启动时读取 `DETENT_MCP_CAPABILITIES_FILE`，通过 Streamable HTTP 初始化外部 MCP 会话、发现工具并转换其输入 Schema。以下部署示例用环境变量为注册表工具提供凭证。
+
+```json
+{
+  "capabilities": [
+    {
+      "name": "harbor-sync",
+      "approverTier": "prod",
+      "transport": {
+        "type": "streamable-http",
+        "url": "https://mcp.example.com/harbor",
+        "headers": { "Authorization": "Bearer ${HARBOR_SYNC_TOKEN}" }
+      },
+      "toolPolicies": { "check_image_exists": "readonly" }
+    }
+  ]
+}
+```
+
+Agent 通过 `requires: [harbor-sync]` 启用本包，工具以 `<包前缀>__<工具名>` 注册到 Detent SDK MCP。上例中 `harbor-sync__check_image_exists` 可在 Plan 调用，未指定策略的 `harbor-sync__sync_image` 默认 `always_approve`，在 Coding 阶段通过工具审批后才调用远端。`toolPolicies` 可覆盖 `defaultPolicy`，工具仍通过既有门禁。缺失凭证、初始化失败或工具名冲突会禁用对应能力包，经 `setupHint` 提供引导。
+
+请求头在服务端展开。代理在工具元数据、审批卡片、工具结果和错误返回前脱敏，外部凭证不传给 Claude Code。Delivery 重读当前 Agent 验证工具仍启用，并对 `approverTier: prod` 包的工具执行生产审批权限校验，即使 SOP 指定 `approver_tier: standard`。Plan 保持普通项目审批权限。示例 `image-sync` 默认 `requires: []`，可通过 GitOps 清单 MR 与 CI 完成同步，也可配置此能力包。[镜像同步 Agent](../examples/hub-workspace/agents/image-sync/AGENT.md)
+
+### 7.4 V5 确定性验收
+
+同一套 E2E 保留缺能力、跨库双 MR、在线更新发版 Agent、旧 `workflows/hotfix.md`、只读审计和跨 Pod 环境变更。在镜像同步场景中，Mock Jev 先以低置信度触发澄清。用户回复后，服务写回选定 Agent 的标签，真实 Claude Code 读取私有 Skill 并在 Plan 查询 Mock MCP。测试检查 Developer 批准 Plan、生产工具须 SRE 批准、同步成功后关闭工单，并确认 MCP 回显的 Bearer 凭证在进入模型结果及 Issue 评论前已脱敏。

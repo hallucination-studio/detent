@@ -48,6 +48,14 @@ it('parses exact commands and only treats standalone consent as approval while w
     'PROMPT',
   );
 });
+it.each([
+  ['/use image-sync', 'USE', 'image-sync'],
+  [' /USE Agent::Image-Sync  mirror app:v1\nto staging ', 'USE', 'Agent::Image-Sync  mirror app:v1\nto staging'],
+  ['/use  \n', 'PROMPT', '/use'],
+  ['/useful image-sync', 'PROMPT', '/useful image-sync'],
+])('parses %j as %s', (noteBody, type, comment) => {
+  expect(parseNoteIntent({ ...actor, noteBody, sessionStatus: 'WAITING_TOOL' })).toEqual({ ...actor, type, comment });
+});
 it('binds emoji decisions to their note and ignores removals', () => {
   for (const [name, type] of [
     ['thumbsup', 'APPROVE'],

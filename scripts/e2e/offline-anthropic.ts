@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { imageMirror } from './offline-mcp.js';
 
 type Text = { type: 'text'; text: string };
 type Use = { type: 'tool_use'; id: string; name: string; input: object };
@@ -25,7 +26,7 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
   if (!body.tools?.length) return text('Delivery request');
   const blocks = body.messages.flatMap(m => typeof m.content === 'string' ? [text(m.content)] : m.content);
   const prefix = 'mcp__detent__';
-  const toolName = (name: string) => ['Write', 'Bash'].includes(name) ? name : prefix + name;
+  const toolName = (name: string) => ['Read', 'Write', 'Bash'].includes(name) ? name : prefix + name;
   const use = (name: string, input: object): Use => {
     assert.ok(body.tools?.some(t => t.name === toolName(name)), 'SDK did not advertise ' + toolName(name));
     return { type: 'tool_use', id: 'toolu_' + randomUUID(), name: toolName(name), input };
@@ -44,11 +45,19 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
   }
   const approved = blocks.findIndex(b => b.type === 'text' && b.text.includes('实施方案已获批准'));
   const system = contents(body.system ?? '');
+  const sopPath = /^当前(?: Agent|工作流)：(.+)$/m.exec(system)?.[1];
   const issue = /Issue #(\d+)\b/.exec(system);
   assert.ok(issue, 'Missing Hub Issue number in the SDK system prompt');
   const merges = blocks.filter((b): b is Text => b.type === 'text' && /合并提交 SHA：[a-f0-9]{40}/.test(b.text));
   const lastMerge = merges.at(-1);
   const turn = lastMerge ? blocks.slice(blocks.indexOf(lastMerge)) : blocks;
+
+  function workspaceRoot() {
+    const context = system + '\n' + blocks.filter((b): b is Text => b.type === 'text').map(b => b.text).join('\n');
+    const cwd = /Working directory: ([^\n]+\/workspace)\s*\n/.exec(context)?.[1];
+    assert.ok(cwd, 'Missing workspace in the SDK prompt');
+    return cwd;
+  }
 
   function closeIssue(summary: string, report: string, expectDenied = false) {
     const closed = result('detent_close_issue', turn);
@@ -62,8 +71,50 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
     return text(report);
   }
 
-  const hotfix = system.includes('workflows/hotfix.md');
-  if (hotfix || system.includes('workflows/release.md')) {
+  if (system.includes('需求澄清与引导模式（只读）')) {
+    assert.equal(sopPath, undefined);
+    assert.match(system, /本轮仅允许只读检查/);
+    assert.match(system, /Jev 参考建议：image-sync（置信度 0\.55）/);
+    const menu = system.split('\n');
+    for (const label of ['delivery::audit', 'delivery::env-change'])
+      assert.ok(menu.some(line => line.includes(label) && line.includes('缺少能力包：jumpserver')));
+    for (const label of ['delivery::code', 'delivery::release', 'agent::image-sync'])
+      assert.ok(menu.some(line => line.includes(label) && line.includes('已就绪')));
+    assert.ok(!body.tools.some(t => ['Edit', 'Write', 'Bash', toolName('detent_close_issue')].includes(t.name) ||
+      t.name.startsWith(prefix + 'harbor-sync__')), 'Triage advertised a restricted tool');
+    return text('请提供带 Tag 的完整源镜像地址和目标镜像仓库地址。');
+  }
+
+  if (sopPath === 'agents/image-sync/AGENT.md') {
+    const skillPath = 'agents/image-sync/skills/mirror-to-harbor/SKILL.md';
+    const { source_image, target_image } = imageMirror;
+    assert.ok(system.includes(skillPath) && system.includes('skills/gitlab-mr-conventions/SKILL.md'));
+    assert.ok(!body.tools.some(t => t.name === 'Bash'), 'image-sync advertised Bash');
+    function mirrorResult(r: Result) {
+      const { authorization, ...outcome } = JSON.parse(success(r));
+      assert.ok(authorization === '***', 'The MCP result leaked its authorization header');
+      return outcome;
+    }
+    if (approved < 0) {
+      assert.match(system, /当前为方案阶段（只读）/);
+      const skill = result('Read');
+      if (!skill) return use('Read', { file_path: join(workspaceRoot(), skillPath) });
+      assert.match(success(skill), /harbor-sync__check_image_exists/);
+      const check = result('harbor-sync__check_image_exists');
+      if (!check) return use('harbor-sync__check_image_exists', { target_image });
+      assert.deepEqual(mirrorResult(check), { target_image, exists: false });
+      return text(`目标 Tag 尚不存在。批准后将 ${source_image} 同步到 ${target_image} 并核对结果。`);
+    }
+
+    assert.match(system, /已获方案审批/);
+    const sync = result('harbor-sync__sync_image');
+    if (!sync) return use('harbor-sync__sync_image', imageMirror);
+    assert.deepEqual(mirrorResult(sync), { ...imageMirror, synced: true });
+    return closeIssue('已核对同步结果。', `镜像同步完成，目标为 ${target_image}。`);
+  }
+
+  const hotfix = sopPath === 'workflows/hotfix.md';
+  if (hotfix || sopPath === 'agents/release/AGENT.md') {
     const marker = hotfix ? 'CUSTOM_HOTFIX_WORKFLOW: hotfix-' : 'CUSTOM_RELEASE_TAG_PREFIX: rel-';
     assert.ok(system.includes(marker), 'Missing live Hub SOP in the SDK system prompt');
     const tag = hotfix ? 'hotfix-1.0.1' : 'rel-1.0.0';
@@ -97,7 +148,7 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
     if (!checkout) return use('detent_checkout_worktree', { project, branch_name: branch });
     const directory: string = JSON.parse(success(checkout));
     assert.ok(directory.startsWith(project.split('/').at(-1) + '__'));
-    if (project === webRepo && system.includes('workflows/code-delivery.md')) {
+    if (project === webRepo && sopPath === 'agents/code-delivery/AGENT.md') {
       const dir = 'projects/' + directory;
       let shellHistory = history.slice(history.indexOf(checkout) + 1);
       for (const command of ['pwd; ls -la', 'git -C ' + dir + ' status && git -C ' + dir + ' branch --show-current']) {
@@ -108,12 +159,7 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
       }
     }
     const write = result('Write', history);
-    if (!write) {
-      const context = system + '\n' + blocks.filter((b): b is Text => b.type === 'text').map(b => b.text).join('\n');
-      const cwd = /Working directory: ([^\n]+\/workspace)\s*\n/.exec(context)?.[1];
-      assert.ok(cwd, 'Missing workspace in the SDK prompt');
-      return use('Write', { file_path: join(cwd, 'projects', directory, file), content });
-    }
+    if (!write) return use('Write', { file_path: join(workspaceRoot(), 'projects', directory, file), content });
     assert.ok(success(write).includes(file.split('/').at(-1)!));
     const pushed = result('detent_commit_and_push', history);
     if (!pushed) return use('detent_commit_and_push', { directory_name: directory, commit_message: title });
@@ -125,7 +171,7 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
     return { sha, targetProjectId, mrIid, mrWebUrl, after: history.slice(history.indexOf(mr) + 1) };
   }
 
-  if (system.includes('workflows/code-delivery.md')) {
+  if (sopPath === 'agents/code-delivery/AGENT.md') {
     for (const project of [webRepo, apiRepo])
       assert.ok(blocks.some(b => b.type === 'text' && b.text.includes(project)), 'Missing repository in Issue prompt: ' + project);
     if (approved < 0) return text('Add hello.txt in ' + webRepo + ' and ' + apiRepo + ', then review both MRs.');
@@ -142,8 +188,8 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
     return closeIssue('Check cross-repo delivery.', 'Please review and merge both MRs: ' + urls.join(' '), true);
   }
 
-  const audit = system.includes('workflows/audit.md');
-  assert.ok(audit || system.includes('workflows/env-change.md'), 'Missing JumpServer SOP');
+  const audit = sopPath === 'agents/audit/AGENT.md';
+  assert.ok(audit || sopPath === 'agents/env-change/AGENT.md', 'Missing JumpServer SOP');
   if (approved < 0 && !lastMerge) {
     const assets = result('jms_list_assets');
     if (!assets) return use('jms_list_assets', {});

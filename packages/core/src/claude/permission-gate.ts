@@ -1,4 +1,4 @@
-import { bashWriteOperation, evaluateLocalBash, isHardGatedLocalBash } from '../decision/bash-guard.js';
+import { bashOperands, bashWriteOperation, evaluateLocalBash, isHardGatedLocalBash } from '../decision/bash-guard.js';
 import type { DecisionClient } from '../decision/jev-client.js';
 import { lstat, realpath } from 'node:fs/promises';
 import path from 'node:path';
@@ -6,10 +6,11 @@ import { isDeepStrictEqual } from 'node:util';
 import type { PermissionResult } from '@anthropic-ai/claude-code';
 import type { AppConfig } from '../config.js';
 import type { DetentRepository } from '../db/repository.js';
-import type { AnyDetentExtensionTool, ExtensionToolContext, SessionLifecycleHooks, TurnProfile } from '../extensions.js';
+import type { AnyDetentExtensionTool, DetentCapabilityPack, ExtensionToolContext, SessionLifecycleHooks, TurnProfile } from '../extensions.js';
 import type { GitLabClient } from '../gitlab/client.js';
 import { renderNote, renderToolApprovalCard } from '../gitlab/note-streamer.js';
 import type { ApprovalRequestRow, IssueSessionRow } from '../types.js';
+import { isHubScopePath } from '../workspace/hub-paths.js';
 import { allowedInPlan, isWorkspaceTool } from '../workspace/mcp-tools.js';
 
 import { resolveApproval } from '../orchestrator/lifecycle.js';
@@ -64,7 +65,7 @@ function allowedPath(root: string, target: string, write: boolean) {
   if (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) return false;
   if (!write) return true;
   const parts = rel.toLowerCase().split(path.sep);
-  return !['claude.md', 'workflows'].includes(parts[0]) &&
+  return !['claude.md', 'workflows', 'agents', 'skills'].includes(parts[0]) &&
     !parts.some(part => ['.git', '.claude', '.mcp.json'].includes(part));
 }
 
@@ -76,8 +77,14 @@ async function contained(root: string, value: unknown, write: boolean) {
     value.split(path.sep).includes('..')
   )
     return false;
-  let prefix = path.resolve(root, value);
-  if (!allowedPath(root, prefix, write)) return false;
+  const target = path.resolve(root, value);
+  if (!allowedPath(root, target, write)) return false;
+  const resolved = await resolveWorkspacePath(root, target);
+  return resolved !== undefined && allowedPath(root, resolved, write);
+}
+
+async function resolveWorkspacePath(root: string, target: string) {
+  let prefix = target;
   // Walk back only over missing components. A dangling symlink exists for lstat
   // and must fail realpath instead of being treated as a new file.
   while (prefix !== root) {
@@ -85,24 +92,34 @@ async function contained(root: string, value: unknown, write: boolean) {
       await lstat(prefix);
       break;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return undefined;
       prefix = path.dirname(prefix);
     }
   }
   try {
-    const suffix = path.relative(prefix, path.resolve(root, value));
-    return allowedPath(root, path.join(await realpath(prefix), suffix), write);
+    return path.join(await realpath(prefix), path.relative(prefix, target));
   } catch {
-    return false;
+    return undefined;
   }
+}
+
+async function blockedBashWrite(command: string, root: string) {
+  if (!bashWriteOperation.test(command)) return false;
+  for (const operand of new Set(bashOperands(command))) {
+    if (!operand) continue;
+    const target = path.resolve(root, operand);
+    if (isHubScopePath(path.relative(root, target))) return true;
+    if (!allowedPath(root, target, false)) continue;
+    const resolved = await resolveWorkspacePath(root, target);
+    if (resolved === undefined || isHubScopePath(path.relative(root, resolved))) return true;
+  }
+  return false;
 }
 // A rejected static path check (including a symlink into the host) must not
 // become eligible through the semantic fallback. Check quoted operands intact.
 async function bashOperandsContained(command: string, root: string) {
   const write = bashWriteOperation.test(command);
-  const words = command.match(/"[^"]*"|'[^']*'|[^\s"'|&;<>]+/g) ?? [];
-  for (const word of new Set(words)) {
-    const operand = word.replace(/^['"]|['"]$/g, '').replace(/^[^=]+=|^-[A-Za-z](?=\/)/, '');
+  for (const operand of new Set(bashOperands(command))) {
     if (operand && operand !== '/dev/null' && !await contained(root, operand, write)) return false;
   }
   return true;
@@ -119,6 +136,7 @@ interface GateContext {
   controller: AbortController;
   previousDecision?: ApprovalRequestRow;
   extensionTools?: readonly AnyDetentExtensionTool[];
+  capabilities?: readonly DetentCapabilityPack[];
   profile?: TurnProfile;
   onApprovalResolved?: SessionLifecycleHooks['onApprovalResolved'];
 }
@@ -135,7 +153,8 @@ export class PermissionGate {
     this.readonly = profile?.readonly ?? false;
     if (profile?.name !== undefined) this.extensionContext.profileName = profile.name;
     this.disableBash = profile?.disableBash ?? false;
-    for (const tool of ctx.extensionTools ?? []) {
+    const packTools = ctx.capabilities?.filter(pack => pack.enabled).flatMap(pack => pack.tools) ?? [];
+    for (const tool of [...(ctx.extensionTools ?? []), ...packTools]) {
       if (profile?.enabledExtensionTools && !profile.enabledExtensionTools.includes(tool.name)) continue;
       const id = 'mcp__detent__' + tool.name;
       if (this.extensionTools.has(id) || isWorkspaceTool(tool.name) || ['Bash', 'AskUserQuestion'].includes(tool.name))
@@ -240,6 +259,8 @@ export class PermissionGate {
     }
     if (name === 'Bash') {
       const { command, description } = input;
+      if (typeof command === 'string' && await blockedBashWrite(command, workspaceRoot))
+        return deny('此路径不允许 Bash 写入');
       if (!effectiveReadOnly && this.previousDecision(name, input)) return 'ask';
       if (typeof command === 'string' && !isHardGatedLocalBash(command, workspaceRoot)) {
         if (await safeCommand(command, config.safeBashPrefixes, effectiveReadOnly, workspaceRoot)) return allow;

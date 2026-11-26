@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
@@ -15,6 +15,7 @@ import { liveGitLab } from './live-gitlab.js';
 import { offlineGitLab } from './offline-gitlab.js';
 import { offlineJev } from './offline-jev.js';
 import { offlineJumpServer } from './offline-jumpserver.js';
+import { imageMirror, offlineMcp } from './offline-mcp.js';
 
 const run = promisify(execFile);
 const loopback = '127.0.0.1';
@@ -100,6 +101,14 @@ async function main() {
     const jev = offlineJev();
     const jevServer = await serve(jev.handle);
     cleanup.push(jevServer.close);
+    const mcp = offlineMcp();
+    const mcpServer = await serve(mcp.handle);
+    cleanup.push(mcpServer.close);
+    const capabilitiesFile = join(tmp, 'mcp-capabilities.json');
+    await writeFile(capabilitiesFile, JSON.stringify({ capabilities: [{
+      name: 'harbor-sync', approverTier: 'prod', toolPolicies: { check_image_exists: 'readonly' },
+      transport: { type: 'streamable-http', url: mcpServer.baseUrl + '/mcp', headers: { Authorization: 'Bearer ${HARBOR_SYNC_TOKEN}' } },
+    }] }));
     const external = env.E2E_MYSQL_HOST;
     const host = external || loopback;
     assert.ok([loopback, 'localhost', '::1'].includes(host), 'E2E_MYSQL_HOST must be local');
@@ -143,10 +152,12 @@ async function main() {
         ANTHROPIC_BASE_URL: mock.baseUrl, ...extra },
       timeout: 180000,
     });
-    await provision();
+    await provision({ DETENT_MCP_CAPABILITIES_FILE: capabilitiesFile });
     const config = parseEnv(await readFile(envFile, 'utf8'));
     assert.equal((await stat(envFile)).mode & 0o777, 0o600);
     assert.equal(config.GITLAB_ADMIN_TOKEN, undefined);
+    assert.equal(config.DETENT_MCP_CAPABILITIES_FILE, capabilitiesFile);
+    assert.equal(config.JEV_ROUTING_THRESHOLD, '0.8');
     const hub = Number(config.GITLAB_HUB_PROJECT_ID);
     const admin = gitlabApi(gitlab.baseUrl, gitlab.adminToken);
     if (env.E2E_GITLAB_URL) cleanup.push(() => admin.request('/personal_access_tokens/self', 'DELETE', undefined, config.GITLAB_TOKEN));
@@ -155,23 +166,26 @@ async function main() {
     const [hubProject, web, api, target] = projects;
     assert.equal(hubProject.id, hub);
     assert.equal(new Set(projects.map(p => p.id)).size, 4);
-    const releasePath = 'workflows/release.md';
+    const releasePath = 'agents/release/AGENT.md';
+    const imagePath = 'agents/image-sync/AGENT.md';
     const hubFile = (path: string) => gitlab.getFile(hub, path);
-    const templates = ['CLAUDE.md'];
+    const templates = ['CLAUDE.md', imagePath, 'agents/image-sync/skills/mirror-to-harbor/SKILL.md', 'skills/gitlab-mr-conventions/SKILL.md'];
     for (const name of ['audit', 'code-delivery', 'env-change', 'release'])
-      templates.push('workflows/' + name + '.md', '.gitlab/issue_templates/' + name + '.md');
+      templates.push('agents/' + name + '/AGENT.md', '.gitlab/issue_templates/' + name + '.md');
     for (const path of templates)
       assert.equal(await hubFile(path), await readFile(join('examples/hub-workspace', path), 'utf8'), path);
 
     const savedSop = await hubFile(releasePath) + '\nInclude the change ticket in release notes.\n';
     await gitlab.upsertFile(hub, releasePath, savedSop, 'Document team release notes');
+    const hubHead = await gitlab.headSha(hub);
     const jmsEnv = { JUMPSERVER_BASE_URL: jmsServer.baseUrl, JUMPSERVER_READONLY_TOKEN: jms.readonly, JUMPSERVER_JOB_TOKEN: jms.job };
     await provision(jmsEnv);
     const withJms = parseEnv(await readFile(envFile, 'utf8'));
     assert.deepEqual({ ...withJms }, { ...config, ...jmsEnv }, 'Bootstrap changed existing settings or credentials');
-    assert.equal(await hubFile(releasePath), savedSop, 'Bootstrap overwrote the customer workflow');
+    assert.equal(await hubFile(releasePath), savedSop, 'Bootstrap overwrote the customer Agent');
+    assert.equal(await gitlab.headSha(hub), hubHead, 'Bootstrap changed the Hub repository on its second run');
     const labels = await admin.json<{ name: string }[]>('/projects/' + hub + '/labels?per_page=100');
-    for (const name of ['claude::coding', 'claude::done', 'claude::failed', 'claude::idle', 'claude::planning',
+    for (const name of ['agent::image-sync', 'claude::coding', 'claude::done', 'claude::failed', 'claude::idle', 'claude::planning',
       'claude::waiting-approval', 'delivery::audit', 'delivery::code', 'delivery::env-change', 'delivery::release'])
       assert.ok(labels.some(label => label.name === name), 'Missing Hub label ' + name);
     for (const p of projects) {
@@ -190,7 +204,8 @@ async function main() {
       assert.equal(settings.ANTHROPIC_BASE_URL, mock.baseUrl, 'Claude Code requires the loopback mock');
       pod = spawn(process.execPath, ['packages/delivery/dist/server.js'], {
         env: { ...localEnv, ...settings, POD_ID: id, JEV_PROVIDER: 'bailian',
-          JEV_BASE_URL: jevServer.baseUrl + '/compatible-mode/v1/systemone', JEV_API_KEY: 'offline-jev-key' }, stdio: ['ignore', 'inherit', 'inherit'], detached: true,
+          JEV_BASE_URL: jevServer.baseUrl + '/compatible-mode/v1/systemone', JEV_API_KEY: 'offline-jev-key', HARBOR_SYNC_TOKEN: mcp.token },
+        stdio: ['ignore', 'inherit', 'inherit'], detached: true,
       });
       pod.on('error', error => { failure = error; });
       await until(id + ' health check', async () => {
@@ -264,24 +279,70 @@ async function main() {
       assert.equal((await rows('SELECT status FROM approval_requests WHERE id=?', [approval.id]))[0].status, 'PENDING');
     }
 
-    const unlabeled = await openIssue('Choose a workflow');
-    await state(unlabeled, 'IDLE');
-    assert.equal((await gitlab.getIssue(hub, unlabeled)).state, 'opened');
-    assert.equal(anthropic.getRequests(), 0);
-    const menu = (await notes(unlabeled)).map(n => n.body).join('\n');
-    assert.match(menu, /delivery::audit\b/);
-    assert.match(menu, /delivery::env-change .*缺少能力包：jumpserver/);
-    assert.match(menu, /delivery::release .*已就绪/);
-    assert.match(menu, /delivery::code .*已就绪/);
     const missing = await openIssue('Inspect web01', '', 'delivery::env-change');
     await state(missing, 'IDLE');
     assert.equal((await gitlab.getIssue(hub, missing)).state, 'opened');
     assert.equal(anthropic.getRequests(), 0);
     const guidance = (await notes(missing)).map(n => n.body).join('\n');
+    assert.match(guidance, /agents\/env-change\/AGENT\.md/);
     assert.match(guidance, /jumpserver：.*JUMPSERVER_BASE_URL/);
-    const alternatives = guidance.split('\n').find(line => line.includes('已就绪的工作流标签')) ?? '';
-    for (const label of ['delivery::release', 'delivery::code']) assert.ok(alternatives.includes(label));
-    console.log('Workflow menu and missing-capability guidance posted with zero Anthropic requests.');
+    const alternatives = guidance.split('\n').find(line => line.includes('已就绪的Agent标签')) ?? '';
+    for (const label of ['delivery::release', 'delivery::code', 'agent::image-sync']) assert.ok(alternatives.includes(label));
+    assert.deepEqual(jev.routingRequests, []);
+    console.log('Missing-capability guidance posted with zero Anthropic requests.');
+
+    const imageAgent = await hubFile(imagePath);
+    assert.match(imageAgent, /^requires: \[\]$/m);
+    assert.match(imageAgent, /^approver_tier: standard$/m);
+    await gitlab.upsertFile(hub, imagePath, imageAgent.replace(/^requires: \[\]$/m, 'requires: [harbor-sync]'), 'Enable Harbor MCP capability');
+    const mirror = await openIssue('同步 nginx 镜像');
+    const triage = await state(mirror, 'IDLE', 0);
+    const unrouted = await gitlab.getIssue(hub, mirror);
+    assert.equal(unrouted.state, 'opened');
+    assert.deepEqual(unrouted.labels, ['claude::idle']);
+    assert.deepEqual(await records(triage.id, 'approval_requests'), []);
+    assert.ok(anthropic.getRequests() > 0);
+    assert.ok((await notes(mirror)).some(n => /请提供带 Tag .*目标镜像仓库地址/.test(n.body)));
+    const lowConfidence = { recentMessages: [], confidence: 0.55, ambiguity: 2 };
+    assert.deepEqual(jev.routingRequests, [lowConfidence]);
+    assert.deepEqual(mcp.calls, []);
+
+    // Include a prior user note so routing must read GitLab history and discard bot replies.
+    await gitlab.postNote(hub, mirror, '/status');
+    await until('triage /status reply', async () => (await notes(mirror)).some(n => n.body.startsWith('IDLE\n')));
+    const { source_image, target_image } = imageMirror;
+    const clarification = `请将 ${source_image} 同步到 ${target_image}。`;
+    await gitlab.postNote(hub, mirror, clarification);
+    const mirrorPlan = await pendingCard(mirror, 'Plan', ['🧭 已由 Jev 自动路由', '0.96', '实施方案审批',
+      source_image, target_image, 'harbor-sync__check_image_exists']);
+    const routed = await state(mirror, 'WAITING_PLAN', triage.last_message_seq);
+    assert.equal(routed.permission_mode, 'plan');
+    assert.equal(routed.claude_session_id, triage.claude_session_id);
+    assert.ok((await gitlab.getIssue(hub, mirror)).labels.includes('agent::image-sync'));
+    assert.deepEqual(jev.routingRequests, [lowConfidence, { recentMessages: ['/status', clarification], confidence: 0.96, ambiguity: 0.1 }]);
+    const check = { name: 'check_image_exists', arguments: { target_image } };
+    assert.deepEqual(mcp.calls, [check]);
+
+    await award(mirror, mirrorPlan, 'dev');
+    const mirrorSync = await pendingCard(mirror, 'harbor-sync__sync_image', ['外部 MCP 工具执行审批', 'harbor-sync', 'sync_image', source_image, target_image]);
+    await rejectDeveloper(mirror, mirrorSync);
+    assert.deepEqual(mcp.calls, [check]);
+    await award(mirror, mirrorSync, 'sre');
+    const mirrored = await done(mirror);
+    assert.deepEqual(mcp.calls, [check, { name: 'sync_image', arguments: imageMirror }]);
+    assert.equal(jev.routingRequests.length, 2, 'The sticky label should resolve subsequent turns and approvals');
+    assert.equal(mirrored.claude_session_id, triage.claude_session_id);
+    const mirrorApprovals = await records(mirrored.id, 'approval_requests');
+    assert.equal(mirrorApprovals.length, 2);
+    for (const approval of mirrorApprovals) {
+      assert.equal(approval.status, 'APPROVED');
+      assert.equal(approval.decided_by, approval.id === mirrorPlan.id ? gitlab.devUsername : gitlab.sreUsername);
+    }
+    const mirrorNotes = await notes(mirror);
+    assert.ok(mirrorNotes.some(n => n.body.includes('镜像同步完成，目标为 ' + target_image)));
+    assert.ok(mirrorNotes.every(n => !n.body.includes(mcp.token)), 'The MCP Bearer token appeared in an Issue note');
+    assert.deepEqual(await readdir(sandbox), []);
+    console.log('Triage clarified and routed image-sync. The scoped Skill and MCP tools ran with production approval.');
 
     const code = await openIssue('Deliver hello.txt', 'Update ' + webRepo + ' and ' + apiRepo, 'delivery::code');
     await award(code, await pendingCard(code, 'Plan', [webRepo, apiRepo]), 'dev');
@@ -317,10 +378,10 @@ async function main() {
       const tag = hotfix ? 'hotfix-1.0.1' : 'rel-1.0.0';
       const marker = hotfix ? 'CUSTOM_HOTFIX_WORKFLOW: hotfix-' : 'CUSTOM_RELEASE_TAG_PREFIX: rel-';
       if (hotfix) await gitlab.ensureLabel(hub, label);
-      const sop = ['---', 'label: ' + label, 'mode: governed', 'requires: [gitlab-release]', 'approver_tier: prod',
-        'close_policy: ' + (hotfix ? 'approve' : 'auto'), '---', marker,
-        'List tags and publish the pinned commit after approval.', ''].join('\n');
-      await gitlab.upsertFile(hub, 'workflows/' + workflow + '.md', sop, 'Customize ' + workflow + ' workflow');
+      const sop = hotfix ? ['---', 'label: ' + label, 'mode: governed', 'requires: [gitlab-release]', 'approver_tier: prod',
+        'close_policy: approve', '---', marker, 'List tags and publish the pinned commit after approval.', ''].join('\n')
+        : savedSop + '\n' + marker + '\n';
+      await gitlab.upsertFile(hub, hotfix ? 'workflows/hotfix.md' : releasePath, sop, 'Customize ' + workflow + ' SOP');
       const iid = await openIssue('Publish ' + tag, 'Publish ' + webRepo + ' at ' + shaToPublish, label);
       await award(iid, await pendingCard(iid, 'Plan', [tag, shaToPublish]), 'dev');
       const publish = await pendingCard(iid, 'detent_create_release', ['GitLab 发布审批', webRepo, tag, shaToPublish]);

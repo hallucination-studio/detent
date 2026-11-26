@@ -19,6 +19,7 @@ const ConfigSchema = z.object({
   gitlabHubDefaultBranch: z.string().default('main'),
   gitlabMinAccessLevel: z.coerce.number().int().default(30),
   noteStreamThrottleMs: z.coerce.number().int().default(2000),
+  mcpCapabilitiesFile: z.string().trim().min(1).optional(),
 
   mysqlHost: z.string().default('127.0.0.1'),
   mysqlPort: z.coerce.number().int().default(3306),
@@ -40,6 +41,7 @@ const ConfigSchema = z.object({
   jevApiKey: z.string().optional(),
   jevModel: z.string().optional(),
   jevThreshold: z.coerce.number().min(0.5).max(0.99).default(0.9),
+  jevRoutingThreshold: z.coerce.number().min(0.5).max(0.99).default(0.8),
   jevTimeoutMs: z.coerce.number().int().positive().max(30000).default(2500),
   safeBashPrefixes: z
     .string()
@@ -70,6 +72,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     gitlabHubDefaultBranch: env.GITLAB_HUB_DEFAULT_BRANCH,
     gitlabMinAccessLevel: env.GITLAB_MIN_ACCESS_LEVEL,
     noteStreamThrottleMs: env.NOTE_STREAM_THROTTLE_MS,
+    mcpCapabilitiesFile: env.DETENT_MCP_CAPABILITIES_FILE?.trim() || undefined,
 
     mysqlHost: env.MYSQL_HOST,
     mysqlPort: env.MYSQL_PORT,
@@ -87,6 +90,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     jevApiKey: env.JEV_API_KEY?.trim() || undefined,
     jevModel: env.JEV_MODEL?.trim() || undefined,
     jevThreshold: env.JEV_THRESHOLD,
+    jevRoutingThreshold: env.JEV_ROUTING_THRESHOLD,
     jevTimeoutMs: env.JEV_TIMEOUT_MS,
     safeBashPrefixes: env.SAFE_BASH_PREFIXES,
   });

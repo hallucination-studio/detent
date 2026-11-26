@@ -12,13 +12,15 @@ import type {
 } from '../types.js';
 import { redactGitUrl, type GitLabClient } from '../gitlab/client.js';
 import type { WebhookEvent } from '../gitlab/webhook.js';
-import { NoteStreamer, renderPlanApprovalCard, renderSummary } from '../gitlab/note-streamer.js';
+import { escapeTableCell, NoteStreamer, renderPlanApprovalCard, renderSummary } from '../gitlab/note-streamer.js';
 import { EphemeralSandbox, type TurnSandbox, type WorkspaceGitLab } from '../workspace/ephemeral-sandbox.js';
 import { WorkspaceTools } from '../workspace/mcp-tools.js';
 import { TranscriptHydrator } from '../claude/transcript-hydrator.js';
 import { ColdHold, PermissionGate } from '../claude/permission-gate.js';
 import { buildSystemPrompt } from '../claude/prompts.js';
 import type { ClaudeRunner } from '../claude/runner.js';
+import { loadHubAgents } from '../workflows/hub-agents.js';
+import { normalizeHubValue } from '../workflows/hub-frontmatter.js';
 
 import type { DetentExtensions } from '../extensions.js';
 import { checkIssueClosure, createCloseIssueTool } from './close-issue.js';
@@ -30,7 +32,7 @@ type Client = WorkspaceGitLab &
   Pick<
     GitLabClient,
     'createIssueNote' | 'updateIssueNote' | 'syncIssueStatusLabel' | 'getIssue' | 'hasApprovalPermission'
-  > & Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile' | 'closeIssue'>>;
+  > & Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile' | 'listIssueNotes' | 'updateIssueLabels' | 'isBotUser' | 'closeIssue'>>;
 type Active = { controller: AbortController; ownsLease: boolean; gate?: PermissionGate };
 export class SessionOrchestrator {
   private active = new Map<string, Active>();
@@ -44,8 +46,13 @@ export class SessionOrchestrator {
   ) {
     this.decision = extensions.decisionClient ?? createDecisionClient(config);
   }
-  private resolveTurnProfile(session: IssueSessionRow) {
-    return this.extensions.resolveTurnProfile?.({ session, repo: this.repo, gitlab: this.gitlab });
+  private getCapabilities() {
+    return this.extensions.capabilities ?? [];
+  }
+  private resolveTurnProfile(session: IssueSessionRow, context: { purpose: 'turn' | 'approval'; prompt?: string }) {
+    return this.extensions.resolveTurnProfile?.({
+      session, repo: this.repo, gitlab: this.gitlab, decision: this.decision, capabilities: this.getCapabilities(), ...context,
+    });
   }
   async resumeSession(id: string, prompt: string, options?: {
     permissionMode?: PermissionMode;
@@ -117,10 +124,9 @@ export class SessionOrchestrator {
     await this.gitlab.syncIssueStatusLabel(s.hubProjectId, s.hubIssueIid, status);
   }
   private async expire(s: IssueSessionRow) {
-    const pending = await this.repo.getLatestPendingApproval(s.id);
-    if (pending) await resolveApproval(
-      this.repo, s, pending.id, 'EXPIRED', 'detent', '轮次已结束', this.extensions.hooks?.onApprovalResolved,
-    );
+    for (let pending = await this.repo.getLatestPendingApproval(s.id); pending; pending = await this.repo.getLatestPendingApproval(s.id)) {
+      await resolveApproval(this.repo, s, pending.id, 'EXPIRED', 'detent', '轮次已结束', this.extensions.hooks?.onApprovalResolved);
+    }
   }
   private async summary(id: string) {
     return renderSummary(
@@ -135,19 +141,20 @@ export class SessionOrchestrator {
   ) {
     const host = new EphemeralSandbox(this.config, this.repo, this.gitlab);
     const transcripts = new TranscriptHydrator(this.repo);
-    const plan = s.permissionMode === 'plan';
     const { controller } = active;
     let sandbox: TurnSandbox | undefined;
     let streamer: NoteStreamer | undefined;
     let issueClosed = false;
     try {
-      const profile = await this.resolveTurnProfile(s);
+      const profile = await this.resolveTurnProfile(s, { purpose: 'turn', prompt });
       controller.signal.throwIfAborted();
       if (profile?.blockedMessage?.trim()) {
         await this.gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, redactGitUrl(profile.blockedMessage));
         await this.state(s, 'IDLE');
         return;
       }
+      const plan = s.permissionMode === 'plan';
+      const routingPrefix = profile?.routingNotice ? redactGitUrl(profile.routingNotice, this.config.jevApiKey) + '\n\n' : '';
       await this.state(s, plan ? 'PLANNING' : 'CODING', s.permissionMode);
       const note = await this.gitlab.createIssueNote(
         s.hubProjectId,
@@ -158,7 +165,7 @@ export class SessionOrchestrator {
       s.claudeSessionId ??= randomUUID();
       await this.repo.updateSessionState(s.id, { activeNoteId: note.id, claudeSessionId: s.claudeSessionId });
       s.activeNoteId = note.id;
-      sandbox = await host.prepareTurnSandbox(s);
+      sandbox = await host.prepareTurnSandbox(s, profile?.sandboxScope);
       const { claudeHome, workspaceRoot } = sandbox;
       await transcripts.hydrateTranscriptToTmp(s, claudeHome, workspaceRoot);
       const flush = () =>
@@ -172,11 +179,8 @@ export class SessionOrchestrator {
       const closeTool = profile && createCloseIssueTool(profile, request => { closeRequested = request; });
       const gate = new PermissionGate({
         decision: this.decision,
-        extensionTools: [
-          ...(this.extensions.tools ?? []),
-          ...(this.extensions.capabilities ?? []).filter(pack => pack.enabled).flatMap(pack => pack.tools),
-          ...(closeTool ? [closeTool] : []),
-        ],
+        capabilities: this.getCapabilities(),
+        extensionTools: closeTool ? [...(this.extensions.tools ?? []), closeTool] : this.extensions.tools,
         profile: closeTool && profile?.enabledExtensionTools
           ? { ...profile, enabledExtensionTools: [...profile.enabledExtensionTools, closeTool.name] }
           : profile,
@@ -188,7 +192,7 @@ export class SessionOrchestrator {
         gitlab: this.gitlab,
         workspaceRoot,
         checkpoint,
-        previousDecision,
+        previousDecision: profile?.routingNotice ? undefined : previousDecision,
       });
       active.gate = gate;
       streamer = new NoteStreamer(
@@ -230,7 +234,7 @@ export class SessionOrchestrator {
         const approval = await this.repo.createApprovalRequest(s.id, 'PLAN', 'Plan', {});
         await this.repo.updateApprovalNoteId(approval.id, note.id);
         await this.state(s, 'WAITING_PLAN');
-        await streamer.flush(renderPlanApprovalCard(result));
+        await streamer.flush(routingPrefix + renderPlanApprovalCard(result));
       } else if (closeRequested && profile) {
         // Tools may have created new work after the close request.
         const checked = await checkIssueClosure(profile, { session: s, repo: this.repo, permissionMode: s.permissionMode });
@@ -238,13 +242,13 @@ export class SessionOrchestrator {
         controller.signal.throwIfAborted();
         await this.archiveWorktrees(s.id);
         controller.signal.throwIfAborted();
-        await streamer.flush(result);
+        await streamer.flush(routingPrefix + result);
         controller.signal.throwIfAborted();
         await this.gitlab.closeIssue?.(s.hubProjectId, s.hubIssueIid);
         issueClosed = true;
         await this.state(s, 'DONE');
       } else {
-        await streamer.flush(result);
+        await streamer.flush(routingPrefix + result);
         await this.state(s, 'IDLE');
       }
       const completed = this.extensions.hooks?.onTurnCompleted;
@@ -297,10 +301,11 @@ export class SessionOrchestrator {
     if (!s) return;
     if (intent.type === 'STATUS') return this.replyStatus(s);
     if (
-      ['RESET', 'ABORT'].includes(intent.type) &&
+      ['RESET', 'ABORT', 'USE'].includes(intent.type) &&
       !(await this.gitlab.hasApprovalPermission(project, intent.userId))
     )
       return;
+    if (intent.type === 'USE') return this.handleUseAgent(s, intent);
     if (intent.type === 'APPROVE' || intent.type === 'REJECT') return this.handleApprovalIntent(s, intent);
     return this.handleSessionCommand(s, intent);
   }
@@ -323,7 +328,8 @@ export class SessionOrchestrator {
         ? await this.repo.getApprovalByNoteId(s.id, intent.targetNoteId)
         : await this.repo.getLatestPendingApproval(s.id);
     if (pending?.status !== 'PENDING') return;
-    const profile = await this.resolveTurnProfile(s);
+    const profile = await this.resolveTurnProfile(s, { purpose: 'approval' });
+    if (profile?.blockedMessage?.trim()) return;
     const permitted = profile?.canApprove
       ? await profile.canApprove({
           projectId: s.hubProjectId, userId: intent.userId, username: intent.username,
@@ -354,6 +360,43 @@ export class SessionOrchestrator {
         await this.run(session, active, prompt, decision);
       }
     }, async () => stillWaiting(await this.repo.getSession(s.id)));
+  }
+  private async handleUseAgent(s: IssueSessionRow, intent: ParsedUserIntent) {
+    const args = intent.comment?.trim() ?? '';
+    const target = args.split(/\s+/, 1)[0];
+    const prompt = args.slice(target.length).trim();
+    const idOrLabel = normalizeHubValue(target);
+    const { agents } = await loadHubAgents(this.gitlab, s.hubProjectId, this.config.gitlabHubDefaultBranch);
+    const matched = agents.find(agent => agent.id === idOrLabel || agent.label === idOrLabel);
+    if (!matched) {
+      const message = agents.length ? [
+        '未找到指定的 Agent。可用 Agent：',
+        ...agents.map(agent => `- ${escapeTableCell(agent.id, 'code')}（标签 ${escapeTableCell(agent.label, 'code')}）`),
+      ].join('\n') : 'Hub 仓库尚未配置可用 Agent。';
+      await this.gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, redactGitUrl(message, this.config.jevApiKey));
+      return;
+    }
+    if (!this.gitlab.updateIssueLabels) {
+      await this.gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, '无法更新 Issue 标签，请手动添加目标 Agent 的标签。');
+      return;
+    }
+
+    const otherLabels = new Set(agents.map(agent => agent.label).filter(label => label !== matched.label));
+    await this.stop(s);
+    await this.withLease(s, async (session, active) => {
+      const { hubProjectId, hubIssueIid } = session;
+      await this.expire(session);
+      active.controller.signal.throwIfAborted();
+      // Clear the waiting state and persist the Plan reset before GitLab can change the route.
+      await this.repo.updateSessionState(session.id, { status: 'IDLE', permissionMode: 'plan' });
+      session.status = 'IDLE';
+      session.permissionMode = 'plan';
+      const issue = await this.gitlab.getIssue(hubProjectId, hubIssueIid);
+      const remove = issue.labels.filter(label => otherLabels.has(normalizeHubValue(label)));
+      active.controller.signal.throwIfAborted();
+      await this.gitlab.updateIssueLabels?.(hubProjectId, hubIssueIid, { add: [matched.label], remove });
+      await this.run(session, active, prompt || session.issueTitle);
+    });
   }
   private async handleSessionCommand(s: IssueSessionRow, intent: ParsedUserIntent) {
     if (intent.type === 'ABORT' || intent.type === 'RESET') await this.stop(s);

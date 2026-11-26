@@ -22,6 +22,7 @@ export type DecisionAnswer = z.infer<typeof response>['answers'][string];
 export interface DecisionClient {
   readonly provider: Provider;
   readonly threshold: number;
+  readonly routingThreshold?: number;
   decide(state: string | Record<string, unknown>, questions: Record<string, DecisionQuestion>): Promise<Record<string, DecisionAnswer>>;
 }
 
@@ -42,6 +43,7 @@ class HttpJevDecisionClient implements DecisionClient {
   private readonly model: string;
   private readonly timeoutMs: number;
   readonly threshold: number;
+  readonly routingThreshold: number;
   constructor(readonly provider: Provider, config: AppConfig, private http: typeof fetch) {
     if (!config.jevBaseUrl || !config.jevModel) throw Error('Missing System One endpoint or model');
     this.#apiKey = config.jevApiKey;
@@ -49,6 +51,7 @@ class HttpJevDecisionClient implements DecisionClient {
     this.timeoutMs = config.jevTimeoutMs;
     this.endpoint = resolveJevEndpoint(provider, config.jevBaseUrl);
     this.threshold = config.jevThreshold;
+    this.routingThreshold = config.jevRoutingThreshold;
   }
 
   async decide(state: string | Record<string, unknown>, questions: Record<string, DecisionQuestion>) {

@@ -235,8 +235,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
       controller.signal.throwIfAborted();
       await host.checkpoint(sandbox, s.id);
       controller.signal.throwIfAborted();
-      for (const discussion of replyThreads)
-        if (discussion !== discussions[0]) await this.channel(s, discussion).createNote(redact(result));
+      let discussionReply = result;
       if (plan && !readonly) {
         const card = await this.repo.createApprovalRequest(s.id, 'PLAN', 'Plan', {});
         await this.repo.updateApprovalNoteId(card.id, note.id);
@@ -244,9 +243,11 @@ export class MergeRequestOrchestrator extends TurnRuntime {
         await this.repo.updateSessionState(s.id, { status: s.status });
         await streamer.flush(renderPlanApprovalCard(result));
       } else {
-        await streamer.flush(result);
+        discussionReply = await streamer.flush(result);
         s.status = 'IDLE';
       }
+      for (const discussion of replyThreads)
+        if (discussion !== discussions[0]) await this.channel(s, discussion).createNote(redact(discussionReply));
       await this.repo.updateSessionState(s.id, { status: s.status, recoveryAttempts: 0 });
     } catch (error) {
       const cause = controller.signal.reason ?? error;

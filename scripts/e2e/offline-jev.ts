@@ -3,6 +3,7 @@ import { imageMirror } from './offline-mcp.js';
 
 export function offlineJev() {
   const requests: string[] = [];
+  const eventDecisions: string[] = [];
   const routingRequests: { recentMessages: string[]; confidence: number; ambiguity: number }[] = [];
   async function handle(req: Request) {
     assert.equal(req.method, 'POST');
@@ -26,12 +27,22 @@ export function offlineJev() {
         ambiguity: { type: 'score', score: ambiguity },
       } });
     }
+    if (questions.action) {
+      assert.deepEqual(questions.action, { type: 'choice', criteria: { notify: 'notify', run: 'run' } });
+      assert.equal(state.hint, 'Notify on infrastructure flakes and fix code errors.');
+      assert.match(state.summary, /pipeline.*failed/);
+      assert.match(state.summary, /Infrastructure flake|Code error/);
+      const choice = state.summary.includes('Infrastructure flake') ? 'notify' : 'run';
+      eventDecisions.push(choice);
+      return Response.json({ answers: { action: { type: 'choice', choice } } });
+    }
+    const manual = state.command === 'printf config-loader-ok | cut -c 1-6';
     const remote = state.surface === 'remote_jumpserver_readonly_inspect';
     if (remote) assert.equal(state.command, 'ss -lntp');
     else {
       assert.equal(state.surface, 'local_ephemeral_workspace_bash');
       assert.equal(state.mode, 'coding');
-      assert.ok(state.command === 'pwd; ls -la' ||
+      assert.ok(manual || state.command === 'pwd; ls -la' ||
         /^git -C (projects\/[\w.-]+) status && git -C \1 branch --show-current$/.test(state.command));
     }
     const category = remote ? 'effect' : 'category';
@@ -41,9 +52,9 @@ export function offlineJev() {
     assert.equal(questions.impact.type, 'score');
     requests.push(state.command);
     return Response.json({ answers: {
-      [category]: { type: 'choice', choice: remote ? 'pure_readonly' : 'readonly_inspect' },
-      [safety]: { type: 'noul', noul: 0.96 }, impact: { type: 'score', score: 0 },
+      [category]: { type: 'choice', choice: manual ? 'uncertain' : remote ? 'pure_readonly' : 'readonly_inspect' },
+      [safety]: { type: 'noul', noul: manual ? 0.5 : 0.96 }, impact: { type: 'score', score: manual ? 2 : 0 },
     } });
   }
-  return { requests, routingRequests, handle };
+  return { requests, routingRequests, eventDecisions, handle };
 }

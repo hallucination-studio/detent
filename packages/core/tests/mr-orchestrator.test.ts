@@ -213,13 +213,15 @@ it('batches inline review and delivers hot steering to PostToolUse, replying in 
     const result = await hook({ hook_event_name: 'PostToolUse', cwd: t.sandbox.workspaceRoot, transcript_path: '',
       session_id: t.session.claudeSessionId!, tool_name: 'Read', tool_input: {}, tool_response: 'ok' }, undefined, { signal: t.controller.signal });
     expect(result).toMatchObject({ hookSpecificOutput: { additionalContext: '@dev: tracked:4 change 4' } });
+    t.progress('read review diff');
     return 'review addressed';
   });
   await worker.wakeSession(s, 'inbox');
   expect((await session()).status).toBe('IDLE');
   expect(run).toHaveBeenCalledOnce();
-  expect(gitlab.updateMergeRequestDiscussionNote).toHaveBeenCalledWith(2, 1, 'review-1', expect.any(Number), 'review addressed');
-  for (const index of [2, 3, 4]) expect(gitlab.createMergeRequestDiscussionNote).toHaveBeenCalledWith(2, 1, 'review-' + index, 'review addressed');
+  const body = gitlab.updateMergeRequestDiscussionNote.mock.lastCall?.at(-1);
+  expect(body).toMatch(/review addressed[\s\S]*<details>[\s\S]*read review diff[\s\S]*<\/details>/);
+  for (const index of [2, 3, 4]) expect(gitlab.createMergeRequestDiscussionNote).toHaveBeenCalledWith(2, 1, 'review-' + index, body);
 });
 
 it('deduplicates bot CI, checks live SHA and ownership, escalates to both resources, and resets the budget', async () => {

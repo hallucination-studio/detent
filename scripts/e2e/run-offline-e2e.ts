@@ -6,10 +6,12 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promise
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parseEnv, promisify } from 'node:util';
 import mysql, { type RowDataPacket } from 'mysql2/promise';
 import { createOfflineAnthropic } from './offline-anthropic.js';
+import { runMrScenarios } from './mr-scenarios.js';
 import { gitlabApi } from './gitlab-driver.js';
 import { liveGitLab } from './live-gitlab.js';
 import { offlineGitLab } from './offline-gitlab.js';
@@ -74,15 +76,22 @@ async function main() {
     return { baseUrl: 'http://' + loopback + ':' + port, close: () => close(server) };
   }
 
-  async function stopPod() {
+  async function stopPod(requireCleanExit = false) {
     const child = pod;
     pod = undefined;
-    if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
+    if (!child?.pid || child.exitCode !== null || child.signalCode !== null) {
+      assert.ok(!requireCleanExit, 'Expected a running Pod for a planned restart');
+      return;
+    }
     const stopped = once(child, 'exit');
     child.kill('SIGTERM');
-    // A failed run can still be holding an SDK approval. Terminate its process group on timeout.
-    const kill = setTimeout(() => { try { process.kill(-child.pid!, 'SIGKILL'); } catch {} }, 4000);
-    try { await stopped; } finally { clearTimeout(kill); }
+    // Allow active turns and the SDK's five-second transport teardown to drain on planned restarts.
+    // Failed runs may still hold an approval, so bound their cleanup separately.
+    const kill = setTimeout(() => { try { process.kill(-child.pid!, 'SIGKILL'); } catch {} }, requireCleanExit ? 90_000 : 4000);
+    try {
+      const [code] = await stopped;
+      if (requireCleanExit) assert.equal(code, 0, 'Pod must finish draining webhooks and MR turns');
+    } finally { clearTimeout(kill); }
   }
 
   try {
@@ -161,6 +170,7 @@ async function main() {
     const hub = Number(config.GITLAB_HUB_PROJECT_ID);
     const admin = gitlabApi(gitlab.baseUrl, gitlab.adminToken);
     if (env.E2E_GITLAB_URL) cleanup.push(() => admin.request('/personal_access_tokens/self', 'DELETE', undefined, config.GITLAB_TOKEN));
+    const [developer] = await admin.json<{ id: number }[]>('/users?username=' + gitlab.devUsername);
     const project = (path: string) => admin.json<{ id: number; path_with_namespace: string }>('/projects/' + encodeURIComponent(path));
     const projects = await Promise.all([gitlab.hubProjectPath, webRepo, apiRepo, ansibleRepo].map(project));
     const [hubProject, web, api, target] = projects;
@@ -201,12 +211,37 @@ async function main() {
       assert.equal(hooks[0].deployment_events, p.id !== hub);
       assert.equal(hooks[0].push_events, false);
     }
+    const podGets = new Map<string, number>();
+    async function observeGet(path: string, act: () => Promise<unknown>) {
+      const key = '/api/v4' + path;
+      const before = podGets.get(key) ?? 0;
+      await act();
+      await until('Pod read ' + path, () => (podGets.get(key) ?? 0) > before);
+    }
+    const secrets = [gitlab.adminToken, config.GITLAB_TOKEN, config.GITLAB_WEBHOOK_SECRET, config.ANTHROPIC_API_KEY,
+      'offline-jev-key', mcp.token, jms.readonly, jms.job];
+    if (!external) secrets.push(password);
+    function checkSecrets(value: unknown) {
+      const body = JSON.stringify(value);
+      assert.ok(!secrets.some(secret => secret && body.includes(secret)), 'A credential appeared in E2E output');
+      assert.ok(!/https?:\/\/oauth2:(?!\*\*\*@)[^\s/@]+@/i.test(body), 'A Git URL exposed credentials');
+    }
+    anthropic.checkRequests(checkSecrets);
     async function startPod(id: string, settings: NodeJS.ProcessEnv) {
       assert.equal(settings.ANTHROPIC_BASE_URL, mock.baseUrl, 'Claude Code requires the loopback mock');
-      pod = spawn(process.execPath, ['packages/delivery/dist/server.js'], {
+      pod = spawn(process.execPath, ['--import', './scripts/e2e/observe-gitlab.mjs', 'packages/delivery/dist/server.js'], {
         env: { ...localEnv, ...settings, POD_ID: id, JEV_PROVIDER: 'bailian',
           JEV_BASE_URL: jevServer.baseUrl + '/compatible-mode/v1/systemone', JEV_API_KEY: 'offline-jev-key', HARBOR_SYNC_TOKEN: mcp.token },
-        stdio: ['ignore', 'inherit', 'inherit'], detached: true,
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'], detached: true,
+      });
+      for (const [stream, output] of [[pod.stdout!, process.stdout], [pod.stderr!, process.stderr]] as const) {
+        createInterface({ input: stream }).on('line', line => {
+          try { checkSecrets(line); output.write(line + '\n'); }
+          catch { failure ??= Error('A credential appeared in the Pod log'); }
+        });
+      }
+      pod.on('message', path => {
+        if (typeof path === 'string') podGets.set(path, (podGets.get(path) ?? 0) + 1);
       });
       pod.on('error', error => { failure = error; });
       await until(id + ' health check', async () => {
@@ -221,7 +256,11 @@ async function main() {
       issueIds.push(iid);
       return iid;
     }
-    const standaloneMrs: number[] = [];
+    const standaloneMrs: [number, number][] = [];
+    function trackMr<T extends { target_project_id: number; iid: number }>(mr: T) {
+      standaloneMrs.push([mr.target_project_id, mr.iid]);
+      return mr;
+    }
     if (external) cleanup.push(async () => {
       if (!issueIds.length && !standaloneMrs.length) return;
       const cx = await db.getConnection();
@@ -229,10 +268,14 @@ async function main() {
         await cx.beginTransaction();
         const [owned] = await cx.query<RowDataPacket[]>(`SELECT id FROM issue_sessions WHERE
           (session_kind='issue' AND hub_project_id=? AND hub_issue_iid IN (?)) OR
-          (session_kind='mr' AND ((hub_project_id=? AND hub_issue_iid IN (?)) OR
+          (session_kind='mr' AND ((hub_project_id,hub_issue_iid) IN (?) OR
             (hub_project_id,hub_issue_iid) IN (SELECT m.target_project_id,m.mr_iid FROM session_merge_requests m
               JOIN issue_sessions h ON h.id=m.session_id WHERE h.session_kind='issue' AND h.hub_project_id=? AND h.hub_issue_iid IN (?))))`,
-          [hub, issueIds.length ? issueIds : [0], api.id, standaloneMrs.length ? standaloneMrs : [0], hub, issueIds.length ? issueIds : [0]]);
+          [hub, issueIds.length ? issueIds : [0], standaloneMrs.length ? standaloneMrs : [[0, 0]], hub, issueIds.length ? issueIds : [0]]);
+        const [linked] = await cx.query<RowDataPacket[]>(`SELECT m.target_project_id,m.mr_iid FROM session_merge_requests m
+          JOIN issue_sessions h ON h.id=m.session_id WHERE h.session_kind='issue' AND h.hub_project_id=? AND h.hub_issue_iid IN (?)`,
+          [hub, issueIds.length ? issueIds : [0]]);
+        for (const m of linked) standaloneMrs.push([m.target_project_id, m.mr_iid]);
         for (const fixture of owned) {
           for (const table of ['delivery_executions', 'session_inbox', 'approval_requests', 'session_merge_requests', 'session_worktrees', 'session_messages'])
             await cx.query('DELETE FROM ' + table + ' WHERE session_id=?', [fixture.id]);
@@ -243,8 +286,13 @@ async function main() {
         await cx.rollback();
         throw error;
       } finally { cx.release(); }
+      const paths = new Set([...standaloneMrs.map(([id, iid]) => '/projects/' + id + '/merge_requests/' + iid),
+        ...issueIds.map(iid => '/projects/' + hub + '/issues/' + iid)]);
+      const deletions = await Promise.allSettled([...paths].map(path => admin.request(path, 'DELETE', undefined, gitlab.adminToken, [404])));
+      const errors = deletions.flatMap(r => r.status === 'rejected' ? [r.reason] : []);
+      if (errors.length) throw new AggregateError(errors, 'Could not remove GitLab fixtures');
     });
-    cleanup.push(stopPod);
+    cleanup.push(() => stopPod());
     const noJms = Object.fromEntries(Object.entries(config).filter(([key]) => !key.startsWith('JUMPSERVER_')));
     await startPod('detent-pod-nojms', noJms);
     assert.deepEqual(await rows('SELECT id FROM issue_sessions WHERE hub_project_id=? LIMIT 1', [hub]), [], 'Hub already has sessions');
@@ -278,11 +326,7 @@ async function main() {
       return card;
     }
     async function rejectDeveloper(iid: number, approval: RowDataPacket) {
-      const checks = gitlab.membershipChecks;
-      if (checks) checks.length = 0;
-      await award(iid, approval, 'dev');
-      if (checks) await until('developer RBAC lookup', () => checks.includes(hub + '/2'));
-      else await delay(1500);
+      await observeGet('/projects/' + hub + '/members/all/' + developer.id, () => award(iid, approval, 'dev'));
       assert.equal((await rows('SELECT status FROM approval_requests WHERE id=?', [approval.id]))[0].status, 'PENDING');
     }
 
@@ -366,17 +410,16 @@ async function main() {
     const firstMr = mrs.find(m => m.target_project_id === web.id)!;
     const secondMr = mrs.find(m => m.target_project_id === api.id)!;
     const bot = await admin.json<{ id: number; username: string }>('/user', 'GET', undefined, config.GITLAB_TOKEN);
-    const [developer] = await admin.json<{ id: number }[]>('/users?username=' + gitlab.devUsername);
     for (const m of mrs) {
       const mr = await gitlab.getMr(m.target_project_id, m.mr_iid);
       assert.ok(mr.assignees.some(a => a.id === bot.id), 'Issue-created MR must be assigned to the bot');
       await admin.request('/projects/' + m.target_project_id + '/members', 'POST', { user_id: developer.id, access_level: 30 });
     }
-    async function mrState(project: number, iid: number, status: 'IDLE' | 'DONE', afterSeq = -1) {
+    async function mrState(project: number, iid: number, status: 'IDLE' | 'DONE' | 'WAITING_PLAN' | 'WAITING_TOOL' | 'FAILED', afterSeq = -1) {
       return until(project + '!' + iid + ' ' + status, async () => {
         const [row] = await rows("SELECT * FROM issue_sessions WHERE session_kind='mr' AND hub_project_id=? AND hub_issue_iid=?", [project, iid]);
-        if (row?.status === 'FAILED') throw Error('MR worker failed: ' + (await gitlab.listMrNotes(project, iid)).map(n => n.body).join('\n'));
-        if (row?.status === status && !row.locked_by_pod && row.last_message_seq > afterSeq) return row;
+        if (row?.status === 'FAILED' && status !== 'FAILED') throw Error('MR worker failed: ' + (await gitlab.listMrNotes(project, iid)).map(n => n.body).join('\n'));
+        if (row?.status === status && (status === 'WAITING_TOOL' || !row.locked_by_pod) && row.last_message_seq > afterSeq) return row;
       });
     }
     const hubNotes = await notes(code);
@@ -429,8 +472,7 @@ async function main() {
 
     const hubIssueIds = async () => (await admin.json<{ iid: number }[]>('/projects/' + hub + '/issues?scope=all&per_page=100')).map(i => i.iid).sort();
     const beforeStandalone = await hubIssueIds();
-    const standalone = await gitlab.openExternalMr(api.id, 'external-feature');
-    standaloneMrs.push(standalone.iid);
+    const standalone = trackMr(await gitlab.openExternalMr(api.id, 'external-feature'));
     assert.deepEqual(standalone.assignees, []);
     const externalThread = await gitlab.openDiscussion(api.id, standalone.iid, '@' + bot.username + ' Please inspect this contribution');
     const mentioned = await mrState(api.id, standalone.iid, 'IDLE');
@@ -464,7 +506,7 @@ async function main() {
       const receipt = 'steer-' + randomUUID();
       const instruction = 'Please include receipt ' + receipt + ' in the CI fix.';
       let steeringThread: string | undefined;
-      anthropic.beforeNextJobLog(async () => {
+      anthropic.beforeNextTool('detent_get_pipeline_job_log', async () => {
         const [active] = await rows('SELECT status, locked_by_pod FROM issue_sessions WHERE id=?', [assigned.id]);
         assert.ok(active.status === 'CODING' && active.locked_by_pod);
         steeringThread = (await gitlab.openDiscussion(api.id, before.iid, instruction)).id;
@@ -487,12 +529,17 @@ async function main() {
         n.author.username === bot.username && n.body.includes(receipt)));
       assert.deepEqual(await hubIssueIds(), beforeStandalone);
       await gitlab.synthetic.failDeployment(api.id);
-      const alert = await until('deployment alert Issue', async () => (await admin.json<{ title: string; description: string; labels: string[] }[]>(
+      const alert = await until('deployment alert Issue', async () => (await admin.json<{ iid: number; title: string; description: string; labels: string[] }[]>(
         '/projects/' + hub + '/issues?search=deployment')).find(i => i.labels.includes(alertLabel)));
+      issueIds.push(alert.iid);
       for (const detail of ['deployment', 'failed', apiRepo, 'staging']) assert.ok(alert.description.includes(detail));
       await gitlab.upsertFile(hub, 'events.json', originalPolicy, 'Restore Hub event policy');
       console.log('Verified live policy changes, in-turn MR steering, and the deployment alert Issue.');
     }
+
+    await runMrScenarios({ gitlab, admin, db, until, rows, records, mrState, state, openIssue, pendingCard, trackMr,
+      anthropic, jev, bot, hub, api: api.id, missing, standalone, observeGet, checkSecrets, sandbox,
+      stopPod: () => stopPod(true), startPod: (id, overrides) => startPod(id, { ...noJms, ...overrides }) });
 
     const shaToPublish = await gitlab.headSha(web.id);
     for (const workflow of ['release', 'hotfix']) {

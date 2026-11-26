@@ -88,7 +88,7 @@ export function renderToolApprovalCard(
 export class NoteStreamer {
   private steps: string[] = [];
   private timer?: NodeJS.Timeout;
-  private pending: Promise<void> = Promise.resolve();
+  private pending = Promise.resolve('');
   private revision = 0;
   private written = -1;
   private heading = '## 🤖 Claude 执行进展';
@@ -116,9 +116,9 @@ export class NoteStreamer {
   }
   private write() {
     this.pending = this.pending
-      .catch(() => {})
-      .then(async () => {
-        if (this.written === this.revision) return;
+      .catch(() => '')
+      .then(async previous => {
+        if (this.written === this.revision) return previous;
         const revision = this.revision;
         const trace = this.steps.length && [
           '<details><summary>🛠️ 已执行 ' + this.steps.length + ' 个步骤（点击展开轨迹）</summary>',
@@ -127,10 +127,10 @@ export class NoteStreamer {
           '',
           '</details>',
         ].join('\n');
-        await this.update(
-          renderNote([this.heading, this.draft, trace, await this.summary()].filter(Boolean).join('\n\n')),
-        );
+        const body = renderNote([this.heading, this.draft, trace, await this.summary()].filter(Boolean).join('\n\n'));
+        await this.update(body);
         this.written = revision;
+        return body;
       });
     return this.pending;
   }
@@ -142,6 +142,6 @@ export class NoteStreamer {
       this.draft = '';
       this.revision++;
     }
-    await this.write();
+    return this.write();
   }
 }

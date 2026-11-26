@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 
-type Actor = 'dev' | 'sre';
+type Actor = 'dev' | 'sre' | 'reporter';
 type Issue = { iid: number; state: string; labels: string[] };
 type Note = { id: number; body: string };
 type DiffRefs = { base_sha: string; start_sha: string; head_sha: string };
 type InlinePosition = DiffRefs & { position_type: 'text'; old_path: string; new_path: string; new_line: number };
-type MR = { iid: number; sha: string; source_branch: string; assignees: { id: number; username: string }[];
+type MR = { iid: number; state: string; labels: string[]; source_project_id: number; target_project_id: number; sha: string; source_branch: string; assignees: { id: number; username: string }[];
   diff_refs: DiffRefs | null };
 type Discussion = { id: string; notes: (Note & { author: { username: string }; type?: string })[] };
 type Release = { tag_name: string; name: string; description: string; commit?: { id: string } };
@@ -42,10 +42,10 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
       const labels = await api.json<{ name: string }[]>(path + '?search=' + encodeURIComponent(name));
       if (!labels.some(label => label.name === name)) await api.request(path, 'POST', { name, color: '#356288' });
     },
-    async upsertFile(id: number, path: string, content: string, message: string) {
+    async upsertFile(id: number, path: string, content: string, message: string, branch = 'main', startBranch?: string) {
       const url = file(id, path);
-      const existing = await api.lookup(url + '?ref=main');
-      await api.request(url, existing ? 'PUT' : 'POST', { branch: 'main', content, commit_message: message });
+      const existing = await api.lookup(url + '?ref=' + encodeURIComponent(startBranch ?? branch));
+      await api.request(url, existing ? 'PUT' : 'POST', { branch, start_branch: startBranch, content, commit_message: message });
     },
     async getFile(id: number, path: string, ref = 'main') {
       const data = await api.json<{ content: string }>(file(id, path) + '?ref=' + encodeURIComponent(ref));
@@ -69,17 +69,34 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
       await api.request(issues(id, iid) + '/notes', 'POST', { body }, tokens[actor]);
     },
     getMr(id: number, iid: number) { return api.json<MR>(mr(id, iid)); },
-    async openExternalMr(id: number, branch: string) {
+    openMr(id: number, branch: string, title: string, botId?: number) {
+      return api.json<MR>(project(id) + '/merge_requests', 'POST', {
+        source_branch: branch, target_branch: 'main', title, assignee_ids: botId ? [botId] : [],
+      }, tokens.dev);
+    },
+    async openExternalMr(id: number, branch: string, title = 'External contribution') {
       await api.request(file(id, 'feature.txt'), 'POST', { branch, start_branch: 'main',
         content: 'External contribution\n', commit_message: 'Add external feature' }, tokens.dev);
       return api.json<MR>(project(id) + '/merge_requests', 'POST', {
-        source_branch: branch, target_branch: 'main', title: 'External contribution',
+        source_branch: branch, target_branch: 'main', title,
       }, tokens.dev);
     },
     async assignMr(id: number, iid: number, userId: number) {
       await api.request(mr(id, iid), 'PUT', { assignee_ids: [userId] }, tokens.dev);
     },
+    async unassignMr(id: number, iid: number) {
+      await api.request(mr(id, iid), 'PUT', { assignee_ids: [] }, tokens.dev);
+    },
+    async closeMr(id: number, iid: number) {
+      await api.request(mr(id, iid), 'PUT', { state_event: 'close' }, tokens.dev);
+    },
+    async awardMrThumbsUp(id: number, iid: number, noteId: number, actor: Actor) {
+      await api.request(mr(id, iid) + '/notes/' + noteId + '/award_emoji', 'POST', { name: 'thumbsup' }, tokens[actor]);
+    },
     listMrNotes(id: number, iid: number) { return api.json<Note[]>(mr(id, iid) + '/notes?per_page=100'); },
+    listMrDiscussions(id: number, iid: number) {
+      return api.json<Discussion[]>(mr(id, iid) + '/discussions?per_page=100');
+    },
     openDiscussion(id: number, iid: number, body: string, position?: InlinePosition) {
       return api.json<Discussion>(mr(id, iid) + '/discussions', 'POST', { body, position }, tokens.dev);
     },
@@ -120,12 +137,15 @@ export interface E2EGitLabDriver extends ReturnType<typeof projectActions> {
   readonly targetProjects: { web: string; api: string; ansible: string };
   readonly devUsername: string;
   readonly sreUsername: string;
+  readonly reporterUsername: string;
   readonly podHost: string;
   readonly synthetic?: {
-    failPipeline(project: number, iid: number, botId: number): Promise<number>;
+    failPipeline(project: number, iid: number, botId: number, sha?: string): Promise<number>;
+    succeedPipeline(project: number, iid: number, botId: number): Promise<number>;
+    openReadonlyForkMr(project: number, botId: number): Promise<MR>;
+    pushAttempts(project: number): number;
     failDeployment(project: number): Promise<void>;
   };
-  readonly membershipChecks?: string[];
   detentPublicUrl(port: number): string;
   ensureUsers(): Promise<void>;
   close(): Promise<void>;

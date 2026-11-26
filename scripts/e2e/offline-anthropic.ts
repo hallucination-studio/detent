@@ -61,19 +61,59 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
   const mr = /^GitLab MR (\d+)!(\d+) · (.+)$/m.exec(system);
   if (mr) {
     // A resumed session includes old tool calls. Select only the current webhook's prompt and results.
-    const trigger = /@[\w-]+: (?:Pipeline #\d+ failed|(?:hello\.txt:1 )?Add a regression test|Please inspect this contribution|请检查新分配的 MR)/;
+    const trigger = /@[\w-]+: (?:Pipeline #\d+ failed|(?:hello\.txt:1 )?Add a regression test|Please inspect this contribution|请检查新分配的 MR|Check the config defaults|Resume the interrupted review)|Refactor config loader|实施方案已获批准，请按方案开始实施/;
     const prompt = blocks.filter((b): b is Text => b.type === 'text' && trigger.test(b.text)).at(-1);
     assert.ok(prompt, 'Missing MR event in SDK prompt');
     const event = prompt.text;
     const history = blocks.slice(blocks.indexOf(prompt));
     const current = (name: string) => result(name, history);
     if (event.includes('Please inspect this contribution')) return text('Inspected the external contribution.');
-    if (event.includes('请检查新分配的 MR')) return text('Accepted the assigned MR.');
 
     const directory = /^Active worktree: projects\/(.+)$/m.exec(system)?.[1];
     assert.ok(directory);
     let file: string, content: string, report: string;
-    if (event.includes('Add a regression test')) {
+    if (system.includes('Read-only fork.')) {
+      assert.ok(!body.tools.some(t => t.name === 'Write' || t.name === 'Edit'));
+      const diff = current('detent_get_mr_diff');
+      if (!diff) return use('detent_get_mr_diff', {});
+      assert.match(success(diff), /timeout=0/);
+      return text('Suggested fix in config.ini: set timeout=30 to bound stalled requests.');
+    }
+    if (event.includes('Resume the interrupted review')) {
+      const diff = current('detent_get_mr_diff');
+      if (!diff) return use('detent_get_mr_diff', {});
+      success(diff);
+      return text('Recovered the interrupted review.');
+    }
+    if (event.includes('Check the config defaults')) {
+      const threads = current('detent_list_mr_discussions');
+      if (!threads) return use('detent_list_mr_discussions', {});
+      success(threads);
+      assert.match(JSON.stringify(history.slice(history.indexOf(threads))), /@[\w-]+: Also check the config override/);
+      return text('Reviewed both the config defaults and the override.');
+    }
+    if (event.includes('Refactor config loader')) {
+      assert.match(system, /当前为方案阶段/);
+      return text('Refactor the config loader and verify its defaults.');
+    }
+    if (event.includes('实施方案已获批准')) {
+      const shell = current('Bash');
+      if (!shell) return use('Bash', { command: 'printf config-loader-ok | cut -c 1-6', description: 'Check loader output formatting' });
+      assert.equal(success(shell).trim(), 'config');
+      return text('Approved config loader check returned config.');
+    }
+    if (mr[3] === 'Resolve conflict on config' && event.includes('请检查新分配的 MR')) {
+      const sync = current('detent_sync_target_branch');
+      if (!sync) return use('detent_sync_target_branch', {});
+      assert.deepEqual(JSON.parse(success(sync)), { merged: false, conflictedFiles: ['conflict.txt'] });
+      file = 'conflict.txt';
+      const read = current('Read');
+      if (!read) return use('Read', { file_path: join(workspaceRoot(), 'projects', directory, file) });
+      assert.match(success(read), /<<<<<<<[\s\S]*source setting[\s\S]*=======[\s\S]*target setting/);
+      content = 'resolved source and target settings\n';
+      report = 'Resolved the conflicting config settings.';
+    } else if (event.includes('请检查新分配的 MR')) return text('Accepted the assigned MR.');
+    else if (event.includes('Add a regression test')) {
       assert.match(event + '\n' + system, /hello\.txt:1 Add a regression test/);
       const diff = current('detent_get_mr_diff');
       if (!diff) return use('detent_get_mr_diff', {});
@@ -229,6 +269,11 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
   }
 
   if (sopPath === 'agents/code-delivery/AGENT.md') {
+    if (system.includes('Review CI readiness change')) {
+      if (approved < 0) return text('Propose the readiness probe for review.');
+      const step = deliverFile(apiRepo, 'ci/readiness-probe', 'probe.txt', 'check readiness\n', 'Add readiness probe', blocks.slice(approved));
+      return 'type' in step ? step : text('Readiness probe ready for review: ' + step.mrWebUrl);
+    }
     for (const project of [webRepo, apiRepo])
       assert.ok(blocks.some(b => b.type === 'text' && b.text.includes(project)), 'Missing repository in Issue prompt: ' + project);
     if (approved < 0) return text('Add hello.txt in ' + webRepo + ' and ' + apiRepo + ', then review both MRs.');
@@ -311,21 +356,27 @@ function respond(body: Messages, block: Text | Use) {
 
 export function createOfflineAnthropic(repos: Repos) {
   let requests = 0;
-  let beforeJobLog: (() => Promise<void>) | undefined;
+  let nextTool: { name: string; observe: () => Promise<void> } | undefined;
+  let checkPayload: (body: Messages) => void = () => {};
   return {
     async handle(req: Request) {
       requests++;
       if (req.method !== 'POST' || new URL(req.url).pathname !== '/v1/messages') return new Response(null, { status: 404 });
       const body: Messages = await req.json();
+      checkPayload(body);
       const block = next(body, repos);
-      if (beforeJobLog && block.type === 'tool_use' && block.name === 'mcp__detent__detent_get_pipeline_job_log') {
-        const postComment = beforeJobLog;
-        beforeJobLog = undefined;
-        await postComment();
+      if (nextTool && block.type === 'tool_use' && block.name === 'mcp__detent__' + nextTool.name) {
+        const { observe } = nextTool;
+        nextTool = undefined;
+        await observe();
       }
       return respond(body, block);
     },
-    beforeNextJobLog(postComment: () => Promise<void>) { beforeJobLog = postComment; },
+    beforeNextTool(name: string, observe: () => Promise<void>) {
+      assert.equal(nextTool, undefined);
+      nextTool = { name, observe };
+    },
+    checkRequests(check: (body: Messages) => void) { checkPayload = check; },
     getRequests: () => requests,
   };
 }

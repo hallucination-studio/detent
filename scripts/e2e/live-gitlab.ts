@@ -8,18 +8,18 @@ export function liveGitLab(url: string): E2EGitLabDriver {
   const baseUrl = url.replace(/\/$/, '');
   const api = gitlabApi(baseUrl, adminToken);
   const namespace = 'e2e-' + randomUUID().slice(0, 8);
-  const tokens = { dev: '', sre: '' };
+  const tokens = { dev: '', sre: '', reporter: '' };
   const patIds: number[] = [];
   let group: { id: number } | undefined;
   return {
     ...projectActions(api, tokens), baseUrl, adminToken,
     hubProjectPath: namespace + '/workspace-hub',
     targetProjects: { web: namespace + '/web', api: namespace + '/api', ansible: namespace + '/ansible-infra' },
-    devUsername: 'e2e-dev', sreUsername: 'e2e-sre', podHost: '0.0.0.0',
+    devUsername: 'e2e-dev', sreUsername: 'e2e-sre', reporterUsername: 'e2e-reporter', podHost: '0.0.0.0',
     detentPublicUrl: port => process.env.E2E_DETENT_PUBLIC_URL?.replace(/\/$/, '') ?? 'http://host.docker.internal:' + port,
     async ensureUsers() {
       group ??= await api.json<{ id: number }>('/groups', 'POST', { name: namespace, path: namespace });
-      for (const actor of ['dev', 'sre'] as const) {
+      for (const actor of ['dev', 'sre', 'reporter'] as const) {
         if (tokens[actor]) continue;
         const username = 'e2e-' + actor;
         const users = await api.json<{ id: number }[]>('/users?username=' + username);
@@ -27,7 +27,7 @@ export function liveGitLab(url: string): E2EGitLabDriver {
           username, name: username, email: username + '@detent.local', force_random_password: true, skip_confirmation: true,
         });
         // The maintainer merges to protected main in all three targets.
-        if (actor === 'sre') await api.request('/groups/' + group.id + '/members', 'POST', { user_id: user.id, access_level: 40 });
+        if (actor !== 'dev') await api.request('/groups/' + group.id + '/members', 'POST', { user_id: user.id, access_level: actor === 'sre' ? 40 : 20 });
         const pat = await api.json<{ id: number; token: string }>('/users/' + user.id + '/personal_access_tokens', 'POST', {
           name: namespace, scopes: ['api'], expires_at: new Date(Date.now() + 86400000).toISOString().slice(0, 10),
         });

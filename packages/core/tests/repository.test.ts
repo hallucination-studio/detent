@@ -1,7 +1,7 @@
 import { expect, it, vi } from 'vitest';
 import type { RowDataPacket } from 'mysql2/promise';
 import { loadConfig } from '../src/config.js';
-import { createMySqlPool } from '../src/db/mysql.js';
+import { createMySqlPool, initMySqlSchema } from '../src/db/mysql.js';
 import { MySqlDetentRepository } from '../src/db/repository.js';
 import { InMemoryDetentRepository } from './memory-repository.js';
 
@@ -95,6 +95,85 @@ it('looks up each issue tracking a project MR and records the first merge only',
   expect(merged).toMatchObject({ mrState: 'merged', mergeCommitSha: 'abc', mergedBy: 'dev', mergedAt: expect.any(Date) });
   expect(await repo.markMergeRequestMerged(first.id, null, 'other')).toBe(false);
   expect(await repo.findMergeRequest(2, 4)).toEqual([merged, second]);
+  expect(await repo.markMergeRequestClosed(first.id)).toBe(false);
+  expect(await repo.markMergeRequestClosed(second.id)).toBe(true);
+  expect(await repo.markMergeRequestClosed(second.id)).toBe(false);
   const updated = await repo.upsertMergeRequest({ ...row, mrState: 'merged', mrTitle: 'New title' });
   expect(updated).toMatchObject({ ...merged, mrTitle: 'New title', updatedAt: expect.any(Date) });
+});
+
+it('isolates Issue #1 and MR !1, including defaults and transcript resets', async () => {
+  const repo = new InMemoryDetentRepository();
+  const [issue, mr] = await Promise.all([repo.getOrCreateSession(7, 1, 'Issue'), repo.getOrCreateMrSession(7, 1, 'MR')]);
+  expect(issue.id).not.toBe(mr.id);
+  expect(await repo.getSessionByIssue(7, 1)).toEqual(issue);
+  expect(await repo.getSessionByMr(7, 1)).toEqual(mr);
+  expect(await repo.getOrCreateMrSession(7, 1, 'retry')).toEqual(mr);
+  for (const s of [issue, mr]) {
+    expect(s).toMatchObject({ autoFixAttempts: 0, lastFailedPipelineId: null, recoveryAttempts: 0 });
+    await repo.updateSessionState(s.id, { status: 'FAILED', permissionMode: 'acceptEdits' });
+    await repo.resetTranscript(s.id);
+    expect(await repo.getSession(s.id)).toMatchObject(s.id === mr.id
+      ? { sessionKind: 'mr', status: 'CODING', permissionMode: 'default' }
+      : { sessionKind: 'issue', status: 'PLANNING', permissionMode: 'plan' });
+  }
+});
+
+it('deduplicates deliveries per session and consumes an ordered batch only once', async () => {
+  const { repo, id } = await setup();
+  const other = await repo.getOrCreateMrSession(1, 42, 'MR');
+  const input = { sessionId: id, eventId: 'one', sourceKind: 'note', content: 'hello' };
+  expect(await Promise.all([repo.enqueueSessionInbox(input), repo.enqueueSessionInbox(input)])).toEqual([true, false]);
+  await repo.enqueueSessionInbox({ ...input, sessionId: other.id });
+  await repo.enqueueSessionInbox({ ...input, eventId: 'two' });
+  const batches = await Promise.all([repo.drainSessionInbox(id), repo.drainSessionInbox(id)]);
+  expect(batches.map(batch => batch.map(row => row.eventId))).toEqual([['one', 'two'], []]);
+  expect(await repo.enqueueSessionInbox(input)).toBe(false);
+  expect(await repo.drainSessionInbox(other.id)).toHaveLength(1);
+});
+
+it('consumes only the locked IDs on one connection and rolls back a failed write', async () => {
+  const pool = createMySqlPool(loadConfig({}));
+  const cx = { beginTransaction: vi.fn(), commit: vi.fn(), rollback: vi.fn(), release: vi.fn(), query: vi.fn() };
+  vi.spyOn(pool, 'getConnection').mockImplementation(async () => cx as unknown as Awaited<ReturnType<typeof pool.getConnection>>);
+  const repo = new MySqlDetentRepository(pool);
+  try {
+    const pending = [[{ id: 3, session_id: 's' }, { id: 8, session_id: 's' }], []];
+    cx.query.mockResolvedValueOnce(pending).mockResolvedValueOnce([{}, []]);
+    expect(await repo.drainSessionInbox('s')).toEqual([{ id: 3, sessionId: 's' }, { id: 8, sessionId: 's' }]);
+    expect(cx.query.mock.calls[0]).toEqual([expect.stringContaining("status='PENDING' ORDER BY id ASC FOR UPDATE"), ['s']]);
+    expect(cx.query.mock.calls[1]).toEqual([expect.stringContaining("consumed_at=NOW(3) WHERE id IN (?)"), [[3, 8]]]);
+    cx.query.mockResolvedValueOnce(pending).mockRejectedValueOnce(Error('write failed'));
+    await expect(repo.drainSessionInbox('s')).rejects.toThrow('write failed');
+    expect(cx.commit).toHaveBeenCalledOnce();
+    expect(cx.rollback).toHaveBeenCalledOnce();
+    expect(cx.release).toHaveBeenCalledTimes(2);
+  } finally {
+    await pool.end();
+  }
+});
+
+it('upgrades the legacy resource key in one ALTER and skips it on subsequent starts', async () => {
+  const pool = createMySqlPool(loadConfig({}));
+  const query = vi.spyOn(pool, 'query').mockResolvedValue([[], []]);
+  try {
+    for (let i = 0; i < 6; i++) query.mockResolvedValueOnce([[], []]);
+    query.mockResolvedValueOnce([[{ Key_name: 'hub_project_id' } as RowDataPacket], []]);
+    await initMySqlSchema(pool);
+    await initMySqlSchema(pool);
+    const ddl = query.mock.calls.map(([sql]) => String(sql));
+    expect(ddl.filter(sql => sql.startsWith('ALTER'))).toEqual([expect.stringMatching(
+      /DROP INDEX hub_project_id, ADD session_kind.*ADD recovery_attempts.*UNIQUE KEY session_resource\(session_kind, hub_project_id, hub_issue_iid\)/,
+    )]);
+    expect(ddl.find(sql => sql.startsWith('CREATE TABLE IF NOT EXISTS session_inbox')))
+      .toContain('UNIQUE(session_id, event_id), INDEX(session_id, status, id)');
+    const repo = new MySqlDetentRepository(pool);
+    query.mockClear();
+    await repo.listExpiredActiveSessions(4);
+    await repo.listSessionsWithPendingInbox(3);
+    for (const [sql] of query.mock.calls) expect(sql).not.toContain('FOR UPDATE');
+    expect(query.mock.calls.map(([, params]) => params)).toEqual([[4], [3]]);
+  } finally {
+    await pool.end();
+  }
 });

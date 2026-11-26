@@ -45,11 +45,23 @@ It is built as a **two-package layered monorepo**:
 - **Append-Only MySQL Persistence (Zero Write Amplification)**
   `issue_sessions` stores lightweight metadata and a distributed lease lock (`locked_by_pod`). Conversation history is persisted incrementally in `session_messages` via batched `INSERT IGNORE` — never rewriting full `.jsonl` blobs.
 - **Single-Comment Throttled Streaming**
-  Each turn edits a single GitLab Issue note via the Edit Note API (throttled to avoid notification spam), wrapping tool traces in collapsible `<details>` blocks while displaying active worktrees, MRs, and pipeline statuses at the bottom.
+  Issue and MR turns stream progress into one note with a collapsible tool trace. Issue notes also summarize active worktrees, MRs, and pipeline status.
 - **Bot Loop Prevention & Redaction**
   Resolves its own Bot `user.id` at startup (`GET /api/v4/user`) to filter self-triggered webhook events, verifies `X-Gitlab-Token`, and redacts credentials in comments and logs.
 
 ---
+
+## V6 merge request workers
+
+Assign the bot to an open MR for ongoing review and CI fixes, or mention `@bot` (its GitLab username) in a comment for a single turn. Issue-created MRs are assigned automatically. Each MR has its own Claude session, pushes to its source branch, and replies to inline reviews in their original discussion. Merging the MR finishes its worker and wakes any linked Hub Issue.
+
+The first matching rule in the Hub default branch’s `events.json` chooses `ignore`, `notify`, `run`, or `semantic`. Edits apply to subsequent events without a pod restart. A failed pipeline can trigger an MR fix, while a failed deployment can open a Hub alert Issue. During a turn, `session_inbox` stores new instructions and the Claude Code `PostToolUse` hook passes them to the model after a tool call. Late arrivals can start a follow-up turn. [Example policy](./examples/hub-workspace/events.json)
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `MR_MAX_AUTO_FIX_ATTEMPTS` | 3 | Failed pipelines the worker may attempt per MR before escalating (0–10). A matching rule can override the limit. |
+| `WATCHDOG_INTERVAL_MS` | 30000 | Base interval for scanning expired leases and pending inboxes, with jitter. Use 0 to disable, or at least 15000 ms. |
+| `WATCHDOG_MAX_RECOVERIES` | 1 | Recovery attempts for interrupted turns (0–5). A successful turn resets the count. |
 
 ## Architecture
 
@@ -96,7 +108,7 @@ DETENT_TARGET_PROJECTS=apps/web,ops/ansible-infra DETENT_HUB_MEMBERS=dev:30,sre:
 npm run bootstrap -- --env-out .env
 ```
 
-The default Hub is `ai/workspace-hub`. Set `DETENT_HUB_PROJECT` to another path or `GITLAB_HUB_PROJECT_ID` to an existing project ID. Bootstrap seeds `CLAUDE.md`, four SOPs under `workflows/`, four Issue templates, and ten labels. Rerunning with the same output file reuses the bot PAT and webhook secret and preserves existing Hub files. Supply MySQL, Anthropic, and JumpServer settings through the environment or edit the resulting mode-0600 file.
+The default Hub is `ai/workspace-hub`. Set `DETENT_HUB_PROJECT` to another path or `GITLAB_HUB_PROJECT_ID` to an existing project ID. Bootstrap seeds the Hub agents, skills, `CLAUDE.md`, `events.json`, Issue templates, and eleven labels. Rerunning with the same output file reuses the bot PAT and webhook secret and preserves existing Hub files. Supply MySQL, Anthropic, and JumpServer settings through the environment or edit the resulting mode-0600 file.
 
 For manual GitLab setup, copy [`.env.example`](./.env.example) and fill in your credentials:
 
@@ -144,8 +156,7 @@ node --env-file=.env packages/delivery/dist/server.js
      - ✅ **Issues events** (new Issue starts a session; closing archives the workspace)
      - ✅ **Comments (Note events)** (drives multi-turn `--resume` conversations & slash commands)
      - ✅ **Emoji events** (one-click 👍 `thumbsup` / 👎 `thumbsdown` approvals on cards)
-   - **Target Ansible repositories (`@detent/delivery`)**: enable **Merge request events** pointing to the same URL and secret token so merged MRs record the merge SHA and automatically resume the Hub Issue session.
-   - *(Optional)* Enable **Pipeline events** on target repositories to sync CI pipeline status back to the Hub Issue.
+   - On target repositories use the same URL and secret for **Merge request**, **Comments**, **Emoji**, **Pipeline**, and **Deployment** events.
 
 > **Webhook Queue Note**: Webhook endpoints return `202` once an event is enqueued in the process's in-memory queue. Graceful shutdown drains in-flight events; abrupt process termination may drop unprocessed events.
 
@@ -165,16 +176,16 @@ E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab
 
 Set the live URL to the origin GitLab advertises for HTTP clones. Allow the GitLab container to send project webhooks to `host.docker.internal`. For another route, set `E2E_DETENT_PUBLIC_URL` to the address GitLab can reach and `E2E_POD_PORT` to the corresponding host listener port. Each live run leaves its own `e2e-*/workspace-hub` and three target projects for inspection and revokes its temporary tokens.
 
-Bootstrap runs twice and checks nine Hub files, ten labels, hooks, and preservation of credentials and a customized SOP. Both targets exercise the same six scenarios.
+Both targets run bootstrap twice to verify Hub files, labels, hooks, and preservation of credentials and a customized SOP. They exercise the six SOP scenarios and the V6 MR interactions.
 
-1. Unlabeled and missing-capability Issues receive guidance and stay open and idle with zero model requests.
+1. A missing capability produces guidance with zero model calls. An unlabeled image request is clarified, routed to its Agent, approved, and completed.
 2. Code delivery writes to two repositories. Closure is denied with two open MRs and again with one. The second merge triggers closure and archives both worktrees.
 3. A live edit to the release SOP publishes a pinned tag and Release after maintainer approval.
 4. A new hotfix SOP publishes only a tag and requires separate production-tier closure approval.
 5. Readonly audit verifies nginx on `web01` and closes with zero approval rows.
 6. Environment change resumes its plan after a pod restart. A human merges the Ansible MR and approves execution. The suite checks the pinned ZIP, successful execution audit, post-change inspection and empty sandbox.
 
-The two blocked Issues remain open. Each completed workflow verifies GitLab `closed` and `claude::done` alongside MySQL `DONE`.
+Both targets check inline review, MR progress traces, independent MR completion, and a standalone MR triggered by mention and assignment. Completed Issue workflows verify GitLab `closed` and `claude::done` alongside MySQL `DONE`. The offline driver also emits bot-triggered CI failures and a failed deployment to verify real branch pushes, live policy changes, mid-turn steering, and a Hub alert Issue.
 
 By default the suite starts a container from a locally cached `mysql:8.0` image. To use an existing local MySQL 8.0 instance, set `E2E_MYSQL_HOST=127.0.0.1`. The optional `E2E_MYSQL_PORT`, `E2E_MYSQL_USER`, `E2E_MYSQL_PASSWORD`, and `E2E_MYSQL_DATABASE` default to `3306`, `root`, an empty password, and `detent`. Use a dedicated test database. The harness creates the Detent tables and removes its session rows during teardown.
 
@@ -259,7 +270,7 @@ detent/
 ├── .opencodereview/rule.json       # Automated architecture & code quality review rules
 ├── docs/
 │   ├── DESIGN.md                   # Architecture, sequence diagrams & MySQL data model
-│   └── IMPLEMENTATION_PLAN.md      # V2 and V3 roadmap & acceptance criteria
+│   └── IMPLEMENTATION_PLAN.md      # V2–V6 roadmap & acceptance criteria
 ├── examples/
 │   └── hub-workspace/CLAUDE.md     # Sample Workspace Hub repository CLAUDE.md
 ├── packages/

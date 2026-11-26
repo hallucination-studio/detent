@@ -23,6 +23,16 @@ export interface IssueNote {
   system?: boolean;
   author?: { id: number; username: string };
 }
+export interface MergeRequestNote extends IssueNote {
+  type?: string | null;
+  resolvable?: boolean;
+  resolved?: boolean;
+  position?: { old_path?: string; new_path?: string; old_line?: number | null; new_line?: number | null };
+}
+export interface MergeRequestDiscussion {
+  id: string;
+  notes: MergeRequestNote[];
+}
 interface MergeRequest {
   iid: number;
   title: string;
@@ -31,7 +41,9 @@ interface MergeRequest {
   target_branch: string;
   state: 'opened' | 'closed' | 'merged';
 }
+export type LiveMr = Awaited<ReturnType<GitLabClient['getMergeRequest']>>;
 interface Pipeline {
+  project_id?: number;
   id: number;
   ref: string;
   status: string;
@@ -103,6 +115,9 @@ export class GitLabClient {
   async initBotIdentity() {
     this.identity = await this.json<GitLabUser>('/user');
   }
+  getBotIdentity() {
+    return this.identity;
+  }
   isBotUser(id?: number, name?: string) {
     return Boolean(this.identity && (id === this.identity.id || name === this.identity.username));
   }
@@ -133,10 +148,10 @@ export class GitLabClient {
     return notes.slice(0, perPage).reverse();
   }
   createIssueNote(p: number, i: number, body: string) {
-    return this.json<{ id: number }>(this.notes(p, i), 'POST', { body: renderNote(body, this.config.jevApiKey) });
+    return this.createNote(this.notes(p, i), body);
   }
   async updateIssueNote(p: number, i: number, n: number, body: string) {
-    await this.request(this.notes(p, i) + '/' + n, 'PUT', { body: renderNote(body, this.config.jevApiKey) });
+    await this.updateNote(this.notes(p, i), n, body);
   }
   async updateIssueLabels(project: number, iid: number, changes: { add?: readonly string[]; remove?: readonly string[] }): Promise<void> {
     const clean = (values: readonly string[] = []) => [...new Set(values.map(label => label.trim()).filter(Boolean))];
@@ -199,14 +214,71 @@ export class GitLabClient {
     return this.json<Pipeline[]>(this.project(project) + '/pipelines?sha=' + encodeURIComponent(sha));
   }
   createTag(project: number, input: { tag_name: string; ref: string; message?: string }) {
-    return this.json<Tag>(this.project(project) + '/repository/tags', 'POST', input);
+    return this.json<Tag>(this.project(project) + '/repository/tags', 'POST', {
+      ...input, message: input.message && renderNote(input.message, this.config.jevApiKey),
+    });
   }
   createRelease(project: number, input: { tag_name: string; ref: string; name?: string; description?: string }) {
-    return this.json<Release>(this.project(project) + '/releases', 'POST', input);
+    return this.json<Release>(this.project(project) + '/releases', 'POST', {
+      ...input, name: input.name && renderNote(input.name, this.config.jevApiKey),
+      description: input.description && renderNote(input.description, this.config.jevApiKey),
+    });
+  }
+  private mrPath(project: number, iid: number) {
+    return this.project(project) + '/merge_requests/' + iid;
+  }
+  getMergeRequest(project: number, mrIid: number) {
+    return this.json<MergeRequest & {
+      description: string | null; draft?: boolean; source_project_id: number; target_project_id: number;
+      sha?: string; author?: GitLabUser; assignees?: GitLabUser[]; has_conflicts?: boolean;
+      detailed_merge_status?: string; head_pipeline?: Pipeline | null;
+    }>(this.mrPath(project, mrIid));
+  }
+  listOpenMergeRequestsByBranch(project: number, sourceBranch: string) {
+    return this.pages<MergeRequest>(this.project(project) + '/merge_requests', {
+      scope: 'all', state: 'opened', source_branch: sourceBranch,
+    });
+  }
+  listMergeRequestDiffs(project: number, mrIid: number) {
+    return this.pages<{ old_path: string; new_path: string; diff: string }>(this.mrPath(project, mrIid) + '/diffs');
+  }
+  listMergeRequestDiscussions(project: number, mrIid: number) {
+    return this.pages<MergeRequestDiscussion>(this.mrPath(project, mrIid) + '/discussions');
+  }
+  private discussionNotes(project: number, mrIid: number, discussionId: string) {
+    return this.mrPath(project, mrIid) + '/discussions/' + encodeURIComponent(discussionId) + '/notes';
+  }
+  private createNote(path: string, body: string) {
+    return this.json<{ id: number }>(path, 'POST', { body: renderNote(body, this.config.jevApiKey) });
+  }
+  private async updateNote(path: string, noteId: number, body: string) {
+    await this.request(path + '/' + noteId, 'PUT', { body: renderNote(body, this.config.jevApiKey) });
+  }
+  createMergeRequestNote(project: number, mrIid: number, body: string) {
+    return this.createNote(this.mrPath(project, mrIid) + '/notes', body);
+  }
+  updateMergeRequestNote(project: number, mrIid: number, noteId: number, body: string) {
+    return this.updateNote(this.mrPath(project, mrIid) + '/notes', noteId, body);
+  }
+  createMergeRequestDiscussionNote(project: number, mrIid: number, discussionId: string, body: string) {
+    return this.createNote(this.discussionNotes(project, mrIid, discussionId), body);
+  }
+  updateMergeRequestDiscussionNote(project: number, mrIid: number, discussionId: string, noteId: number, body: string) {
+    return this.updateNote(this.discussionNotes(project, mrIid, discussionId), noteId, body);
+  }
+  async createCommitComment(project: number, sha: string, note: string) {
+    await this.request(this.project(project) + '/repository/commits/' + encodeURIComponent(sha) + '/comments',
+      'POST', { note: renderNote(note, this.config.jevApiKey) });
+  }
+  createIssue(project: number, input: { title: string; description: string; labels?: readonly string[] }) {
+    return this.json<Issue>(this.project(project) + '/issues', 'POST', {
+      title: renderNote(input.title, this.config.jevApiKey), description: renderNote(input.description, this.config.jevApiKey),
+      labels: input.labels?.join(','),
+    });
   }
   async createMergeRequest(
     p: number,
-    input: { source_branch: string; target_branch: string; title: string; description: string },
+    input: { source_branch: string; target_branch: string; title: string; description: string; assignee_ids?: number[] },
   ) {
     const { source_branch, target_branch, title, description } = input;
     const resource = this.project(p) + '/merge_requests';
@@ -214,8 +286,9 @@ export class GitLabClient {
       return await this.json<MergeRequest>(resource, 'POST', {
         source_branch,
         target_branch,
-        title,
-        description,
+        title: renderNote(title, this.config.jevApiKey),
+        description: renderNote(description, this.config.jevApiKey),
+        assignee_ids: input.assignee_ids,
       });
     } catch (error) {
       // GitLab may already have created the MR before the previous turn lost its response.
@@ -246,9 +319,18 @@ export class GitLabClient {
       this.project(p) + '/pipelines/' + id + '/jobs',
     );
   }
-  async getJobTrace(p: number, id: number) {
+  async getJobTrace(p: number, id: number, mr?: LiveMr) {
+    if (mr) {
+      if (![mr.target_project_id, mr.source_project_id].includes(p)) throw Error('Project is outside this MR');
+      const job = await this.json<{ pipeline: Pipeline }>(this.project(p) + '/jobs/' + id);
+      if (p !== mr.source_project_id || job.pipeline.ref !== mr.source_branch) {
+        const pipelines = await this.listPipelines(mr.target_project_id, mr.iid);
+        if (!pipelines.some(pipe => pipe.id === job.pipeline.id && (pipe.project_id ?? p) === p))
+          throw Error('Job is outside this MR');
+      }
+    }
     return redactGitUrl(
-      (await (await this.request(this.project(p) + '/jobs/' + id + '/trace')).text()).slice(-16000),
+      (await (await this.request(this.project(p) + '/jobs/' + id + '/trace')).text()).slice(-16000), this.config.jevApiKey,
     );
   }
   buildAuthenticatedCloneUrl(httpUrl: string) {

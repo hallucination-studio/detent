@@ -169,8 +169,8 @@ async function main() {
     const hook = (await all<{ id: number; url: string }>(path)).find(h => h.url === hookUrl);
     await json(hook ? path + '/' + hook.id : path, hook ? 'PUT' : 'POST', {
       url: hookUrl, token: secret, enable_ssl_verification: ssl === 'true', push_events: false,
-      issues_events: p.id === hub.id, note_events: p.id === hub.id, emoji_events: p.id === hub.id,
-      merge_requests_events: targets.has(p.id), pipeline_events: targets.has(p.id),
+      issues_events: p.id === hub.id, note_events: true, emoji_events: true,
+      merge_requests_events: targets.has(p.id), pipeline_events: targets.has(p.id), deployment_events: targets.has(p.id),
     });
   }
 

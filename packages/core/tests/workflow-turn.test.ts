@@ -88,12 +88,14 @@ it('mounts Hub workflow files without symlinks and protects only root governance
       expect(await readdir(path.join(workspace, 'workflows'))).toEqual(['release.md']);
       expect(await readFile(path.join(workspace, 'workflows/release.md'), 'utf8')).toBe('# Procedure');
       await symlink('.', path.join(workspace, 'alias'));
-      for (const file_path of ['CLAUDE.md', 'workflows/release.md', 'WorkFlows/new.md', 'claude.MD', 'alias/WorkFlows/new.md']) {
+      for (const file_path of ['CLAUDE.md', 'events.json', 'workflows/release.md', 'WorkFlows/new.md', 'claude.MD', 'alias/WorkFlows/new.md']) {
         for (const action of ['Edit', 'Write'])
           expect(await gate.preflight(action, { file_path }), file_path).toMatchObject({ behavior: 'deny' });
         expect(await gate.preflight('Read', { file_path }), file_path).toMatchObject({ behavior: 'allow' });
       }
-      for (const file_path of ['projects/app/CLAUDE.md', 'projects/app/workflows/ci.yml'])
+      for (const command of ['echo data > events.json', 'rm alias/events.json'])
+        expect(await gate.preflight('Bash', { command })).toMatchObject({ behavior: 'deny' });
+      for (const file_path of ['projects/app/CLAUDE.md', 'projects/app/workflows/ci.yml', 'projects/app/events.json'])
         expect(await gate.preflight('Write', { file_path }), file_path).toMatchObject({ behavior: 'allow' });
       return 'verified';
     } };

@@ -10,6 +10,9 @@ const ConfigSchema = z.object({
     .default(process.env.HOSTNAME || `detent-pod-${os.hostname()}-${crypto.randomUUID().slice(0, 8)}`),
   ephemeralRoot: z.string().default('/tmp/detent-sandboxes'),
   leaseTtlSeconds: z.coerce.number().default(300),
+  mrMaxAutoFixAttempts: z.coerce.number().int().min(0).max(10).default(3),
+  watchdogIntervalMs: z.coerce.number().int().refine(ms => ms === 0 || ms >= 15000).default(30000),
+  watchdogMaxRecoveries: z.coerce.number().int().min(0).max(5).default(1),
   hotHoldTimeoutMs: z.coerce.number().default(180_000),
 
   gitlabBaseUrl: z.string().url().default('http://localhost:8080'),
@@ -63,6 +66,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     podId: env.POD_ID,
     ephemeralRoot: env.EPHEMERAL_ROOT,
     leaseTtlSeconds: env.LEASE_TTL_SECONDS,
+    mrMaxAutoFixAttempts: env.MR_MAX_AUTO_FIX_ATTEMPTS?.trim() || undefined,
+    watchdogIntervalMs: env.WATCHDOG_INTERVAL_MS?.trim() || undefined,
+    watchdogMaxRecoveries: env.WATCHDOG_MAX_RECOVERIES?.trim() || undefined,
     hotHoldTimeoutMs: env.HOT_HOLD_TIMEOUT_MS,
 
     gitlabBaseUrl: env.GITLAB_BASE_URL,

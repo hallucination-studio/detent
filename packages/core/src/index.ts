@@ -5,7 +5,7 @@ export {
   parseMcpCapabilitiesConfig, type McpCapabilityConfig,
 } from './extensions/mcp-bridge.js';
 export { loadConfig, type AppConfig } from './config.js';
-export { GitLabClient, redactGitUrl, type IssueNote } from './gitlab/client.js';
+export { GitLabClient, redactGitUrl, type IssueNote, type MergeRequestDiscussion, type MergeRequestNote } from './gitlab/client.js';
 export { createGitLabReleaseTools, createGitLabReleaseCapability, type ReleaseGitLab } from './workspace/release-tools.js';
 export {
   parseHubWorkflowMarkdown, loadHubWorkflows, matchHubWorkflow, findMatchingHubDefinitions as findMatchingHubAgents,
@@ -16,13 +16,13 @@ export {
   type HubAgent, type HubSkill,
 } from './workflows/hub-agents.js';
 export { escapeTableCell as escapeMarkdownCell, neutralizeQuickActions } from './gitlab/note-streamer.js';
-export { createWebhookApp } from './gitlab/webhook.js';
+export { createWebhookApp, normalizeGitLabEvent } from './gitlab/webhook.js';
 export { SessionOrchestrator, SessionBusy } from './orchestrator/session-orchestrator.js';
 export type { DetentRepository } from './db/repository.js';
-export type { ApprovalRequestRow, ApprovalType, IssueSessionRow, PermissionMode, SessionMergeRequestRow } from './types.js';
+export type { ApprovalRequestRow, ApprovalType, IssueSessionRow, SessionKind, SessionInboxRow, InboxStatus, NormalizedGitLabEvent, PermissionMode, SessionMergeRequestRow } from './types.js';
 export type {
   AnyDetentExtensionTool, ExtensionToolContext, ExtensionWebhookEvent, DetentCapabilityPack, DetentExtensions, DetentExtensionTool, SessionLifecycleHooks,
-  IssueClosePolicy, SandboxScope, ToolGovernancePolicy, TurnProfile, TurnProfileResolver, WebhookExtension,
+  EventNotification, IssueClosePolicy, SandboxScope, ToolGovernancePolicy, TurnProfile, TurnProfileResolver, WebhookExtension,
 } from './extensions.js';
 export { createDecisionClient, resolveJevEndpoint, type DecisionClient, type DecisionQuestion, type DecisionAnswer, type JevProvider } from './decision/jev-client.js';
 export { routeHubAgent, buildTriageSystemPrompt, type AgentRouteResult, type AgentRoutingCandidate } from './decision/agent-router.js';

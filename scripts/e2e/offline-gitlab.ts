@@ -7,9 +7,13 @@ import { gitlabApi, projectActions, type E2EGitLabDriver } from './gitlab-driver
 
 interface User { id: number; username: string }
 interface Hook { id: number; url: string; token: string; issues_events: boolean; emoji_events: boolean;
-  note_events: boolean; merge_requests_events: boolean; pipeline_events: boolean; push_events: boolean }
-interface MR { iid: number; source_project_id: number; title: string; web_url: string; source_branch: string;
-  target_branch: string; state: string }
+  note_events: boolean; merge_requests_events: boolean; pipeline_events: boolean; deployment_events: boolean; push_events: boolean }
+interface MR { iid: number; source_project_id: number; title: string; description: string; web_url: string; source_branch: string;
+  target_project_id: number; target_branch: string; state: string; assignees: User[]; threads: Thread[] }
+interface Thread { id: string; notes: MrNote[] }
+interface MrNote { id: number; body: string; author: User; discussion_id: string; type: string | null;
+  position?: { old_path: string; new_path: string; new_line: number }; resolvable: boolean; resolved: boolean }
+interface Pipeline { id: number; project_id: number; ref: string; sha: string; status: string }
 interface Project {
   id: number; path_with_namespace: string; http_url_to_repo: string; default_branch: string;
 }
@@ -47,6 +51,8 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
   const labels = new Map<number, { name: string; color: string }[]>();
   const hooks = new Map<number, Hook[]>();
   const mrs = new Map<number, MR[]>();
+  const pipelines: Pipeline[] = [];
+  let nextNoteId = 1;
   const issues = new Map<number, Issue>();
   const notes = new Map<number, { issueIid: number; body: string; author: User }>();
   const releases = new Map<number, Release[]>();
@@ -69,35 +75,45 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
     const message = annotated ? git(repo(p), 'tag', '--list', '--format=%(contents)', '--', name).toString().trimEnd() : null;
     return { name, message, commit: { id } };
   }
-  async function commitFile(p: Project, file: string, content: string | Buffer, message: string) {
+  async function commitFile(p: Project, file: string, content: string | Buffer, message: string, branch = p.default_branch, start = branch) {
     assert.ok(safePath(file), 'Expected a relative repository file path');
     const work = await mkdtemp(join(root, 'seed-'));
     try {
       git(root, 'clone', '-c', 'core.symlinks=false', '--', repo(p), work);
+      if (start !== p.default_branch) git(work, 'checkout', '--detach', 'refs/remotes/origin/' + start);
+      git(work, 'check-ref-format', 'refs/heads/' + branch);
       await mkdir(dirname(join(work, file)), { recursive: true });
       await writeFile(join(work, file), content);
       git(work, '--literal-pathspecs', 'add', '--', file);
       git(work, 'commit', '-m', message);
-      git(work, 'push', 'origin', 'HEAD:refs/heads/' + p.default_branch);
+      git(work, 'push', 'origin', 'HEAD:refs/heads/' + branch);
     } finally { await rm(work, { recursive: true, force: true }); }
   }
 
-  async function dispatch(project: Project, kind: string, enabled: keyof Hook, user: User, attrs: object, issue?: Issue) {
+  async function dispatch(project: Project, kind: string, enabled: keyof Hook, user: User, attrs: object, extra: object = {}) {
     for (const hook of hooks.get(project.id)!.filter(h => h[enabled])) {
       const response = await fetch(hook.url, { method: 'POST', signal: AbortSignal.timeout(10000),
         headers: { 'Content-Type': 'application/json', 'X-Gitlab-Token': hook.token,
           'X-Gitlab-Event-UUID': randomUUID() },
-        body: JSON.stringify({ object_kind: kind, project, project_id: project.id, user, issue, object_attributes: attrs }),
+        body: JSON.stringify({ object_kind: kind, project, project_id: project.id, user, object_attributes: attrs, ...extra }),
       });
       assert.ok(response.ok, kind + ' webhook HTTP ' + response.status);
     }
   }
   async function note(issue: Issue, actor: User, body: string) {
-    const id = notes.size + 1;
+    const id = nextNoteId++;
     const author = { id: actor.id, username: actor.username };
     notes.set(id, { issueIid: issue.iid, body, author });
-    await dispatch(find(issue.project_id)!, 'note', 'note_events', actor, { id, noteable_type: 'Issue', action: 'create', note: body }, issue);
+    await dispatch(find(issue.project_id)!, 'note', 'note_events', actor, { id, noteable_type: 'Issue', action: 'create', note: body }, { issue });
     return { id, body, author };
+  }
+
+  function mrResource(p: Project, { threads, ...mr }: MR) {
+    const sha = commitSha(p, 'refs/heads/' + mr.source_branch)!;
+    const target = commitSha(p, 'refs/heads/' + mr.target_branch)!;
+    const base = git(repo(p), 'merge-base', target, sha).toString().trim();
+    return { ...mr, sha, diff_refs: { base_sha: base, start_sha: target, head_sha: sha }, draft: false, has_conflicts: false,
+      head_pipeline: pipelines.find(pipe => pipe.project_id === p.id && pipe.ref === mr.source_branch && pipe.sha === sha) ?? null };
   }
 
   async function smartHttp(req: Request, url: URL) {
@@ -137,7 +153,7 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
     const credential = req.headers.get('private-token') ?? '';
     const actor = tokens.get(credential);
     if (!actor) return new Response(null, { status: 401 });
-    const [resource, ref, section, item, sub, child, operation] = url.pathname.slice(8).split('/').map(decodeURIComponent);
+    const [resource, ref, section, item, sub, child, operation, noteId] = url.pathname.slice(8).split('/').map(decodeURIComponent);
     const get = req.method === 'GET', post = req.method === 'POST', put = req.method === 'PUT';
     const body = get ? {} : await req.json();
     if (get && resource === 'user') return reply(actor);
@@ -242,11 +258,11 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
         }));
       }
       if ((post || put) && item === 'files') {
-        const exists = git(repo(p), 'ls-tree', '--name-only', p.default_branch, '--', sub).length > 0;
+        const start = body.start_branch ?? body.branch;
+        const exists = git(repo(p), 'ls-tree', '--name-only', 'refs/heads/' + start, '--', sub).length > 0;
         if (exists !== put) return new Response(null, { status: exists ? 400 : 404 });
-        assert.equal(body.branch, p.default_branch);
         const content = body.encoding === 'base64' ? Buffer.from(body.content, 'base64') : body.content;
-        await commitFile(p, sub, content, body.commit_message);
+        await commitFile(p, sub, content, body.commit_message, body.branch, start);
         return reply({ file_path: sub, branch: body.branch });
       }
     }
@@ -254,8 +270,24 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
       const id = commitSha(p, sub);
       return id ? reply({ id, title: git(repo(p), 'show', '-s', '--format=%s', id).toString().trimEnd() }) : absent();
     }
+    const projectPipelines = pipelines.filter(pipe => pipe.project_id === p.id);
+    const job = (pipeline: Pipeline) => ({ id: pipeline.id + 1000, name: 'verify-ready', status: pipeline.status, pipeline });
+    if (section === 'jobs' && get) {
+      const pipeline = projectPipelines.find(pipe => job(pipe).id === Number(item));
+      if (!pipeline) return absent();
+      if (sub === 'trace') return new Response('Missing ci/ready.txt: expected ready');
+      return sub ? absent() : reply(job(pipeline));
+    }
     if (section === 'pipelines' && get) {
+      if (sub === 'jobs') {
+        const pipeline = projectPipelines.find(pipe => pipe.id === Number(item));
+        return pipeline ? reply([job(pipeline)]) : absent();
+      }
+      const ref = url.searchParams.get('ref');
+      if (ref) return reply(projectPipelines.filter(pipe => pipe.ref === ref));
       const sha = url.searchParams.get('sha');
+      const matches = projectPipelines.filter(pipe => pipe.sha === sha);
+      if (matches.length) return reply(matches);
       return reply(sha && commitSha(p, sha) ? [{ id: 1, ref: p.default_branch, status: 'success' }] : []);
     }
     if (section === 'repository' && item === 'tags' && get) {
@@ -300,10 +332,12 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
     }
     if (section === 'releases' && get) return reply(releases.get(p.id)!.find(r => r.tag_name === item));
     if (section === 'issues') {
+      if (get && !item) return reply([...issues.values()].filter(i => i.project_id === p.id &&
+        i.title.includes(url.searchParams.get('search') ?? '')));
       if (post && !item) {
         const iid = issues.size + 1;
         const issue = { id: iid, iid, project_id: p.id, state: 'opened', title: body.title, description: body.description,
-          labels: body.labels.split(',').filter(Boolean) };
+          labels: (body.labels ?? '').split(',').filter(Boolean) };
         issues.set(iid, issue);
         await dispatch(p, 'issue', 'issues_events', actor, { ...issue, action: 'open' });
         return reply(issue);
@@ -330,7 +364,7 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
       const saved = notes.get(Number(child));
       if (sub === 'notes' && post && operation === 'award_emoji' && saved?.issueIid === issue.iid) {
         await dispatch(p, 'emoji', 'emoji_events', actor,
-          { name: body.name, awardable_type: 'Note', awardable_id: Number(child), action: 'award' }, issue);
+          { name: body.name, awardable_type: 'Note', awardable_id: Number(child), action: 'award' }, { issue });
         return reply({ name: body.name });
       }
       if (sub === 'notes' && put && saved?.issueIid === issue.iid) {
@@ -340,10 +374,35 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
     }
     if (section === 'merge_requests') {
       const rows = mrs.get(p.id)!;
+      if (!item && get) {
+        const filters = ['source_branch', 'target_branch', 'state'] as const;
+        const matches = rows.filter(m => filters.every(key => !url.searchParams.has(key) || m[key] === url.searchParams.get(key)));
+        return reply(matches.map(m => mrResource(p, m)));
+      }
+      const assignees = () => users.filter(u => body.assignee_ids?.includes(u.id));
+      if (!item && post) {
+        const mr: MR = { iid: rows.length + 1, title: body.title, description: body.description ?? '', source_project_id: p.id, target_project_id: p.id,
+          source_branch: body.source_branch, target_branch: body.target_branch, state: 'opened', assignees: assignees(), threads: [],
+          web_url: url.origin + '/' + p.path_with_namespace + '/-/merge_requests/' + (rows.length + 1) };
+        const resource = mrResource(p, mr);
+        rows.push(mr);
+        await dispatch(p, 'merge_request', 'merge_requests_events', actor, { ...resource, action: 'open' }, { assignees: mr.assignees });
+        return reply(resource);
+      }
+      const iid = Number(item);
+      const mr = rows.find(m => m.iid === iid);
+      if (!mr) return absent();
+      const resource = mrResource(p, mr);
+      if (!sub && get) return reply(resource);
+      if (!sub && put && Array.isArray(body.assignee_ids)) {
+        const previous = mr.assignees;
+        mr.assignees = assignees();
+        const updated = mrResource(p, mr);
+        await dispatch(p, 'merge_request', 'merge_requests_events', actor, { ...updated, action: 'update' },
+          { assignees: mr.assignees, changes: { assignees: { previous, current: mr.assignees } } });
+        return reply(updated);
+      }
       if (put && sub === 'merge') {
-        const iid = Number(item);
-        const mr = rows.find(m => m.iid === iid);
-        if (!mr) return absent();
         const bare = repo(p);
         const target = git(bare, 'rev-parse', mr.target_branch).toString().trim();
         git(bare, 'merge-base', '--is-ancestor', target, mr.source_branch);
@@ -352,18 +411,53 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
           '-m', 'Merge !' + iid).toString().trim();
         git(bare, 'update-ref', 'refs/heads/' + mr.target_branch, sha, target);
         mr.state = 'merged';
-        await dispatch(p, 'merge_request', 'merge_requests_events', actor, { ...mr, action: 'merge', merge_commit_sha: sha });
-        return reply({ ...mr, merge_commit_sha: sha });
+        await dispatch(p, 'merge_request', 'merge_requests_events', actor, { ...resource, state: mr.state, action: 'merge', merge_commit_sha: sha });
+        return reply({ ...resource, state: mr.state, merge_commit_sha: sha });
       }
-      if (get && sub === 'pipelines') return reply([]);
-      if (get && !item) return reply(rows);
-      if (post && !item) {
-        git(repo(p), 'rev-parse', '--verify', 'refs/heads/' + body.source_branch);
-        const iid = rows.length + 1;
-        const mr = { ...body, iid, source_project_id: p.id, state: 'opened',
-          web_url: url.origin + '/' + p.path_with_namespace + '/-/merge_requests/' + iid };
-        rows.push(mr);
-        return reply(mr);
+      if (get && sub === 'pipelines') return reply(projectPipelines.filter(pipe => pipe.ref === mr.source_branch));
+      if (get && sub === 'diffs') {
+        const { base_sha, head_sha } = resource.diff_refs;
+        const diff = (...args: string[]) => git(repo(p), 'diff', '--no-renames', ...args).toString();
+        const files = diff('--name-only', '-z', base_sha, head_sha).split('\0').filter(Boolean);
+        return reply(files.map(path => ({ old_path: path, new_path: path, diff: diff(base_sha, head_sha, '--', path) })));
+      }
+      if (sub === 'notes' || sub === 'discussions') {
+        const inThread = sub === 'discussions';
+        const allNotes = mr.threads.flatMap(thread => thread.notes);
+        let thread = inThread ? mr.threads.find(t => t.id === child) : undefined;
+        if (inThread && child && !thread) return absent();
+        const saved = inThread ? thread?.notes.find(n => n.id === Number(noteId)) : allNotes.find(n => n.id === Number(child));
+        if (get) {
+          if (!child) return reply(inThread ? mr.threads : allNotes);
+          if (thread && !operation) return reply(thread);
+          if (thread && operation === 'notes' && !noteId) return reply(thread.notes);
+          return reply(saved);
+        }
+        if (post && !inThread && saved && operation === 'award_emoji') {
+          await dispatch(p, 'emoji', 'emoji_events', actor,
+            { name: body.name, awardable_type: 'Note', awardable_id: saved.id, action: 'award' },
+            { merge_request: resource, note: { noteable_type: 'MergeRequest', noteable_iid: iid, discussion_id: saved.discussion_id } });
+          return reply({ name: body.name });
+        }
+        const emitNote = (n: MrNote, action: string) => dispatch(p, 'note', 'note_events', actor,
+          { ...n, note: n.body, action, noteable_type: 'MergeRequest' }, { merge_request: resource });
+        if (put && thread && !operation && typeof body.resolved === 'boolean') {
+          for (const n of thread.notes) if (n.resolvable) n.resolved = body.resolved;
+          return reply(thread);
+        }
+        if (put && saved) {
+          saved.body = body.body;
+          await emitNote(saved, 'update');
+          return reply(saved);
+        }
+        if (post && (!child || (inThread && operation === 'notes' && !noteId))) {
+          if (!thread) { thread = { id: randomUUID(), notes: [] }; mr.threads.push(thread); }
+          const n = { id: nextNoteId++, author: actor, body: body.body, discussion_id: thread.id, position: body.position,
+            type: body.position ? 'DiffNote' : inThread ? 'DiscussionNote' : null, resolvable: !!body.position, resolved: false };
+          thread.notes.push(n);
+          await emitNote(n, 'create');
+          return reply(inThread && !child ? thread : n);
+        }
       }
     }
     return absent();
@@ -376,6 +470,24 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
     hubProjectPath: 'ai/workspace-hub', targetProjects: { web: 'apps/web', api: 'apps/api', ansible: 'ops/ansible-infra' },
     devUsername: 'dev', sreUsername: 'sre', podHost: '127.0.0.1',
     detentPublicUrl: port => 'http://127.0.0.1:' + port,
+    synthetic: {
+      async failPipeline(id, iid, botId) {
+        const p = find(id)!;
+        const mr = mrResource(p, mrs.get(id)!.find(m => m.iid === iid)!);
+        const pipeline = { id: pipelines.length + 1, project_id: id, ref: mr.source_branch, sha: mr.sha, status: 'failed' };
+        pipelines.unshift(pipeline);
+        const bot = users.find(u => u.id === botId);
+        assert.ok(bot, 'Expected the provisioned bot as the pipeline actor');
+        await dispatch(p, 'pipeline', 'pipeline_events', bot, pipeline, { merge_request: mr });
+        return pipeline.id;
+      },
+      async failDeployment(id) {
+        const p = find(id)!;
+        await dispatch(p, 'deployment', 'deployment_events', users[2], {}, {
+          status: 'failed', ref: p.default_branch, environment: 'staging', sha: commitSha(p, p.default_branch),
+        });
+      },
+    },
     async ensureUsers() {}, close: server.close,
   };
 }

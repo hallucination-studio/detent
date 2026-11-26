@@ -169,7 +169,7 @@ async function main() {
     const releasePath = 'agents/release/AGENT.md';
     const imagePath = 'agents/image-sync/AGENT.md';
     const hubFile = (path: string) => gitlab.getFile(hub, path);
-    const templates = ['CLAUDE.md', imagePath, 'agents/image-sync/skills/mirror-to-harbor/SKILL.md', 'skills/gitlab-mr-conventions/SKILL.md'];
+    const templates = ['CLAUDE.md', 'events.json', imagePath, 'agents/image-sync/skills/mirror-to-harbor/SKILL.md', 'skills/gitlab-mr-conventions/SKILL.md'];
     for (const name of ['audit', 'code-delivery', 'env-change', 'release'])
       templates.push('agents/' + name + '/AGENT.md', '.gitlab/issue_templates/' + name + '.md');
     for (const path of templates)
@@ -190,14 +190,15 @@ async function main() {
       assert.ok(labels.some(label => label.name === name), 'Missing Hub label ' + name);
     for (const p of projects) {
       const hooks = await admin.json<{ url: string; issues_events: boolean; note_events: boolean; emoji_events: boolean;
-        merge_requests_events: boolean; pipeline_events: boolean; push_events: boolean }[]>('/projects/' + p.id + '/hooks');
+        merge_requests_events: boolean; pipeline_events: boolean; deployment_events: boolean; push_events: boolean }[]>('/projects/' + p.id + '/hooks');
       assert.equal(hooks.length, 1);
       assert.equal(hooks[0].url, publicUrl + '/webhooks/gitlab');
       assert.equal(hooks[0].issues_events, p.id === hub);
-      assert.equal(hooks[0].note_events, p.id === hub);
-      assert.equal(hooks[0].emoji_events, p.id === hub);
+      assert.equal(hooks[0].note_events, true);
+      assert.equal(hooks[0].emoji_events, true);
       assert.equal(hooks[0].merge_requests_events, p.id !== hub);
       assert.equal(hooks[0].pipeline_events, p.id !== hub);
+      assert.equal(hooks[0].deployment_events, p.id !== hub);
       assert.equal(hooks[0].push_events, false);
     }
     async function startPod(id: string, settings: NodeJS.ProcessEnv) {
@@ -220,14 +221,20 @@ async function main() {
       issueIds.push(iid);
       return iid;
     }
+    const standaloneMrs: number[] = [];
     if (external) cleanup.push(async () => {
-      if (!issueIds.length) return;
+      if (!issueIds.length && !standaloneMrs.length) return;
       const cx = await db.getConnection();
       try {
         await cx.beginTransaction();
-        const [owned] = await cx.query<RowDataPacket[]>('SELECT id FROM issue_sessions WHERE hub_project_id=? AND hub_issue_iid IN (?)', [hub, issueIds]);
+        const [owned] = await cx.query<RowDataPacket[]>(`SELECT id FROM issue_sessions WHERE
+          (session_kind='issue' AND hub_project_id=? AND hub_issue_iid IN (?)) OR
+          (session_kind='mr' AND ((hub_project_id=? AND hub_issue_iid IN (?)) OR
+            (hub_project_id,hub_issue_iid) IN (SELECT m.target_project_id,m.mr_iid FROM session_merge_requests m
+              JOIN issue_sessions h ON h.id=m.session_id WHERE h.session_kind='issue' AND h.hub_project_id=? AND h.hub_issue_iid IN (?))))`,
+          [hub, issueIds.length ? issueIds : [0], api.id, standaloneMrs.length ? standaloneMrs : [0], hub, issueIds.length ? issueIds : [0]]);
         for (const fixture of owned) {
-          for (const table of ['delivery_executions', 'approval_requests', 'session_merge_requests', 'session_worktrees', 'session_messages'])
+          for (const table of ['delivery_executions', 'session_inbox', 'approval_requests', 'session_merge_requests', 'session_worktrees', 'session_messages'])
             await cx.query('DELETE FROM ' + table + ' WHERE session_id=?', [fixture.id]);
           await cx.query('DELETE FROM issue_sessions WHERE id=?', [fixture.id]);
         }
@@ -247,7 +254,7 @@ async function main() {
     const records = (session: string, table: string) => rows('SELECT * FROM ' + table + ' WHERE session_id=?', [session]);
     async function state(iid: number, status: string, afterSeq = -1) {
       return until('#' + iid + ' ' + status, async () => {
-        const [s] = await rows('SELECT * FROM issue_sessions WHERE hub_project_id=? AND hub_issue_iid=?', [hub, iid]);
+        const [s] = await rows("SELECT * FROM issue_sessions WHERE session_kind='issue' AND hub_project_id=? AND hub_issue_iid=?", [hub, iid]);
         if (s?.status === 'FAILED') throw Error('Delivery failed: ' + (await notes(iid)).map(n => n.body).join('\n'));
         if (s?.status === status && s.last_message_seq > afterSeq && (status === 'WAITING_TOOL' || !s.locked_by_pod)) return s;
       });
@@ -358,6 +365,54 @@ async function main() {
     assert.ok(!(await records(review.id, 'approval_requests')).some(a => a.tool_name === 'Bash'));
     const firstMr = mrs.find(m => m.target_project_id === web.id)!;
     const secondMr = mrs.find(m => m.target_project_id === api.id)!;
+    const bot = await admin.json<{ id: number; username: string }>('/user', 'GET', undefined, config.GITLAB_TOKEN);
+    const [developer] = await admin.json<{ id: number }[]>('/users?username=' + gitlab.devUsername);
+    for (const m of mrs) {
+      const mr = await gitlab.getMr(m.target_project_id, m.mr_iid);
+      assert.ok(mr.assignees.some(a => a.id === bot.id), 'Issue-created MR must be assigned to the bot');
+      await admin.request('/projects/' + m.target_project_id + '/members', 'POST', { user_id: developer.id, access_level: 30 });
+    }
+    async function mrState(project: number, iid: number, status: 'IDLE' | 'DONE', afterSeq = -1) {
+      return until(project + '!' + iid + ' ' + status, async () => {
+        const [row] = await rows("SELECT * FROM issue_sessions WHERE session_kind='mr' AND hub_project_id=? AND hub_issue_iid=?", [project, iid]);
+        if (row?.status === 'FAILED') throw Error('MR worker failed: ' + (await gitlab.listMrNotes(project, iid)).map(n => n.body).join('\n'));
+        if (row?.status === status && !row.locked_by_pod && row.last_message_seq > afterSeq) return row;
+      });
+    }
+    const hubNotes = await notes(code);
+    if (gitlab.synthetic) {
+      const before = await gitlab.getMr(web.id, firstMr.mr_iid);
+      const pipeline = await gitlab.synthetic.failPipeline(web.id, before.iid, bot.id);
+      const worker = await mrState(web.id, before.iid, 'IDLE');
+      assert.notEqual(worker.id, review.id);
+      assert.equal(worker.last_failed_pipeline_id, pipeline);
+      const [linked] = await rows('SELECT latest_pipeline_id, latest_pipeline_status FROM session_merge_requests WHERE id=?', [firstMr.id]);
+      assert.equal(linked.latest_pipeline_id, pipeline);
+      assert.equal(linked.latest_pipeline_status, 'failed');
+      const fixed = await gitlab.getMr(web.id, before.iid);
+      assert.notEqual(fixed.sha, before.sha);
+      assert.equal(await gitlab.getFile(web.id, 'ci/ready.txt', fixed.sha), 'ready\n');
+      assert.ok((await gitlab.listMrNotes(web.id, before.iid)).some(n => n.body.includes('Restored the CI readiness file.')));
+    } else {
+      await gitlab.openDiscussion(web.id, firstMr.mr_iid, 'Please inspect this contribution');
+      await mrState(web.id, firstMr.mr_iid, 'IDLE');
+    }
+    const inlineMr = await until('GitLab diff refs', async () => {
+      const mr = await gitlab.getMr(api.id, secondMr.mr_iid);
+      if (mr.diff_refs?.head_sha) return { ...mr, diff_refs: mr.diff_refs };
+    });
+    const thread = await gitlab.openDiscussion(api.id, inlineMr.iid, 'Add a regression test for this greeting.', {
+      ...inlineMr.diff_refs, position_type: 'text', old_path: 'hello.txt', new_path: 'hello.txt', new_line: 1,
+    });
+    await mrState(api.id, inlineMr.iid, 'IDLE');
+    const inlineNotes = (await gitlab.getDiscussion(api.id, inlineMr.iid, thread.id)).notes;
+    assert.equal(inlineNotes[0].type, 'DiffNote');
+    assert.ok(inlineNotes.some(n => n.author.username === bot.username && n.body.includes('Added the requested greeting regression test.') &&
+      /<details><summary>🛠️ 已执行 [1-9]\d* 个步骤/.test(n.body)));
+    const reviewed = await gitlab.getMr(api.id, inlineMr.iid);
+    assert.notEqual(reviewed.sha, inlineMr.sha);
+    assert.ok((await gitlab.getFile(api.id, 'test-greeting.sh', reviewed.sha)).includes('Hello from ' + apiRepo));
+    assert.deepEqual(await notes(code), hubNotes, 'The independent MR turns posted to the Hub Issue');
     await gitlab.mergeMergeRequest(firstMr.target_project_id, firstMr.mr_iid);
     const waitingForMerge = await state(code, 'IDLE', review.last_message_seq);
     assert.ok((await notes(code)).some(n => n.body.includes('Waiting for the remaining MR to merge.')));
@@ -365,11 +420,79 @@ async function main() {
     assert.equal((await gitlab.getIssue(hub, code)).state, 'opened');
     await gitlab.mergeMergeRequest(secondMr.target_project_id, secondMr.mr_iid);
     assert.ok((await done(code)).last_message_seq > waitingForMerge.last_message_seq);
+    for (const m of mrs) await mrState(m.target_project_id, m.mr_iid, 'DONE');
     const trees = await records(review.id, 'session_worktrees');
     assert.equal(trees.length, 2);
     assert.ok(trees.every(t => t.status === 'ARCHIVED' && t.branch_name === 'feat/issue-' + code));
     for (const p of [web, api]) assert.equal(await gitlab.getFile(p.id, 'hello.txt'), 'Hello from ' + p.path_with_namespace + '!\n');
     console.log('Cross-repo Issue closed after both human merges.');
+
+    const hubIssueIds = async () => (await admin.json<{ iid: number }[]>('/projects/' + hub + '/issues?scope=all&per_page=100')).map(i => i.iid).sort();
+    const beforeStandalone = await hubIssueIds();
+    const standalone = await gitlab.openExternalMr(api.id, 'external-feature');
+    standaloneMrs.push(standalone.iid);
+    assert.deepEqual(standalone.assignees, []);
+    const externalThread = await gitlab.openDiscussion(api.id, standalone.iid, '@' + bot.username + ' Please inspect this contribution');
+    const mentioned = await mrState(api.id, standalone.iid, 'IDLE');
+    assert.deepEqual((await gitlab.getMr(api.id, standalone.iid)).assignees, []);
+    assert.ok((await gitlab.getDiscussion(api.id, standalone.iid, externalThread.id)).notes.some(n =>
+      n.author.username === bot.username && n.body.includes('Inspected the external contribution.')));
+    await gitlab.assignMr(api.id, standalone.iid, bot.id);
+    const assigned = await mrState(api.id, standalone.iid, 'IDLE', mentioned.last_message_seq);
+    assert.equal(assigned.id, mentioned.id);
+    assert.ok((await gitlab.listMrNotes(api.id, standalone.iid)).some(n => n.body.includes('Accepted the assigned MR.')));
+    assert.deepEqual(await hubIssueIds(), beforeStandalone);
+    assert.deepEqual(await rows('SELECT id FROM session_merge_requests WHERE target_project_id=? AND mr_iid=?', [api.id, standalone.iid]), []);
+
+    if (gitlab.synthetic) {
+      const originalPolicy = await hubFile('events.json');
+      const alertLabel = 'e2e::deployment';
+      const policy = (action: 'notify' | 'run') => gitlab.upsertFile(hub, 'events.json', JSON.stringify({ version: 1, rules: [
+        { event: 'pipeline', status: 'failed', project: apiRepo, action, notifyTarget: 'resource' },
+        { event: 'deployment', status: 'failed', project: apiRepo, action: 'notify', notifyTarget: 'hub_issue', hubIssueLabel: alertLabel },
+      ] }), 'Set pipeline policy to ' + action);
+      await policy('notify');
+      const before = await gitlab.getMr(api.id, standalone.iid);
+      const requests = anthropic.getRequests();
+      const notified = await gitlab.synthetic.failPipeline(api.id, before.iid, bot.id);
+      await until('pipeline notification', async () => (await gitlab.listMrNotes(api.id, before.iid))
+        .some(n => n.body.includes('Pipeline #' + notified + ' failed')));
+      assert.equal((await gitlab.getMr(api.id, before.iid)).sha, before.sha);
+      assert.equal((await mrState(api.id, before.iid, 'IDLE')).last_message_seq, assigned.last_message_seq);
+      assert.equal(anthropic.getRequests(), requests);
+      await policy('run');
+      const receipt = 'steer-' + randomUUID();
+      const instruction = 'Please include receipt ' + receipt + ' in the CI fix.';
+      let steeringThread: string | undefined;
+      anthropic.beforeNextJobLog(async () => {
+        const [active] = await rows('SELECT status, locked_by_pod FROM issue_sessions WHERE id=?', [assigned.id]);
+        assert.ok(active.status === 'CODING' && active.locked_by_pod);
+        steeringThread = (await gitlab.openDiscussion(api.id, before.iid, instruction)).id;
+        await until('reviewer instruction in active session inbox', async () => (await rows(
+          "SELECT id FROM session_inbox WHERE session_id=? AND discussion_id=? AND content=? AND status='PENDING'",
+          [assigned.id, steeringThread!, instruction])).length);
+      });
+      const retried = await gitlab.synthetic.failPipeline(api.id, before.iid, bot.id);
+      const fixed = await mrState(api.id, before.iid, 'IDLE', assigned.last_message_seq);
+      assert.equal(fixed.last_failed_pipeline_id, retried);
+      assert.ok(steeringThread);
+      const [consumed] = await rows('SELECT status,consumed_at FROM session_inbox WHERE session_id=? AND discussion_id=?', [assigned.id, steeringThread]);
+      assert.ok(consumed.status === 'CONSUMED' && consumed.consumed_at);
+      const after = await gitlab.getMr(api.id, before.iid);
+      assert.notEqual(after.sha, before.sha);
+      assert.equal(await gitlab.getFile(api.id, 'ci/ready.txt', after.sha), 'ready\n');
+      const commit = await admin.json<{ title: string }>('/projects/' + api.id + '/repository/commits/' + after.sha);
+      assert.ok(commit.title.includes(receipt));
+      assert.ok((await gitlab.getDiscussion(api.id, before.iid, steeringThread)).notes.some(n =>
+        n.author.username === bot.username && n.body.includes(receipt)));
+      assert.deepEqual(await hubIssueIds(), beforeStandalone);
+      await gitlab.synthetic.failDeployment(api.id);
+      const alert = await until('deployment alert Issue', async () => (await admin.json<{ title: string; description: string; labels: string[] }[]>(
+        '/projects/' + hub + '/issues?search=deployment')).find(i => i.labels.includes(alertLabel)));
+      for (const detail of ['deployment', 'failed', apiRepo, 'staging']) assert.ok(alert.description.includes(detail));
+      await gitlab.upsertFile(hub, 'events.json', originalPolicy, 'Restore Hub event policy');
+      console.log('Verified live policy changes, in-turn MR steering, and the deployment alert Issue.');
+    }
 
     const shaToPublish = await gitlab.headSha(web.id);
     for (const workflow of ['release', 'hotfix']) {

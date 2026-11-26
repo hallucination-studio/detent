@@ -94,7 +94,19 @@ export type WebhookExtension = (event: ExtensionWebhookEvent) => {
   handle(orchestrator: SessionOrchestrator): Promise<void>;
 } | null;
 
+export interface EventNotification {
+  eventId: string;
+  projectId?: number;
+  issueIid?: number;
+  mrIid?: number;
+  sha?: string;
+  target: 'resource' | 'hub_issue' | 'commit';
+  hubIssueLabel?: string;
+  body: string;
+}
+
 export interface DetentExtensions {
+  onNotify?(notification: EventNotification): void | Promise<void>;
   decisionClient?: DecisionClient;
   tools?: readonly AnyDetentExtensionTool[];
   capabilities?: readonly DetentCapabilityPack[];

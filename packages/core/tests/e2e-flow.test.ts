@@ -1,3 +1,5 @@
+import { MergeRequestOrchestrator } from '../src/orchestrator/mr-orchestrator.js';
+import { GitLabClient } from '../src/gitlab/client.js';
 import { it, expect, vi } from 'vitest';
 import { mkdtemp, mkdir, readdir, readFile, appendFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -53,6 +55,7 @@ async function mockGitLab(root: string) {
     ...(await bareProjects(root)),
     notes,
     isBotUser: (id?: number) => id === 99,
+    getBotIdentity: () => ({ id: 99, username: 'bot', name: 'Bot' }),
     getIssue: vi.fn(async (_project: number, _iid: number) => ({ ...issue, labels: ['review'] })),
     hasApprovalPermission: async (_: number, user: number) => user === actor.id,
     createIssueNote: async (_: number, __: number, body: string) => ({ id: notes.push(body) }),
@@ -131,7 +134,13 @@ it('resumes a cold Bash approval, answers a hot question and reports two MRs and
     const errors: unknown[] = [];
     function pod(podId: string, hotHoldTimeoutMs: number) {
       const orch = new SessionOrchestrator({ ...config, podId, hotHoldTimeoutMs }, repo, gitlab, runner);
-      return new WebhookQueue((event) => dispatchWebhook(orch, event), error => errors.push(error));
+      const client = Object.assign(new GitLabClient(config, async () => { throw Error('Unexpected GitLab API call'); }), gitlab, {
+        listOpenMergeRequestsByBranch: vi.fn().mockResolvedValue([{ iid: 1 }]),
+        getMergeRequest: vi.fn().mockResolvedValue({ iid: 1, state: 'opened', assignees: [] }),
+        getRepositoryFile: vi.fn().mockResolvedValue(null),
+      });
+      const mrs = new MergeRequestOrchestrator(config, repo, client, runner, { runHubEvent: vi.fn() });
+      return new WebhookQueue((event, id) => dispatchWebhook(orch, event, id, mrs), error => errors.push(error));
     }
     let route = pod('A', 0);
     const app = createWebhookApp(config, gitlab, (id, event) => route.submit(id, event));
@@ -187,6 +196,7 @@ it('resumes a cold Bash approval, answers a hot question and reports two MRs and
     expect(runner.run.mock.calls[2][0].prompt).toContain('工具 Bash，参数 {"command":"npm install ioredis"}');
     expect(new Set(dirs).size).toBe(3);
     expect(await repo.listSessionMergeRequests(s.id)).toHaveLength(2);
+    for (const [, input] of gitlab.createMergeRequest.mock.calls) expect(input.assignee_ids).toEqual([99]);
     await send({
       object_kind: 'pipeline',
       project: { ...project, id: 3, web_url: '' },

@@ -5,12 +5,14 @@ import type {
   ApprovalStatus,
   ApprovalType,
   IssueSessionRow,
+  SessionKind,
+  SessionInboxRow,
   SessionMergeRequestRow,
   SessionMessageRow,
   SessionWorktreeRow,
 } from '../types.js';
 
-export type State = Partial<Pick<IssueSessionRow, 'status' | 'permissionMode' | 'activeNoteId' | 'claudeSessionId'>>;
+export type State = Partial<Pick<IssueSessionRow, 'status' | 'permissionMode' | 'activeNoteId' | 'claudeSessionId' | 'autoFixAttempts' | 'lastFailedPipelineId' | 'recoveryAttempts'>>;
 export type Message = Omit<SessionMessageRow, 'sessionId' | 'id' | 'createdAt'>;
 export type NewRow<T> = Omit<T, 'id' | 'createdAt' | 'updatedAt'>;
 export type Worktree = NewRow<SessionWorktreeRow>;
@@ -18,7 +20,20 @@ type MergeMetadata = Pick<SessionMergeRequestRow, 'mergeCommitSha' | 'mergedBy' 
 export type MR = Omit<NewRow<SessionMergeRequestRow>, keyof MergeMetadata> & Partial<MergeMetadata>;
 export type Decision = Exclude<ApprovalStatus, 'PENDING'>;
 
+export type InboxInput = Pick<SessionInboxRow, 'sessionId' | 'eventId' | 'sourceKind' | 'content'> &
+  Partial<Pick<SessionInboxRow, 'senderUsername' | 'discussionId'>>;
+
 export interface DetentRepository {
+  getOrCreateMrSession(project: number, iid: number, title: string): Promise<IssueSessionRow>;
+  getSessionByMr(project: number, iid: number): Promise<IssueSessionRow | null>;
+  getMrSessionByApprovalNote(project: number, note: number): Promise<IssueSessionRow | null>;
+  claimPipelineFailure(id: string, pipeline: number, max: number, content: string): Promise<'skip' | 'escalate' | 'run'>;
+  markMergeRequestClosed(id: string): Promise<boolean>;
+  enqueueSessionInbox(input: InboxInput): Promise<boolean>;
+  drainSessionInbox(sessionId: string, owner?: string, sourceKind?: string): Promise<SessionInboxRow[]>;
+  failRecovery(sessionId: string): Promise<void>;
+  listExpiredActiveSessions(limit?: number): Promise<IssueSessionRow[]>;
+  listSessionsWithPendingInbox(limit?: number): Promise<IssueSessionRow[]>;
   requestStop(id: string, owner: string): Promise<void>;
   stopRequested(id: string, owner: string): Promise<boolean>;
   getLatestApproval(id: string): Promise<ApprovalRequestRow | null>;
@@ -26,9 +41,10 @@ export interface DetentRepository {
   getSession(id: string): Promise<IssueSessionRow | null>;
   getSessionByIssue(project: number, iid: number): Promise<IssueSessionRow | null>;
   updateSessionState(id: string, state: State): Promise<void>;
-  acquireSessionLease(id: string, pod: string, ttl: number): Promise<boolean>;
+  acquireSessionLease(id: string, pod: string, ttl: number, expiredAt?: Date): Promise<boolean>;
   renewSessionLease(id: string, pod: string, ttl: number): Promise<boolean>;
   releaseSessionLease(id: string, pod: string): Promise<void>;
+  releaseIfInboxEmpty(id: string, owner: string): Promise<boolean>;
   appendIncrementalMessages(id: string, messages: Message[]): Promise<void>;
   getSessionMessages(id: string, afterSeq?: number): Promise<SessionMessageRow[]>;
   resetTranscript(id: string): Promise<void>;
@@ -80,8 +96,8 @@ export class MySqlDetentRepository implements DetentRepository {
   getLatestApproval(id: string) {
     return this.approval('session_id=? ORDER BY created_at DESC LIMIT 1', [id]);
   }
-  private async rows<T>(table: string, where: string, args: unknown[]): Promise<T[]> {
-    const [rows] = await this.pool.query<RowDataPacket[]>(
+  private async rows<T>(table: string, where: string, args: unknown[], cx: Pool | PoolConnection = this.pool): Promise<T[]> {
+    const [rows] = await cx.query<RowDataPacket[]>(
       'SELECT * FROM ' + table + ' WHERE ' + where,
       args,
     );
@@ -96,22 +112,79 @@ export class MySqlDetentRepository implements DetentRepository {
     const [result] = await this.pool.query<ResultSetHeader>(sql, args);
     return result.affectedRows > 0;
   }
-  async getOrCreateSession(project: number, iid: number, title: string) {
+  private async createSession(kind: SessionKind, project: number, iid: number, title: string) {
     await this.change(
-      'INSERT INTO issue_sessions(id,hub_project_id,hub_issue_iid,issue_title) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE id=id',
-      [randomUUID(), project, iid, title],
+      'INSERT INTO issue_sessions(id,session_kind,hub_project_id,hub_issue_iid,issue_title,status,permission_mode) VALUES(?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id',
+      [randomUUID(), kind, project, iid, title, kind === 'issue' ? 'PLANNING' : 'CODING', kind === 'issue' ? 'plan' : 'default'],
     );
-    return (await this.getSessionByIssue(project, iid))!;
+    return (await this.byResource(kind, project, iid))!;
   }
-  async getSessionByIssue(project: number, iid: number) {
-    return (
-      (
-        await this.rows<IssueSessionRow>('issue_sessions', 'hub_project_id=? AND hub_issue_iid=?', [
-          project,
-          iid,
-        ])
-      )[0] ?? null
-    );
+  private async byResource(kind: SessionKind, project: number, iid: number): Promise<IssueSessionRow | null> {
+    return (await this.rows<IssueSessionRow>('issue_sessions', 'session_kind=? AND hub_project_id=? AND hub_issue_iid=?', [kind, project, iid]))[0] ?? null;
+  }
+  getOrCreateSession(project: number, iid: number, title: string) {
+    return this.createSession('issue', project, iid, title);
+  }
+  getOrCreateMrSession(project: number, iid: number, title: string) {
+    return this.createSession('mr', project, iid, title);
+  }
+  getSessionByIssue(project: number, iid: number) {
+    return this.byResource('issue', project, iid);
+  }
+  getSessionByMr(project: number, iid: number) {
+    return this.byResource('mr', project, iid);
+  }
+  async getMrSessionByApprovalNote(project: number, note: number) {
+    return (await this.rows<IssueSessionRow>('issue_sessions',
+      "session_kind='mr' AND hub_project_id=? AND id IN (SELECT session_id FROM approval_requests WHERE gitlab_note_id=? AND status='PENDING')",
+      [project, note]))[0] ?? null;
+  }
+  claimPipelineFailure(id: string, pipeline: number, max: number, content: string) {
+    return this.transaction(async cx => {
+      // Serialize the budget decision and the durable wakeup across webhook workers.
+      const [s] = await this.rows<IssueSessionRow>('issue_sessions', 'id=? FOR UPDATE', [id], cx);
+      if (s.status === 'DONE' || (s.lastFailedPipelineId ?? 0) >= pipeline) return 'skip' as const;
+      const run = s.autoFixAttempts < max;
+      await cx.query('UPDATE issue_sessions SET auto_fix_attempts=auto_fix_attempts+?, last_failed_pipeline_id=? WHERE id=?',
+        [run ? 1 : 0, pipeline, id]);
+      if (!run) return 'escalate' as const;
+      await cx.query('INSERT INTO session_inbox SET ?', [columns({
+        sessionId: id, eventId: 'pipeline/' + pipeline, sourceKind: 'pipeline', content,
+      })]);
+      return 'run' as const;
+    });
+  }
+  markMergeRequestClosed(id: string) {
+    return this.change("UPDATE session_merge_requests SET mr_state='closed' WHERE id=? AND mr_state='opened'", [id]);
+  }
+  enqueueSessionInbox(input: InboxInput) {
+    return this.change('INSERT IGNORE INTO session_inbox SET ?', [columns(input)]);
+  }
+  drainSessionInbox(sessionId: string, owner?: string, sourceKind?: string) {
+    return this.transaction(async cx => {
+      const ownerCheck = owner ? ' AND EXISTS (SELECT 1 FROM issue_sessions WHERE id=? AND locked_by_pod=? AND lock_expires_at>NOW(3))' : '';
+      const items = await this.rows<SessionInboxRow>('session_inbox',
+        "session_id=? AND status='PENDING'" + (sourceKind ? ' AND source_kind=?' : '') + ownerCheck + ' ORDER BY id ASC FOR UPDATE',
+        [sessionId, ...(sourceKind ? [sourceKind] : []), ...(owner ? [sessionId, owner] : [])], cx);
+      if (items.length) await cx.query("UPDATE session_inbox SET status='CONSUMED', consumed_at=NOW(3) WHERE id IN (?)",
+        [items.map(item => item.id)]);
+      return items;
+    });
+  }
+  failRecovery(sessionId: string) {
+    return this.transaction(async cx => {
+      await cx.query("UPDATE issue_sessions SET status='FAILED' WHERE id=?", [sessionId]);
+      await cx.query("UPDATE session_inbox SET status='EXPIRED' WHERE session_id=? AND status='PENDING'", [sessionId]);
+    });
+  }
+  listExpiredActiveSessions(limit = 50) {
+    return this.rows<IssueSessionRow>('issue_sessions',
+      "status IN ('PLANNING','CODING') AND lock_expires_at IS NOT NULL AND lock_expires_at <= NOW(3) ORDER BY lock_expires_at LIMIT ?", [limit]);
+  }
+  listSessionsWithPendingInbox(limit = 50) {
+    return this.rows<IssueSessionRow>('issue_sessions s',
+      `status NOT IN ('WAITING_PLAN','WAITING_TOOL','DONE') AND (locked_by_pod IS NULL OR lock_expires_at <= NOW(3))
+       AND EXISTS (SELECT 1 FROM session_inbox i WHERE i.session_id=s.id AND i.status='PENDING') ORDER BY updated_at LIMIT ?`, [limit]);
   }
   async getSession(id: string) {
     return (await this.rows<IssueSessionRow>('issue_sessions', 'id=?', [id]))[0] ?? null;
@@ -119,10 +192,11 @@ export class MySqlDetentRepository implements DetentRepository {
   async updateSessionState(id: string, state: State) {
     await this.change('UPDATE issue_sessions SET ? WHERE id=?', [columns(state), id]);
   }
-  acquireSessionLease(id: string, pod: string, ttl: number) {
+  acquireSessionLease(id: string, pod: string, ttl: number, expiredAt?: Date) {
     return this.change(
-      'UPDATE issue_sessions SET stop_requested=IF(locked_by_pod<=>?,stop_requested,FALSE),locked_by_pod=?,lock_expires_at=TIMESTAMPADD(SECOND,?,NOW(3)) WHERE id=? AND (locked_by_pod IS NULL OR locked_by_pod=? OR lock_expires_at<=NOW(3))',
-      [pod, pod, ttl, id, pod],
+      'UPDATE issue_sessions SET stop_requested=IF(locked_by_pod<=>?,stop_requested,FALSE),locked_by_pod=?,lock_expires_at=TIMESTAMPADD(SECOND,?,NOW(3)) WHERE id=? AND (locked_by_pod IS NULL OR locked_by_pod=? OR lock_expires_at<=NOW(3))' +
+        (expiredAt ? " AND lock_expires_at=? AND status IN ('PLANNING','CODING')" : ''),
+      [pod, pod, ttl, id, pod, ...(expiredAt ? [expiredAt] : [])],
     );
   }
   renewSessionLease(id: string, pod: string, ttl: number) {
@@ -130,6 +204,11 @@ export class MySqlDetentRepository implements DetentRepository {
       'UPDATE issue_sessions SET lock_expires_at=TIMESTAMPADD(SECOND,?,NOW(3)) WHERE id=? AND locked_by_pod=? AND lock_expires_at>NOW(3)',
       [ttl, id, pod],
     );
+  }
+  releaseIfInboxEmpty(id: string, owner: string) {
+    return this.change(`UPDATE issue_sessions SET locked_by_pod=NULL, lock_expires_at=NULL
+      WHERE id=? AND locked_by_pod=? AND NOT EXISTS
+      (SELECT 1 FROM session_inbox WHERE session_id=? AND status='PENDING')`, [id, owner, id]);
   }
   async releaseSessionLease(id: string, pod: string) {
     await this.change(
@@ -154,12 +233,13 @@ export class MySqlDetentRepository implements DetentRepository {
       await cx.query('UPDATE issue_sessions SET last_message_seq=? WHERE id=?', [next, id]);
     });
   }
-  private async transaction(write: (cx: PoolConnection) => Promise<void>) {
+  private async transaction<T>(write: (cx: PoolConnection) => Promise<T>) {
     const cx = await this.pool.getConnection();
     try {
       await cx.beginTransaction();
-      await write(cx);
+      const value = await write(cx);
       await cx.commit();
+      return value;
     } catch (error) {
       await cx.rollback();
       throw error;
@@ -176,7 +256,7 @@ export class MySqlDetentRepository implements DetentRepository {
   async resetTranscript(id: string) {
     await this.transaction(async (cx) => {
       await cx.query(
-        "UPDATE issue_sessions SET last_message_seq=0,claude_session_id=NULL,permission_mode='plan',status='PLANNING' WHERE id=?",
+        "UPDATE issue_sessions SET last_message_seq=0,claude_session_id=NULL,permission_mode=IF(session_kind='mr','default','plan'),status=IF(session_kind='mr','CODING','PLANNING') WHERE id=?",
         [id],
       );
       await cx.query('DELETE FROM session_messages WHERE session_id=?', [id]);

@@ -4,6 +4,11 @@ import { setTimeout as delay } from 'node:timers/promises';
 type Actor = 'dev' | 'sre';
 type Issue = { iid: number; state: string; labels: string[] };
 type Note = { id: number; body: string };
+type DiffRefs = { base_sha: string; start_sha: string; head_sha: string };
+type InlinePosition = DiffRefs & { position_type: 'text'; old_path: string; new_path: string; new_line: number };
+type MR = { iid: number; sha: string; source_branch: string; assignees: { id: number; username: string }[];
+  diff_refs: DiffRefs | null };
+type Discussion = { id: string; notes: (Note & { author: { username: string }; type?: string })[] };
 type Release = { tag_name: string; name: string; description: string; commit?: { id: string } };
 
 export function gitlabApi(baseUrl: string, adminToken: string) {
@@ -29,6 +34,7 @@ export function gitlabApi(baseUrl: string, adminToken: string) {
 export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record<Actor, string>) {
   const project = (id: number) => '/projects/' + id;
   const issues = (id: number, iid: number) => project(id) + '/issues/' + iid;
+  const mr = (id: number, iid: number) => project(id) + '/merge_requests/' + iid;
   const file = (id: number, path: string) => project(id) + '/repository/files/' + encodeURIComponent(path);
   return {
     async ensureLabel(id: number, name: string) {
@@ -41,8 +47,8 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
       const existing = await api.lookup(url + '?ref=main');
       await api.request(url, existing ? 'PUT' : 'POST', { branch: 'main', content, commit_message: message });
     },
-    async getFile(id: number, path: string) {
-      const data = await api.json<{ content: string }>(file(id, path) + '?ref=main');
+    async getFile(id: number, path: string, ref = 'main') {
+      const data = await api.json<{ content: string }>(file(id, path) + '?ref=' + encodeURIComponent(ref));
       return Buffer.from(data.content, 'base64').toString('utf8');
     },
     async headSha(id: number) {
@@ -61,6 +67,24 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
     },
     async postNote(id: number, iid: number, body: string, actor: Actor = 'dev') {
       await api.request(issues(id, iid) + '/notes', 'POST', { body }, tokens[actor]);
+    },
+    getMr(id: number, iid: number) { return api.json<MR>(mr(id, iid)); },
+    async openExternalMr(id: number, branch: string) {
+      await api.request(file(id, 'feature.txt'), 'POST', { branch, start_branch: 'main',
+        content: 'External contribution\n', commit_message: 'Add external feature' }, tokens.dev);
+      return api.json<MR>(project(id) + '/merge_requests', 'POST', {
+        source_branch: branch, target_branch: 'main', title: 'External contribution',
+      }, tokens.dev);
+    },
+    async assignMr(id: number, iid: number, userId: number) {
+      await api.request(mr(id, iid), 'PUT', { assignee_ids: [userId] }, tokens.dev);
+    },
+    listMrNotes(id: number, iid: number) { return api.json<Note[]>(mr(id, iid) + '/notes?per_page=100'); },
+    openDiscussion(id: number, iid: number, body: string, position?: InlinePosition) {
+      return api.json<Discussion>(mr(id, iid) + '/discussions', 'POST', { body, position }, tokens.dev);
+    },
+    getDiscussion(id: number, iid: number, discussion: string) {
+      return api.json<Discussion>(mr(id, iid) + '/discussions/' + encodeURIComponent(discussion));
     },
     async mergeMergeRequest(id: number, iid: number) {
       const path = project(id) + '/merge_requests/' + iid + '/merge';
@@ -97,6 +121,10 @@ export interface E2EGitLabDriver extends ReturnType<typeof projectActions> {
   readonly devUsername: string;
   readonly sreUsername: string;
   readonly podHost: string;
+  readonly synthetic?: {
+    failPipeline(project: number, iid: number, botId: number): Promise<number>;
+    failDeployment(project: number): Promise<void>;
+  };
   readonly membershipChecks?: string[];
   detentPublicUrl(port: number): string;
   ensureUsers(): Promise<void>;

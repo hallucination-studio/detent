@@ -3,7 +3,8 @@ import { z } from 'zod';
 import buffer from 'node:buffer';
 import { redactGitUrl } from '../gitlab/client.js';
 import type { AppConfig } from '../config.js';
-import type { IssueSessionRow } from '../types.js';
+import { formatInboxMessages } from '../orchestrator/turn-runtime.js';
+import type { IssueSessionRow, SessionInboxRow } from '../types.js';
 import type { TurnSandbox } from '../workspace/ephemeral-sandbox.js';
 import { schemas, type ToolName, type WorkspaceTools } from '../workspace/mcp-tools.js';
 import type { PermissionGate } from './permission-gate.js';
@@ -14,6 +15,8 @@ const textDelta = z.object({
 });
 export interface TurnInput {
   session: IssueSessionRow;
+  allowedWorkspaceTools?: readonly ToolName[];
+  drainInbox?: () => Promise<SessionInboxRow[]>;
   sandbox: TurnSandbox;
   resume: boolean;
   prompt: string;
@@ -30,7 +33,7 @@ export interface ClaudeRunner {
 export class SdkClaudeRunner implements ClaudeRunner {
   constructor(private config: AppConfig) {}
   async run(t: TurnInput) {
-    const { session, sandbox, gate } = t;
+    const { session, sandbox, gate, drainInbox } = t;
     const id = session.claudeSessionId!;
     const canUseTool = async (name: string, input: Record<string, unknown>) => {
       const label = redactGitUrl(name + (typeof input.command === 'string' ? ' ' + input.command : ''), this.config.jevApiKey)
@@ -57,9 +60,9 @@ export class SdkClaudeRunner implements ClaudeRunner {
     const server = createSdkMcpServer({
       name: 'detent',
       tools: [
-        ...Object.entries(schemas).map(([name, schema]) =>
-          tool(name, 'GitLab workspace: ' + name, schema, async (input) =>
-            result(await invoke(name as ToolName, input)),
+        ...(t.allowedWorkspaceTools ?? Object.keys(schemas) as ToolName[]).map(name =>
+          tool(name, 'GitLab workspace: ' + name, schemas[name], async (input) =>
+            result(await invoke(name, input)),
           ),
         ),
         ...Array.from(gate.extensionTools, ([id, extension]) =>
@@ -70,7 +73,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
         ),
         tool(
           'AskUserQuestion',
-          'Ask the GitLab Issue author a question',
+          'Ask a question on GitLab',
           { questions: z.array(z.object({ question: z.string() })).min(1) },
           async (input) => {
             const decision = await canUseTool('AskUserQuestion', input);
@@ -103,6 +106,12 @@ export class SdkClaudeRunner implements ClaudeRunner {
       const messages = query({
         prompt: t.prompt,
         options: {
+          hooks: drainInbox && { PostToolUse: [{ hooks: [async () => {
+            const items = await drainInbox();
+            return items.length ? { hookSpecificOutput: {
+              hookEventName: 'PostToolUse', additionalContext: formatInboxMessages(items, this.config.jevApiKey),
+            } } : {};
+          }] }] },
           stderr: (chunk) => {
             diagnostic = (diagnostic + chunk).slice(-2000);
           },

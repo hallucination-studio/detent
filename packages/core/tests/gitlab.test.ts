@@ -1,5 +1,6 @@
 import { it, expect, vi } from 'vitest';
-import { parseNoteIntent, parseEmojiIntent } from '../src/gitlab/command-parser.js';
+import { createMrChannel } from '../src/orchestrator/channel.js';
+import { stripBotMention, hasBotMention, parseNoteIntent, parseEmojiIntent } from '../src/gitlab/command-parser.js';
 import { GitLabClient } from '../src/gitlab/client.js';
 import {
   escapeTableCell,
@@ -20,7 +21,9 @@ it('filters bot and unsupported events before dispatching validated webhook data
   });
   try {
     expect((await post({ object_kind: 'issue', user: { id: 99 } })).statusCode).toBe(200);
-    expect((await post({ object_kind: 'push' })).statusCode).toBe(200);
+    const unhandled = await post({ object_kind: 'push' });
+    expect(unhandled.statusCode).toBe(200);
+    expect(unhandled.json()).toEqual({ ignored: true });
     expect((await post({ object_kind: 'pipeline' })).statusCode).toBe(400);
     expect(submit).not.toHaveBeenCalled();
     const event = { object_kind: 'pipeline', project: { id: 1 }, object_attributes: { id: 2, ref: 'main', status: 'success' } };
@@ -180,4 +183,94 @@ it('renders numbered questions, fenced commands and escaped fallback tool inputs
   expect(escapeTableCell('prod`|`svc', 'code')).toBe('`` prod`\\|`svc ``');
   expect(card({ args: ['```'] })).toContain('````json');
   expect(card({})).toContain('```json\n{}\n```');
+});
+
+it('recognizes standalone mentions outside code, quotes and email addresses', () => {
+  const examples = ['`@bot`', '```sh\necho @bot\n```', '  > @bot /abort', 'dev@bot.com', 'x+@bot',
+    '@bot-dev', '@bot.example', '@bot_2'];
+  for (const text of examples) {
+    expect(hasBotMention(text, 'bot')).toBe(false);
+    expect(stripBotMention(text, 'bot')).toBe(text.trim());
+  }
+  expect(hasBotMention('(@BoT)', 'bot')).toBe(true);
+  expect(stripBotMention('@Bot /abort', 'bot')).toBe('/abort');
+  expect(hasBotMention('@bot')).toBe(false);
+  expect(parseNoteIntent({ ...actor, sessionStatus: 'CODING', noteBody: '@BOT /abort', botUsername: 'bot' }).type).toBe('ABORT');
+  for (const text of ['> @bot /abort', '`@bot /abort`', '@other /abort'])
+    expect(parseNoteIntent({ ...actor, sessionStatus: 'CODING', noteBody: text, botUsername: 'bot' }).type).toBe('PROMPT');
+});
+
+it('accepts bot-triggered CI and deployment events but filters bot pushes, tags and releases', async () => {
+  const submit = vi.fn();
+  const app = createWebhookApp(loadConfig({ GITLAB_WEBHOOK_SECRET: 'test' }), { isBotUser: id => id === 99 },
+    submit, () => ({ key: 'ci', handle: vi.fn() }));
+  const post = (payload: object) => app.inject({ method: 'POST', url: '/webhooks/gitlab',
+    headers: { 'x-gitlab-token': 'test' }, payload });
+  try {
+    for (const kind of ['pipeline', 'build', 'deployment'])
+      expect((await post({ object_kind: kind, user: { id: 99 }, project: { id: 7 },
+        object_attributes: { id: 5, ref: 'main', status: 'failed' } })).statusCode).toBe(202);
+    for (const kind of ['push', 'tag_push', 'release', 'merge_request'])
+      expect((await post({ object_kind: kind, user_id: 99 })).json()).toEqual({ ignored: true });
+    expect(submit).toHaveBeenCalledTimes(3);
+  } finally {
+    await app.close();
+  }
+});
+
+it('uses MR and discussion endpoints and redacts all note writes', async () => {
+  const calls: { path: string; method?: string; body?: string }[] = [];
+  const client = new GitLabClient(loadConfig({ JEV_API_KEY: 'example-secret' }), async (url, init) => {
+    calls.push({ path: new URL(String(url)).pathname, method: init?.method, body: init?.body?.toString() });
+    if (new URL(String(url)).pathname.endsWith('/discussions')) return Response.json([{ id: 'thread', notes: [{
+      id: 5, body: 'review', type: 'DiffNote', resolvable: true, resolved: false,
+      position: { old_path: 'a.ts', new_path: 'b.ts', old_line: null, new_line: 8 },
+    }] }]);
+    return Response.json(init?.method === 'GET' ? [] : { id: 4 });
+  });
+  const mr = createMrChannel(client, 2, 3);
+  const thread = createMrChannel(client, 2, 3, 'a/b');
+  const note = 'example-secret\n/close';
+  for (const channel of [mr, thread]) {
+    expect(channel.approvalProjectId).toBe(2);
+    await channel.createNote(note);
+    await channel.updateNote(4, note);
+    await channel.syncStatusLabel('DONE');
+  }
+  await client.createCommitComment(2, 'abc', note);
+  await client.createIssue(2, { title: note, description: note, labels: ['alert'] });
+  await client.createMergeRequest(2, { source_branch: 'feature', target_branch: 'main', title: note, description: note, assignee_ids: [42] });
+  for (const call of calls) {
+    expect(call.body).not.toContain('example-secret');
+    expect(Object.values(JSON.parse(call.body!))).toContain('***\n\\/close');
+  }
+  expect(JSON.parse(calls.at(-1)!.body!).assignee_ids).toEqual([42]);
+  await client.getMergeRequest(2, 3);
+  await client.listOpenMergeRequestsByBranch(2, 'feature');
+  await client.listMergeRequestDiffs(2, 3);
+  const [discussion] = await client.listMergeRequestDiscussions(2, 3);
+  const inlineNote = discussion.notes.find(note => note.type === 'DiffNote' && note.resolvable && !note.resolved);
+  expect(inlineNote?.position).toEqual({ old_path: 'a.ts', new_path: 'b.ts', old_line: null, new_line: 8 });
+  expect(calls.map(c => c.path.replace('/api/v4/projects/2/', ''))).toEqual([
+    'merge_requests/3/notes', 'merge_requests/3/notes/4', 'merge_requests/3/discussions/a%2Fb/notes',
+    'merge_requests/3/discussions/a%2Fb/notes/4', 'repository/commits/abc/comments', 'issues', 'merge_requests',
+    'merge_requests/3', 'merge_requests', 'merge_requests/3/diffs', 'merge_requests/3/discussions',
+  ]);
+});
+
+it('reads job traces only for the source branch or a pipeline belonging to the MR', async () => {
+  const http = vi.fn();
+  const client = new GitLabClient(loadConfig({ JEV_API_KEY: 'test-secret' }), http);
+  const mr = { iid: 4, source_branch: 'feature', source_project_id: 3, target_project_id: 2, target_branch: 'main',
+    state: 'opened' as const, title: 'change', web_url: '', description: null };
+  await expect(client.getJobTrace(7, 1, mr)).rejects.toThrow('outside');
+  expect(http).not.toHaveBeenCalled();
+  http.mockResolvedValueOnce(Response.json({ pipeline: { id: 11, ref: 'feature' } })).mockResolvedValueOnce(new Response('test-secret'));
+  expect(await client.getJobTrace(3, 1, mr)).toBe('***');
+  http.mockResolvedValueOnce(Response.json({ pipeline: { id: 12, ref: 'refs/merge-requests/4/head' } }))
+    .mockResolvedValueOnce(Response.json([{ id: 12, project_id: 2 }])).mockResolvedValueOnce(new Response('job output'));
+  expect(await client.getJobTrace(2, 2, mr)).toBe('job output');
+  http.mockResolvedValueOnce(Response.json({ pipeline: { id: 13, ref: 'main' } })).mockResolvedValueOnce(Response.json([{ id: 12 }]));
+  await expect(client.getJobTrace(2, 3, mr)).rejects.toThrow('outside');
+  expect(http.mock.calls.filter(([url]) => url.endsWith('/trace'))).toHaveLength(2);
 });

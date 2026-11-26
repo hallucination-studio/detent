@@ -6,7 +6,7 @@ import { createDeliveryApp, loadDeliveryConfig, type JumpServerClient } from '..
 
 // Exercise real app composition and HTTP routing with only the external I/O replaced.
 const { pool, createPool } = vi.hoisted(() => {
-  const pool = { query: vi.fn(), execute: vi.fn(), end: vi.fn() };
+  const pool = { query: vi.fn().mockResolvedValue([[], []]), execute: vi.fn(), end: vi.fn() };
   return { pool, createPool: vi.fn(() => pool) };
 });
 vi.mock('@detent/core', async original => {
@@ -16,7 +16,8 @@ vi.mock('@detent/core', async original => {
 vi.mock('mysql2/promise', () => ({ default: { createPool } }));
 
 it('dispatches an authenticated extension event with access to the core orchestrator', async () => {
-  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ id: 99, username: 'bot' })));
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => url.includes('/repository/files/')
+    ? new Response(null, { status: 404 }) : Response.json({ id: 99, username: 'bot' })));
   const handle = vi.fn(async () => {});
   const matchWebhookEvent = vi.fn<NonNullable<DetentExtensions['matchWebhookEvent']>>(
     event => event.object_kind === 'sample' ? { key: 'sample', handle } : null,
@@ -40,7 +41,7 @@ it('dispatches an authenticated extension event with access to the core orchestr
     expect(matchWebhookEvent).not.toHaveBeenCalled();
     expect((await post(event)).statusCode).toBe(202);
     expect(matchWebhookEvent).toHaveBeenCalledWith(event);
-    expect((await post({ ...event, object_kind: 'unhandled' })).json()).toEqual({ ignored: true });
+    expect((await post({ ...event, object_kind: 'unhandled' })).statusCode).toBe(202);
     pool.query.mockResolvedValue([[], []]);
     const merge = { ...event, object_kind: 'merge_request', object_attributes: { action: 'merge', iid: 8 } };
     expect((await post(merge)).statusCode).toBe(202);

@@ -3,27 +3,27 @@
     {
       "path": "packages/core/src/db/**/*.ts",
       "merge_system_rule": true,
-      "rule": "Detent Core MySQL & Repository 架构红线：\n1. packages/core 零业务污染：严禁出现 JumpServer、Ansible 等具体交付业务表或业务字段。\n2. issue_sessions 主表严禁存整份 JSONL 大字段（LONGTEXT）或死绑定单一 branch_name / worktree_path / mr_iid，Worktree 与 MR 必须保持 1:N 独立关联表。\n3. session_messages 必须纯增量追加（INSERT IGNORE 批量写入），绝不覆写历史消息。\n4. 严禁为普通只读 SELECT 查询包裹 SELECT ... FOR UPDATE 事务锁。\n5. 严禁在 src/ 生产目录下放置 InMemory* 测试假实现（应放在 tests/）。\n6. 读取 JSON 列（如 tool_input）需兼容对象与字符串两种驱动返回格式。"
+      "rule": "Detent Core MySQL & Repository 架构红线：\n1. packages/core 零业务污染：严禁出现 JumpServer、Ansible 等具体交付业务表或业务字段。\n2. issue_sessions 主表严禁存整份 JSONL 大字段（LONGTEXT）或死绑定单一 branch_name / worktree_path / mr_iid，Worktree 与 MR 必须保持 1:N 独立关联表。\n3. session_messages 必须纯增量追加（INSERT IGNORE 批量写入），绝不覆写历史消息。\n4. 严禁为普通只读 SELECT 查询包裹 SELECT ... FOR UPDATE 事务锁。\n5. 严禁在 src/ 生产目录下放置 InMemory* 测试假实现（应放在 tests/）。\n6. 读取 JSON 列（如 tool_input）需兼容对象与字符串两种驱动返回格式。\n7. Issue/MR 唯一键包含 session_kind；session_inbox 按会话与事件去重，按 ID 短事务消费。Watchdog 的两个候选扫描均为只读。"
     },
     {
       "path": "packages/core/src/orchestrator/**/*.ts",
       "merge_system_rule": true,
-      "rule": "Detent Core Session 编排器架构红线：\n1. Pod 必须 100% 无状态：每轮创建的临时沙箱目录必须在 finally 块中强制销毁（rm -rf）。\n2. 租约心跳定时器严禁高频空转（上限至少 15s），跨 Pod 等锁必须检查会话状态并在原 Pod 热唤醒后立即早退，禁止无限死等。\n3. PLAN 审批通过或拒绝时，严禁把整份方案 JSON 序列化塞回 Prompt 浪费 Token。\n4. resumeSession 与普通轮次共用租约、持久化与清理路径。审批按当前 profile 校验，重置与中止沿用 GitLab 权限；packages/core 严禁出现业务耦合逻辑。\n5. 轮次与审批授权的 profile 解析均传入 session、repo 及读取 Issue 和成员权限的 GitLab 接口。\n6. TurnProfile.blockedMessage 必须在创建沙箱或调用 Claude 之前发回 Issue 并置 IDLE。\n7. detent_close_issue 仅登记本轮请求；成功结束后复核关单守卫、归档 Worktree、刷新最终评论，再关闭 Issue 并置 DONE。失败、中止和冷挂起均不得提交关单。\n8. 审批解析必须使用 purpose=approval。/use 在租约内作废待审单并持久化 Plan 重置，随后才可替换 Agent 标签。"
+      "rule": "Detent Core Session 编排器架构红线：\n1. Pod 必须 100% 无状态：每轮创建的临时沙箱目录必须在 finally 块中强制销毁（rm -rf）。\n2. 租约心跳定时器严禁高频空转（上限至少 15s），跨 Pod 等锁必须检查会话状态并在原 Pod 热唤醒后立即早退，禁止无限死等。\n3. PLAN 审批通过或拒绝时，严禁把整份方案 JSON 序列化塞回 Prompt 浪费 Token。\n4. resumeSession 与普通轮次共用租约、持久化与清理路径。审批按当前 profile 校验，重置与中止沿用 GitLab 权限；packages/core 严禁出现业务耦合逻辑。\n5. 轮次与审批授权的 profile 解析均传入 session、repo 及读取 Issue 和成员权限的 GitLab 接口。\n6. TurnProfile.blockedMessage 必须在创建沙箱或调用 Claude 之前发回 Issue 并置 IDLE。\n7. detent_close_issue 仅登记本轮请求；成功结束后复核关单守卫、归档 Worktree、刷新最终评论，再关闭 Issue 并置 DONE。失败、中止和冷挂起均不得提交关单。\n8. 审批解析必须使用 purpose=approval。/use 在租约内作废待审单并持久化 Plan 重置，随后才可替换 Agent 标签。\n9. 忙轮次接收普通指示时入库，轮末在同一租约下接续。Watchdog 默认 30s 加抖动，下限 15s，0 关闭。恢复前验证扫描到的过期租约，遵循人工审批状态。\n10. MR 独立于 Issue 路由。人为接单、评论、审批须校验目标项目权限。MR 只写评论与数据库状态。流水线先更新关联记录，修复按当前 SHA、策略、幂等 ID 与额度执行。"
     },
     {
       "path": "packages/core/src/workspace/**/*.ts",
       "merge_system_rule": true,
-      "rule": "Detent Core 无状态沙箱与多项目工具集红线：\n1. 单轮临时目录必须受限在 ephemeralRoot 内且使用完立即销毁；跨 Pod 还原需支持远端分支浅克隆 + uncommitted_diff 二进制补丁应用。\n2. Git 凭证必须通过环境变量临时注入（GIT_CONFIG_KEY_0 extraHeader），严禁将明文 Token 写入磁盘 .git/config 或暴露在报错/日志中。\n3. Plan 模式必须严格只读（禁止新建远程分支、推送提交、创建 MR 或归档 Worktree）。"
+      "rule": "Detent Core 无状态沙箱与多项目工具集红线：\n1. 单轮临时目录必须受限在 ephemeralRoot 内且使用完立即销毁；跨 Pod 还原需支持远端分支浅克隆 + uncommitted_diff 二进制补丁应用。\n2. Git 凭证必须通过环境变量临时注入（GIT_CONFIG_KEY_0 extraHeader），严禁将明文 Token 写入磁盘 .git/config 或暴露在报错/日志中。\n3. Plan 模式必须严格只读（禁止新建远程分支、推送提交、创建 MR 或归档 Worktree）。\n4. MR 只注册限定的 CI、提交推送、差异、讨论和合并工具。推送复核源目录与分支。跨 Fork 写入须有源项目 Developer 权限。"
     },
     {
       "path": "packages/core/src/claude/**/*.ts",
       "merge_system_rule": true,
-      "rule": "Detent Core Claude 运行时与权限门禁红线：\n1. .jsonl 增量水合与落库必须只追加 seq > lastMessageSeq 的新增行，严禁全量重传。\n2. 权限边界：readonly 在 plan/coding、coding_auto 在 coding 均须由 preflight 校验 guard 后放行，每次调用执行一次；always_approve 在 plan 拒绝（只读流程的关单审批由专用 guard 校验）。审批工具必须先执行 guard() 硬校验再弹出审批卡片，放行执行前再次校验 guard()。\n3. 审批热挂起兜底轮询 MySQL 间隔 >= 2000ms，暂停前必须先刷盘 checkpoint。\n4. 路径校验必须防目录穿越、越界/悬空符号链接及保护 .git / .claude / .mcp.json；严禁将宿主机密钥透传给子进程环境。\n5. 禁止在 PreToolUse 与 canUseTool 中重复执行同一套 preflight 权限检查。\n6. 热审批与冷恢复放行时，执行前 guard 与 execute 必须取得该调用对应的 approvalId。\n7. readonly 角色使用 SDK default 模式，禁用 Edit/Write，在 disableBash 时禁用 Bash；PermissionGate 与 WorkspaceTools 始终强制工作区只读。\n8. Hub 根目录的 CLAUDE.md、agents/、skills/ 与 workflows/ 必须受写保护，路径检查覆盖符号链接。"
+      "rule": "Detent Core Claude 运行时与权限门禁红线：\n1. .jsonl 增量水合与落库必须只追加 seq > lastMessageSeq 的新增行，严禁全量重传。\n2. 权限边界：readonly 在 plan/coding、coding_auto 在 coding 均须由 preflight 校验 guard 后放行，每次调用执行一次；always_approve 在 plan 拒绝（只读流程的关单审批由专用 guard 校验）。审批工具必须先执行 guard() 硬校验再弹出审批卡片，放行执行前再次校验 guard()。\n3. 审批热挂起兜底轮询 MySQL 间隔 >= 2000ms，暂停前必须先刷盘 checkpoint。\n4. 路径校验必须防目录穿越、越界/悬空符号链接及保护 .git / .claude / .mcp.json；严禁将宿主机密钥透传给子进程环境。\n5. 禁止在 PreToolUse 与 canUseTool 中重复执行同一套 preflight 权限检查。\n6. 热审批与冷恢复放行时，执行前 guard 与 execute 必须取得该调用对应的 approvalId。\n7. readonly 角色使用 SDK default 模式，禁用 Edit/Write，在 disableBash 时禁用 Bash；PermissionGate 与 WorkspaceTools 始终强制工作区只读。\n8. Hub 根目录的 CLAUDE.md、events.json、agents/、skills/ 与 workflows/ 必须受写保护，路径检查覆盖符号链接。"
     },
     {
       "path": "packages/core/src/gitlab/**/*.ts",
       "merge_system_rule": true,
-      "rule": "Detent Core GitLab CE v18.3.0 接入层红线：\n1. Webhook 入口必须使用常量时间比对校验 X-Gitlab-Token，并在第一时间调用 isBotUser 过滤 Bot 自身事件防自环。\n2. 严禁引入 MySQL 高频空转轮询收件箱表；内存 WebhookQueue 必须支持停服中断（AbortController）与最大等待上限。\n3. 所有写入 Issue 评论与错误日志的文本必须经过 redactGitUrl 脱敏。\n4. 扩展仅在 HTTP 入口同步匹配，业务处理必须进入同一 WebhookQueue，复用去重、退避与停服 drain。"
+      "rule": "Detent Core GitLab CE v18.3.0 接入层红线：\n1. Webhook 入口必须使用常量时间比对校验 X-Gitlab-Token，并在第一时间调用 isBotUser 过滤 Bot 自身人为操作防自环，pipeline/build/deployment 状态变化豁免。\n2. 严禁引入 MySQL 高频空转轮询收件箱表；内存 WebhookQueue 必须支持停服中断（AbortController）与最大等待上限。\n3. GitLab 评论经 renderNote(body, jevApiKey) 脱敏并中和 quick action，错误日志同样脱敏。\n4. 扩展仅在 HTTP 入口同步匹配，业务处理必须进入同一 WebhookQueue，复用去重、退避与停服 drain。\n5. 扩展匹配优先，Hub 规则的加载、评估及首条命中规则的处置均在 WebhookQueue 内执行。人为事件带有 actor ID 且处置为 run 时，创建 Issue 或唤醒会话前须校验来源项目的审批权限，缺少项目 ID 时校验 Hub 权限。\n6. merge_request 合并同时入队 Core 收尾与匹配的扩展，扩展事件 ID 追加 :ext，分别使用 MR 会话键与扩展键。"
     },
     {
       "path": "packages/delivery/src/**/*.ts",
@@ -43,7 +43,7 @@
     {
       "path": "scripts/e2e/**/*.ts",
       "merge_system_rule": true,
-      "rule": "Stage 9 双目标验收：npm run e2e:offline 与 E2E_GITLAB_URL=... npm run e2e:gitlab 必须共用同一套场景、真实 Claude Code 进程及本地 Mock Anthropic。V5 验收须覆盖 Jev 澄清与标签路由、Skill 读取、外部 MCP 生产审批和脱敏，并保留 workflows/hotfix.md 的实时兼容验证。真实 GitLab 使用独立命名空间、不同权限用户的 PAT 和真实 Webhook。按 manual / auto / approve 校验 V4 闭环：detent_close_issue 只登记请求，轮次结束后复核方案、其他待审项、打开的 MR 和 canCloseIssue（有执行记录时最新状态须为 SUCCESS）。从 GitLab 和 MySQL 断言 closed、claude::done、DONE 与 Worktree 归档。"
+      "rule": "Stage 9–12 双目标验收：npm run e2e:offline 与 E2E_GITLAB_URL=... npm run e2e:gitlab 必须共用同一套场景、真实 Claude Code 进程及本地 Mock Anthropic。V5 验收须覆盖 Jev 澄清与标签路由、Skill 读取、外部 MCP 生产审批和脱敏，并保留 workflows/hotfix.md 的实时兼容验证。真实 GitLab 使用独立命名空间、不同权限用户的 PAT 和真实 Webhook。按 manual / auto / approve 校验 V4 闭环：detent_close_issue 只登记请求，轮次结束后复核方案、其他待审项、打开的 MR 和 canCloseIssue（有执行记录时最新状态须为 SUCCESS）。从 GitLab 和 MySQL 断言 closed、claude::done、DONE 与 Worktree 归档。V6 两个目标均检查独立 MR 会话、分配与单次提及、源分支提交、原讨论串回复及折叠轨迹。仅离线驱动提供合成的 Bot 流水线与部署失败事件。验证 Hub 策略即时切换、通知不调用模型、PostToolUse 在同一轮消费指示并影响提交，以及部署告警 Issue。"
     }
   ]
 }

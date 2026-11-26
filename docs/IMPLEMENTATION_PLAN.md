@@ -1,6 +1,6 @@
-# Detent 演进实施与验收计划（V2：双包分层与受治理 AI 变更交付中枢）
+# Detent V2–V6 演进实施与验收计划
 
-本文档承接已验收完成的 **V1 基线**（commit `1498aa4`，包含无状态 Pod 底座、纯增量 MySQL 仓储、GitLab CE 接入、双层审批、25 项测试及 `pre-commit` + `knip` + `OpenCodeReview` 质量门禁），定义 **V2：双包 Monorepo 拆分与面向生产交付的“受治理 AI 变更交付中枢（`@detent/core` + `@detent/delivery`）”** 的 **4 个推进阶段（Stages）**。
+本文档承接已验收完成的 **V1 基线**（commit `1498aa4`，包含无状态 Pod 底座、纯增量 MySQL 仓储、GitLab CE 接入、双层审批、25 项测试及 `pre-commit` + `knip` + `OpenCodeReview` 质量门禁），定义 **V2：双包 Monorepo 拆分与面向生产交付的“受治理 AI 变更交付中枢（`@detent/core` + `@detent/delivery`）”** 的前四个阶段，并记录后续演进至 Stage 12 的验收标准。
 
 ---
 
@@ -217,3 +217,24 @@ Stage 6 已实现。使用 `loadHubWorkflows` 和 `matchHubWorkflow` 解析当�
 ### Jev 风控验收
 
 使用回环百炼 Decision Model API 验证 Bash 静态放行、硬门禁、语义放行和失败回退。代码交付在计划获批后执行复合命令，MySQL 中 Bash 审批行数为零；审计通过只读账号执行 `ss -lntp`。单测覆盖超时、响应校验、置信度及密钥隔离。生产执行、发版、方案和审批关单继续验证人工身份。
+
+## Stage 10 · V6 控制面基础
+
+- 初始化时升级原有 Issue 唯一键，同号 Issue、MR 各自独立。唯一新增表为 `session_inbox`。
+- 验收同一事件重复投递、并发消费、PostToolUse 热追加、轮末接续、过期租约竞争和恢复耗尽。
+- 验收 Bot 触发的 CI 事件、受保护的 Markdown 提及、Hub 事件策略多值匹配、队列内 Jev 回退、人为事件运行权限、沙箱策略文件写保护、通知脱敏及 MR 讨论串路由。
+- `npm run check` 同时覆盖 Core 和 Delivery。Stage 11 接入 MR 独立编排与 MR 工具。
+
+## Stage 11 · 独立 MR 编排与工具
+
+- 使用 Stage 10 的表和租约处理 MR 接单、评论、表情审批、主动恢复与归档。
+- MR 工具按当前源工作树、分支与 CI 限定范围。测试用真实临时 Git 远端验证浅克隆、合并冲突、Fork 只读，以及冷恢复后推送的合并历史。
+- 流水线按 Hub 规则处置，检查提交 SHA、尝试次数与事件幂等性。测试验证关联 Issue 通知及独立的合并事件队列。
+- 验收命令为 `npm run check` 和 `npm run build`。真实进程验收见 Stage 12。
+
+## Stage 12 · 双目标端到端验收
+
+- 共用真实 Claude Code、MySQL 8.0、构建后的 Delivery 服务及六个原有 SOP 场景。Issue 创建的双 MR 自动分配给 Bot，行内修复在源分支生成提交并回复原讨论串。两次人工合并后检查两个 MR 会话的 `DONE`，以及 Hub Issue 的关闭状态和 `claude::done`。
+- 外部 MR 通过单次提及和后续分配分别触发。离线驱动发送 Bot 用户的失败流水线，检查任务日志、独立修复、Hub Issue 评论不变、在线策略从 `notify` 切换到 `run`，以及 PostToolUse 消费轮中指示并影响提交。仓库部署失败应生成带来源信息的 Hub 告警 Issue。
+- `npm run e2e:offline` 包含合成 CI 和部署事件；`e2e:gitlab` 使用真实 GitLab 产生的 Webhook。质量门禁为 `npm run check`、`npm run build` 与 `git diff --check`。
+- V6 新增 `MR_MAX_AUTO_FIX_ATTEMPTS`、`WATCHDOG_INTERVAL_MS` 和 `WATCHDOG_MAX_RECOVERIES`。默认值、范围和 MySQL 8.0 升级 SQL 见[设计文档](DESIGN.md#v6-mysql-upgrade)。

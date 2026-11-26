@@ -4,7 +4,7 @@ Detent 的名称来自飞机油门杆上点火前的机械止动槽。受治理 
 
 > [!IMPORTANT]
 > **总体定位**：本项目采用 **双包分层架构（`@detent/core` + `@detent/delivery`）**，并在 V3 演进为 **“硬安全边界由代码兜底 + 软交付流程由 Hub 仓库 SOP 驱动 + 运维能力包可空可插拔”**：
-> 1. **`@detent/core`（通用基础架构包）**：将配置的 GitLab CE v18.3.0 **工作区仓库（Workspace Hub Repo）** 打造为 100% 无状态、多项目、纯增量 MySQL 持久化的 Claude Code 会话中枢（`1 GitLab Issue = 1 Claude Code Session`，解耦 `0..N` 个跨项目 Worktree 与 `0..N` 个 MR，支持双层审批、Hub Agent 与兼容 SOP 加载、可空能力包预检与通用 GitLab Release 工具）。**保持零业务耦合，可独立复用或开源。**
+> 1. **`@detent/core`（通用基础架构包）**：将配置的 GitLab CE v18.3.0 **工作区仓库（Workspace Hub Repo）** 打造为 100% 无状态、多项目、纯增量 MySQL 持久化的 Claude Code 会话中枢（Hub Issue 与目标 MR 各自拥有独立 Claude Code Session，解耦 `0..N` 个跨项目 Worktree 与 `0..N` 个 MR，支持双层审批、Hub Agent 与兼容 SOP 加载、可空能力包预检与通用 GitLab Release 工具）。**保持零业务耦合，可独立复用或开源。**
 > 2. **`@detent/delivery`（受治理 AI 变更交付中枢拓展模块）**：基于 `@detent/core` 的标准扩展点构建，将 JumpServer + Ansible 封装为**可选/可空能力包（`jumpserver`）**，并随 Hub 模板预置开箱即用的标准交付 SOP（`release` / `env-change` / `code-delivery` / `audit`）。客户可直接编辑 Hub 仓库 Markdown 定制流程，无需 JumpServer 也可独立运行发版与代码交付，或接入自有执行 MCP。
 
 ---
@@ -47,7 +47,7 @@ flowchart TD
     subgraph GitLab["GitLab CE v18.3.0"]
         Hub_Repo["工作区仓库 (Workspace Hub Repo)<br/>Issues = 交付工单 / Claude Sessions<br/>存放 CLAUDE.md、Agent 定义与 Skills"]
         Target_Repos["业务配置与 Ansible 脚本仓库群<br/>(ansible-infra / k8s-config / app-repo...)<br/>承载代码版本 / 人工 Review & Merge / Pipelines"]
-        GL_Webhook["Webhooks<br/>(Hub Issue/Note/Emoji + 目标库 MR Merge & Pipeline)"]
+        GL_Webhook["Webhooks<br/>(Hub Issue/Note/Emoji + 目标库 MR/Note/Emoji/Pipeline/Deployment)"]
         GL_API["GitLab REST API v4"]
     end
 
@@ -72,7 +72,7 @@ flowchart TD
     subgraph Infra["外部受控执行面与唯一持久化存储"]
         JMS_RO["JumpServer 堡垒机 (只读账号)<br/>环境现状巡检 & 变更后核验"]
         JMS_Job["JumpServer 任务中心 (执行账号)<br/>受控运行已合入的 Ansible Playbook + 录像审计"]
-        MySQL[("MySQL 8.0<br/>Core 5 张表 (纯增量消息 / Worktree / MR / 审批)<br/>+ delivery_executions (交付执行审计表)")]
+        MySQL[("MySQL 8.0<br/>Core 6 张表 (会话 / 纯增量消息 / Worktree / MR / 审批 / 收件箱)<br/>+ delivery_executions (交付执行审计表)")]
     end
 
     Hub_Repo --> GL_Webhook
@@ -168,7 +168,7 @@ export interface DetentExtensionTool<TSchema extends z.ZodRawShape = z.ZodRawSha
   - 取得租约并重读会话后先执行 `beforeRun`。返回 `false` 时直接释放租约。返回 `true` 或省略回调时继续检查待审状态，再设置权限模式并启动轮次。
   - 租约占用时抛出 `SessionBusy`，等待方案或工具审批时保留待审状态并拒绝续跑。
   - 受分布式租约锁保护的公开入口，供业务模块在收到外部事件（如目标仓库 **MR 被人工合并**、JumpServer 异步任务回调、告警触发）后唤醒对应的 Hub Issue Session。
-- 通过验签和 Bot 过滤的非内置事件交给同步匹配器 `matchWebhookEvent(event)` 校验。返回 `null` 时网关响应 `{ ignored: true }`。返回 `{ key, handle(orchestrator) }` 时，网关提交到与内置事件共用的 WebhookQueue 后即响应 202。队列按 eventId 去重，同一 key 串行，遇到 `SessionBusy` 退避重试。停服时中断退避并等待在途处理结束。
+- 通过验签和 Bot 过滤的非内置事件交给同步匹配器 `matchWebhookEvent(event)` 校验。返回 `null` 时，网关将事件提交到队列评估 Hub 策略并响应 202；未配置策略匹配器时响应 200 和 `{ ignored: true }`。返回 `{ key, handle(orchestrator) }` 时，网关提交到与内置事件共用的 WebhookQueue 后即响应 202。队列按 eventId 去重，同一 key 串行，遇到 `SessionBusy` 退避重试。停服时中断退避并等待在途处理结束。
 
 #### 扩展点 3：多 Agent 角色与审批人策略解析（`TurnProfileResolver`）
 轮次启动与审批授权均调用 `resolveTurnProfile({ session, repo, gitlab })`。`gitlab.getIssue(project, iid)` 提供 Issue 的 ID、IID、标题、描述、标签和状态，供扩展按标签选择角色。`gitlab.hasApprovalPermission(project, userId, minAccessLevel?)` 可用于复用项目成员权限检查。
@@ -290,11 +290,12 @@ Stage 4 的 `TurnProfileResolver` 在每轮和每次审批时从 GitLab 读取 H
 
 ## 四、 MySQL 8.0 数据模型增量演进
 
-在现有 `@detent/core` 5 张表的基础上，保持纯增量原则，仅做 **1 处小扩展 + 1 张交付审计表**：
+V6 使用六张 Core 表和一张 Delivery 审计表。交付审计关联会话、MR 与批准的工具执行。
 
 ```mermaid
 erDiagram
     ISSUE_SESSIONS ||--o{ SESSION_MESSAGES : "1:N 纯增量消息 (@detent/core)"
+    ISSUE_SESSIONS ||--o{ SESSION_INBOX : "1:N 轮中指示 (@detent/core)"
     ISSUE_SESSIONS ||--o{ SESSION_WORKTREES : "1:N 跨项目分支 (@detent/core)"
     ISSUE_SESSIONS ||--o{ SESSION_MERGE_REQUESTS : "1:N 跨项目 MR (@detent/core)"
     ISSUE_SESSIONS ||--o{ APPROVAL_REQUESTS : "1:N 方案/工具/执行审批 (@detent/core)"
@@ -500,3 +501,77 @@ Agent 通过 `requires: [harbor-sync]` 启用本包，工具以 `<包前缀>__<�
 ### 7.4 V5 确定性验收
 
 同一套 E2E 保留缺能力、跨库双 MR、在线更新发版 Agent、旧 `workflows/hotfix.md`、只读审计和跨 Pod 环境变更。在镜像同步场景中，Mock Jev 先以低置信度触发澄清。用户回复后，服务写回选定 Agent 的标签，真实 Claude Code 读取私有 Skill 并在 Plan 查询 Mock MCP。测试检查 Developer 批准 Plan、生产工具须 SRE 批准、同步成功后关闭工单，并确认 MCP 回显的 Bearer 凭证在进入模型结果及 Issue 评论前已脱敏。
+
+## 八、V6 控制面基础
+
+`issue_sessions` 以会话类型、项目 ID 和资源 IID 唯一标识 Issue 或 MR。旧数据升级为 Issue。主表增加自动修复次数、最近失败的流水线 ID 和恢复次数。MR 默认进入 CODING，使用 default 权限模式。创建 MR 时将已识别的 Bot 加入受理人。
+
+`session_inbox` 以 `(session_id, event_id)` 去重，按递增 ID 在短事务内消费。普通评论先入库再尝试取得租约。SDK 的 PostToolUse 读取当前会话的待处理评论。轮末若有新消息，在同一租约下创建下一轮沙箱。发布最终评论后，只有收件箱为空才结束正常轮次。等待审批的会话保留人工门禁。
+
+Watchdog 以无锁查询发现过期的活跃会话和遗留消息。抢占恢复租约时同时比对扫描到的到期时间。成功轮次清零恢复次数。次数用尽后会话进入 FAILED，旧的待处理消息标为 EXPIRED，GitLab 评论提示用户重新发送。定时器在 Fastify 就绪后启动，关闭时等待在途扫描结束。
+
+Hub 默认分支可提供如下 `events.json`。规则按顺序处理，`actionType` 指定处置，此时可用 `action` 匹配 GitLab 操作。省略 `actionType` 时，`action` 直接指定处置。过滤字段支持单个字符串或非空字符串数组，数组内任一值匹配即可。项目和分支支持 `*` 通配符。`semantic` 只向 Jev 发送简短摘要、提示与候选动作，故障时使用 `fallbackAction`，缺省为 notify。
+
+```json
+{
+  "version": 1,
+  "rules": [
+    { "event": "release", "action": "create", "actionType": "notify", "notifyTarget": "hub_issue" },
+    { "event": ["build", "deployment"], "project": "apps/*", "status": ["failed"], "branch": ["main", "release/*"], "action": "notify", "notifyTarget": "commit" }
+  ]
+}
+```
+
+内置 Issue 与流水线处理优先，已匹配的扩展继续拥有其事件。进入策略处理的事件由 WebhookQueue 加载并评估规则。通知按资源、提交或 Hub 告警 Issue 投递，再调用可选的 `onNotify`。资源缺少 Issue 或 MR 时优先使用提交，缺少提交时创建 Hub 告警 Issue。人为事件带有 actor ID 时，`run` 先校验其在来源项目的审批权限，缺少项目 ID 时校验 Hub 权限。通过后按常规运行流程处理。运行流程将摘要投递到关联的 Hub Issue；缺少关联时创建 Hub Issue，从 Plan 开始。
+
+### 8.1 独立 MR 工作轮次
+
+`MergeRequestOrchestrator` 通过目标项目与 MR IID 查找会话，接单后以 `default` 模式检出源分支。只有 Bot 新增为受理人的更新触发接单。未分配的 MR 通过显式提及请求单次协助。目标项目的成员权限适用于人为接单、评论和审批。评论的文件位置和讨论串 ID 随收件箱持久化。繁忙轮次通过 PostToolUse 读取新指示，回复发回对应讨论串。
+
+MR 轮次可用 Read、Glob、Grep、Edit、Write、Bash、AskUserQuestion，以及以下工具。Bash 复用静态命令与 Jev 风控。跨 Fork 写入要求 Bot 在源项目至少有 Developer 权限，缺少权限时通过 GitLab 评论提供建议。
+
+| 工具 | 作用域 |
+| --- | --- |
+| `detent_commit_and_push` | 当前 MR 工作树和源分支 |
+| `detent_get_pipeline_status`、`detent_get_pipeline_job_log` | MR 或源分支的 CI |
+| `detent_get_mr_diff`、`detent_list_mr_discussions` | 当前 MR 的脱敏差异与讨论串 |
+| `detent_sync_target_branch` | 在工作树中合入目标项目的目标分支，返回冲突文件 |
+
+每次失败流水线先更新关联 MR 记录，再检查 MR 状态、提交 SHA 和首条命中策略。缺省时自动修复已分配的 MR，向未分配 MR 关联的 Hub Issue 通知失败。自动修复额度与待处理消息在同一事务内持久化，达到上限后在 MR 和关联工单请求人工介入。成功流水线与有效用户评论重置额度。没有匹配 MR 的流水线依 Hub 策略通知或启动 Hub Issue。
+
+MR 完结时终止活跃轮次、作废审批、归档工作树并置 DONE。合并事件的扩展处理器使用独立队列键和事件 ID，关联 Hub Issue 可继续执行原流程。
+
+### V6 MySQL upgrade
+
+`initMySqlSchema` 在启动时创建缺失的表。V5 升级到 V6 时，新表及旧会话索引的变更对应以下 SQL。仅当 `SHOW INDEX FROM issue_sessions WHERE Key_name='hub_project_id'` 返回旧索引时执行第二条语句。已有会话的 `session_kind` 自动取 `issue`。
+
+```sql
+CREATE TABLE IF NOT EXISTS session_inbox (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  session_id CHAR(36) NOT NULL,
+  FOREIGN KEY (session_id) REFERENCES issue_sessions(id),
+  event_id VARCHAR(64) NOT NULL,
+  source_kind VARCHAR(32) NOT NULL,
+  sender_username VARCHAR(128),
+  discussion_id VARCHAR(128),
+  content MEDIUMTEXT NOT NULL,
+  status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  consumed_at DATETIME(3),
+  UNIQUE(session_id, event_id),
+  INDEX(session_id, status, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+ALTER TABLE issue_sessions DROP INDEX hub_project_id,
+  ADD session_kind VARCHAR(16) NOT NULL DEFAULT 'issue',
+  ADD auto_fix_attempts INT NOT NULL DEFAULT 0,
+  ADD last_failed_pipeline_id BIGINT NULL,
+  ADD recovery_attempts INT NOT NULL DEFAULT 0,
+  ADD UNIQUE KEY session_resource(session_kind, hub_project_id, hub_issue_iid);
+```
+
+`WATCHDOG_INTERVAL_MS` 默认为 30000，启用时至少 15000，设为 0 关闭。每个实例在基础间隔上加小于 10% 的随机抖动。`WATCHDOG_MAX_RECOVERIES` 默认为 1（0–5），`MR_MAX_AUTO_FIX_ATTEMPTS` 默认为 3（0–10），匹配规则中的 `maxAutoFixAttempts` 可覆盖该 MR 修复额度。
+
+### 8.2 Stage 12 验收
+
+Issue 和 MR 的工具调用均通过 NoteStreamer 写入折叠轨迹。双目标套件按真实源分支提交、原讨论串回复及 MySQL 会话终态验收。离线失败流水线使用 Bot 身份并提供真实 API 路径查询任务与日志。外部 MR 场景在模型返回下一次工具调用前等待评论进入收件箱，校验 PostToolUse 将评论中的随机标记传递到同一轮提交。部署失败按 Hub 策略创建带标签的告警 Issue。

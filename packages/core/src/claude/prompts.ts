@@ -1,3 +1,4 @@
+import type { LiveMr, MergeRequestDiscussion, MergeRequestNote } from '../gitlab/client.js';
 import type { IssueSessionRow, SessionWorktreeRow, SessionMergeRequestRow } from '../types.js';
 import { schemas } from '../workspace/mcp-tools.js';
 import { renderSummary } from '../gitlab/note-streamer.js';
@@ -27,4 +28,27 @@ export function buildSystemPrompt(
     ...Object.entries(schemas).map(([name, shape]) => name + ' (' + Object.keys(shape).join(', ') + ')'),
     renderSummary(trees, mrs),
   ].filter(Boolean).join('\n');
+}
+
+export function buildMrSystemPrompt(mr: LiveMr, tree: SessionWorktreeRow, readonly: boolean,
+  plan: boolean, pipeline: LiveMr['head_pipeline'], failedJobs: string[], discussions: MergeRequestDiscussion[]) {
+  return [
+    `GitLab MR ${mr.target_project_id}!${mr.iid} · ${mr.title}`, mr.description,
+    `${mr.source_branch} -> ${mr.target_branch} · draft=${!!mr.draft} · has_conflicts=${mr.has_conflicts ?? 'unknown'} · ${mr.detailed_merge_status ?? ''}`,
+    `Active worktree: projects/${tree.directoryName}`,
+    pipeline ? `Pipeline #${pipeline.id} ${pipeline.status}. Failed jobs: ${failedJobs.join(', ') || 'none'}` : 'No pipeline.',
+    ...discussions.flatMap(thread => thread.notes.filter(n => n.resolvable && !n.resolved && !n.system)
+      .map(n => `Unresolved review: ${inlinePosition(n)}${n.body}`)),
+    readonly && 'Read-only fork. Post suggested fixes in the MR comments. You have no push permission.',
+    plan && permissionPrompt(false, 'plan'),
+    'Diagnose the root cause of failed CI, review requests or merge conflicts. On assignment investigate even without a specific request.',
+    'For casual teammate discussion acknowledge briefly or explain without making changes. Test requested fixes and push only to the MR source branch.',
+    'Keep replies concise and actionable. Never disclose internal tool names or credentials.',
+  ].filter(Boolean).join('\n');
+}
+
+export function inlinePosition(note: Pick<MergeRequestNote, 'type' | 'position'>) {
+  const p = note.position;
+  if (note.type !== 'DiffNote' || !p) return '';
+  return `${p.new_path ?? p.old_path}:${p.new_line ?? p.old_line ?? '?'} `;
 }

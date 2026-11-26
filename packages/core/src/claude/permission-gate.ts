@@ -11,8 +11,9 @@ import type { GitLabClient } from '../gitlab/client.js';
 import { renderNote, renderToolApprovalCard } from '../gitlab/note-streamer.js';
 import type { ApprovalRequestRow, IssueSessionRow } from '../types.js';
 import { isHubScopePath } from '../workspace/hub-paths.js';
-import { allowedInPlan, isWorkspaceTool } from '../workspace/mcp-tools.js';
+import { allowedInPlan, isWorkspaceTool, type ToolName } from '../workspace/mcp-tools.js';
 
+import type { SessionChannel } from '../orchestrator/channel.js';
 import { resolveApproval } from '../orchestrator/lifecycle.js';
 
 type Input = Record<string, unknown>;
@@ -65,7 +66,7 @@ function allowedPath(root: string, target: string, write: boolean) {
   if (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) return false;
   if (!write) return true;
   const parts = rel.toLowerCase().split(path.sep);
-  return !['claude.md', 'workflows', 'agents', 'skills'].includes(parts[0]) &&
+  return !isHubScopePath(rel) && !['claude.md', 'workflows'].includes(parts[0]) &&
     !parts.some(part => ['.git', '.claude', '.mcp.json'].includes(part));
 }
 
@@ -125,11 +126,13 @@ async function bashOperandsContained(command: string, root: string) {
   return true;
 }
 
-interface GateContext {
+type GateChannel = Pick<SessionChannel, 'createNote' | 'syncStatusLabel'>;
+type GateContext = ({ channel: GateChannel } |
+  { gitlab: Pick<GitLabClient, 'createIssueNote' | 'syncIssueStatusLabel'> }) & {
+  allowedWorkspaceTools?: readonly ToolName[];
   decision?: DecisionClient;
   config: AppConfig;
   repo: DetentRepository;
-  gitlab: Pick<GitLabClient, 'createIssueNote' | 'syncIssueStatusLabel'>;
   session: IssueSessionRow;
   workspaceRoot: string;
   checkpoint: () => Promise<void>;
@@ -146,9 +149,14 @@ export class PermissionGate {
   readonly extensionTools = new Map<string, AnyDetentExtensionTool>();
   readonly readonly: boolean;
   readonly disableBash: boolean;
+  private channel: GateChannel;
   private extensionContext: ExtensionToolContext;
   constructor(private ctx: GateContext) {
     const { session, repo, workspaceRoot, profile } = ctx;
+    this.channel = 'channel' in ctx ? ctx.channel : {
+      createNote: body => ctx.gitlab.createIssueNote(session.hubProjectId, session.hubIssueIid, body),
+      syncStatusLabel: status => ctx.gitlab.syncIssueStatusLabel(session.hubProjectId, session.hubIssueIid, status),
+    };
     this.extensionContext = { session, repo, workspaceRoot, permissionMode: session.permissionMode };
     this.readonly = profile?.readonly ?? false;
     if (profile?.name !== undefined) this.extensionContext.profileName = profile.name;
@@ -185,7 +193,7 @@ export class PermissionGate {
     const pending = this.pending;
     if (!pending) return false;
     const { repo, session, onApprovalResolved } = this.ctx;
-    if (!(await resolveApproval(repo, session, pending.id, status, user, comment, onApprovalResolved))) return false;
+    if (!(await resolveApproval(repo, session, pending.id, status, user, comment, onApprovalResolved, this.ctx.config.jevApiKey))) return false;
     pending.wake();
     return true;
   }
@@ -230,6 +238,7 @@ export class PermissionGate {
       name = name.slice('mcp__detent__'.length);
       if (!isWorkspaceTool(name) && name !== 'AskUserQuestion') return deny('未启用此工具');
     }
+    if (isWorkspaceTool(name) && this.ctx.allowedWorkspaceTools && !this.ctx.allowedWorkspaceTools.includes(name)) return deny('未启用此工具');
     if (name === 'Bash' && this.disableBash) return deny('当前角色禁用 Bash');
     if (fileTools.has(name)) {
       const lookup = name === 'Glob' || name === 'Grep';
@@ -286,7 +295,7 @@ export class PermissionGate {
   private async decide(name: string, input: Input): Promise<GateResult> {
     const policy = await this.preflight(name, input);
     if (policy !== 'ask' && !('riskNote' in policy)) return policy;
-    const { session: s, config, repo, gitlab, controller } = this.ctx;
+    const { session: s, config, repo, controller } = this.ctx;
     const plan = s.permissionMode === 'plan';
     const extension = this.extensionTools.get(name);
     name = name.replace(/^mcp__detent__/, '');
@@ -305,15 +314,15 @@ export class PermissionGate {
     try {
       const card = await extension?.renderApprovalCard?.(a.id, input, this.extensionContext)
         ?? renderToolApprovalCard(a, this.ctx.workspaceRoot, policy === 'ask' ? undefined : policy.riskNote);
-      const note = await gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, renderNote(card));
+      const note = await this.channel.createNote(renderNote(card, config.jevApiKey));
       await repo.updateApprovalNoteId(a.id, note.id);
     } catch (error) {
-      await resolveApproval(repo, s, a.id, 'EXPIRED', 'detent', '审批卡片发布失败', this.ctx.onApprovalResolved);
+      await resolveApproval(repo, s, a.id, 'EXPIRED', 'detent', '审批卡片发布失败', this.ctx.onApprovalResolved, config.jevApiKey);
       throw error;
     }
     await repo.updateSessionState(s.id, { status: 'WAITING_TOOL' });
     s.status = 'WAITING_TOOL';
-    await gitlab.syncIssueStatusLabel(s.hubProjectId, s.hubIssueIid, 'WAITING_TOOL');
+    await this.channel.syncStatusLabel('WAITING_TOOL');
     const deadline = Date.now() + config.hotHoldTimeoutMs;
     let finish!: (handled: boolean) => void;
     const handled = new Promise<boolean>((resolve) => {
@@ -334,7 +343,7 @@ export class PermissionGate {
           const status = plan ? 'PLANNING' : 'CODING';
           await repo.updateSessionState(s.id, { status });
           s.status = status;
-          await gitlab.syncIssueStatusLabel(s.hubProjectId, s.hubIssueIid, status);
+          await this.channel.syncStatusLabel(status);
           consumed = true;
           return this.result(stored, input, extension);
         }

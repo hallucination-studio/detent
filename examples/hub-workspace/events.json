@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "rules": [
+    { "event": "pipeline", "status": "failed", "ownership": "assigned", "action": "run" },
+    { "event": "pipeline", "status": "failed", "branch": "main", "action": "notify", "notifyTarget": "hub_issue" }
+  ]
+}

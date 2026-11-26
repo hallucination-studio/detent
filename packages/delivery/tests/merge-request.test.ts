@@ -1,3 +1,5 @@
+import { MergeRequestOrchestrator } from '../../core/src/orchestrator/mr-orchestrator.js';
+import { GitLabClient } from '../../core/src/gitlab/client.js';
 import { randomUUID } from 'node:crypto';
 import { appendFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -44,7 +46,9 @@ async function setup() {
   const run = vi.fn(recordTurn);
   const orchestrator = new SessionOrchestrator(config, repo, gitlab, { run });
   const report = vi.fn();
-  const queue = new WebhookQueue(event => dispatchWebhook(orchestrator, event), report);
+  const clientForMr = Object.assign(new GitLabClient(config, async () => { throw Error('Unexpected GitLab API call'); }), gitlab);
+  const mrs = new MergeRequestOrchestrator(config, repo, clientForMr, { run }, { runHubEvent: vi.fn() });
+  const queue = new WebhookQueue((event, id) => dispatchWebhook(orchestrator, event, id, mrs), report);
   const app = createWebhookApp(config, gitlab, (id, event) => queue.submit(id, event), matchMergeRequestWebhook);
   onTestFinished(async () => {
     queue.stop();
@@ -80,13 +84,16 @@ async function setup() {
 it('records a cross-project merge and resumes the approved Claude session once across distinct deliveries', async () => {
   const { post, queue, session, repo, run, approveAndCreateMr, mergeNotes } = await setup();
   const mr = await approveAndCreateMr();
+  const worker = await repo.getOrCreateMrSession(2, 5, issue.title);
   const mark = vi.spyOn(repo, 'markMergeRequestMerged');
-  expect((await post(merge)).statusCode).toBe(202);
-  expect((await post(merge)).statusCode).toBe(202);
+  const withoutUserId = { ...merge, user: { username: user.username } };
+  expect((await post(withoutUserId)).statusCode).toBe(202);
+  expect((await post(withoutUserId)).statusCode).toBe(202);
   await queue.drain();
   expect(await repo.findMergeRequest(2, 5)).toMatchObject([{
     id: mr.id, mrState: 'merged', mergeCommitSha: sha, mergedBy: user.username, mergedAt: expect.any(Date),
   }]);
+  expect((await repo.getSession(worker.id))?.status).toBe('DONE');
   expect(mark).toHaveBeenCalledExactlyOnceWith(mr.id, sha, user.username);
   expect(mergeNotes()).toEqual([[hub.id, issue.iid,
     `✅ 关联 MR [org/project2!5](<${url}>) 已由 @maintainer 合并 (commit 1234abcd)，正在自动恢复变更会话…`]]);
@@ -173,10 +180,11 @@ it.each(['WAITING_PLAN', 'WAITING_TOOL'] as const)('keeps the pending approval i
 
 it('ignores other MR actions, inconsistent state and untracked merges', async () => {
   const { post, queue, run, repo, mergeNotes } = await setup();
-  for (const [action, state] of [['open', 'opened'], ['update', 'merged'], ['close', 'closed'], ['merge', 'opened']]) {
+  for (const [action, state] of [['open', 'opened'], ['update', 'merged'], ['merge', 'opened']]) {
     const response = await post({ ...merge, object_attributes: { ...merge.object_attributes, action, state } });
     expect(response.json()).toEqual({ ignored: true });
   }
+  expect((await post({ ...merge, object_attributes: { ...merge.object_attributes, action: 'close', state: 'closed' } })).statusCode).toBe(202);
   const mark = vi.spyOn(repo, 'markMergeRequestMerged');
   expect((await post(merge)).statusCode).toBe(202);
   await queue.drain();

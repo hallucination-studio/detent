@@ -26,7 +26,7 @@ Detent 采用 **双包分层架构**：
 ## 相关文档
 
 - 👉 **双包架构与变更交付设计文档**：[`docs/DESIGN.md`](./docs/DESIGN.md)
-- 👉 **V2 与 V3 推进与验收计划**：[`docs/IMPLEMENTATION_PLAN.md`](./docs/IMPLEMENTATION_PLAN.md)
+- 👉 **实施与验收计划**：[`docs/IMPLEMENTATION_PLAN.md`](./docs/IMPLEMENTATION_PLAN.md)
 - 👉 **AI Agent 架构红线与开发规范**：[`AGENT.md`](./AGENT.md)
 
 ---
@@ -49,6 +49,18 @@ Detent 采用 **双包分层架构**：
    - 每轮执行只创建一条评论并通过 GitLab Edit Note API 节流刷新，使用 `<details>` 折叠工具调用链，并实时展示当前 Session 关联的活跃 Worktree 清单与多个 MR/Pipeline 状态。
 
 ---
+
+## V6 独立 MR 会话
+
+把打开的 MR 分配给 Bot 可持续处理评审与 CI。在评论中提及 `@bot`（实际 GitLab 用户名）可请求单次协助。Issue 创建的 MR 会自动分配给 Bot。每个 MR 独立维护 Claude 会话，向源分支推送修复，在原讨论串回复行内评审。合并后 MR 会话结束，并唤醒关联的 Hub Issue。
+
+Hub 默认分支的 `events.json` 按首条命中规则选择 `ignore`、`notify`、`run` 或 `semantic`。修改对后续事件即时生效。流水线失败可启动 MR 修复，部署失败可创建 Hub 告警 Issue。执行期间，`session_inbox` 保存新指示，Claude Code 通过 `PostToolUse` 在工具调用后读取，轮末到达的指示可接续下一轮。[策略示例](./examples/hub-workspace/events.json)
+
+| 配置项 | 默认值 | 作用 |
+| --- | --- | --- |
+| `MR_MAX_AUTO_FIX_ATTEMPTS` | 3 | 每个 MR 的失败流水线自动修复额度（0–10），命中规则可覆盖。 |
+| `WATCHDOG_INTERVAL_MS` | 30000 | Watchdog 扫描过期租约和待处理收件箱的基础间隔，带抖动。设为 0 关闭，启用时至少 15000 毫秒。 |
+| `WATCHDOG_MAX_RECOVERIES` | 1 | 中断轮次的恢复次数上限（0–5），成功轮次清零。 |
 
 ## 系统架构概览
 
@@ -75,7 +87,7 @@ DETENT_TARGET_PROJECTS=apps/web,ops/ansible-infra DETENT_HUB_MEMBERS=dev:30,sre:
 npm run bootstrap -- --env-out .env
 ```
 
-默认 Hub 为 `ai/workspace-hub`，可通过 `DETENT_HUB_PROJECT` 指定其他路径，或用 `GITLAB_HUB_PROJECT_ID` 指定已有项目。脚本预置 `CLAUDE.md`、四份 `workflows/*.md` 流程、四份 Issue 模板及十个标签。重复运行时保留 Hub 中已有文件，并复用同一输出文件中的 PAT 和 Webhook 密钥。MySQL、Anthropic 和 JumpServer 参数可以通过环境变量传入，也可编辑生成的 `.env`（权限 0600）。构建后执行 `node --env-file=.env packages/delivery/dist/server.js` 即可加载配置并启动交付服务。手动配置步骤如下。
+默认 Hub 为 `ai/workspace-hub`，可通过 `DETENT_HUB_PROJECT` 指定其他路径，或用 `GITLAB_HUB_PROJECT_ID` 指定已有项目。脚本预置 Hub Agent、Skills、`CLAUDE.md`、`events.json`、Issue 模板及十一个标签。重复运行时保留 Hub 中已有文件，并复用同一输出文件中的 PAT 和 Webhook 密钥。MySQL、Anthropic 和 JumpServer 参数可以通过环境变量传入，也可编辑生成的 `.env`（权限 0600）。构建后执行 `node --env-file=.env packages/delivery/dist/server.js` 即可加载配置并启动交付服务。手动配置步骤如下。
 
 ### 1. 准备“工作区仓库（Workspace Hub Repo）”
 1. 在 GitLab CE v18.3.0 中创建一个专门用于承载研发会话的工作区仓库（例如 `ai/workspace-hub`），记录其 **Project ID**（填入环境变量 `GITLAB_HUB_PROJECT_ID`）。
@@ -94,8 +106,7 @@ npm run bootstrap -- --env-out .env
   - ✅ **Issues events**（新建 Issue 自动启动 Claude Code Session，关闭 Issue 自动归档工作区）
   - ✅ **Comments (Note events)**（评论驱动多轮 `--resume` 对话与 `/approve`、`/reject` 等斜杠指令）
   - ✅ **Emoji events**（支持在审批卡片评论上点 👍 `thumbsup` 一键批准、点 👎 `thumbsdown` 一键拒绝）
-- 环境变更交付还需在 Ansible 目标仓库启用 **Merge request events**，使用相同的 URL 和 Secret token。人工合并后，Detent 记录合并 SHA 并恢复对应 Issue 会话。
-- *（可选，用于 Pipeline 联动）* 在目标业务仓库添加 Webhook，勾选 **Pipeline events** 指向同一地址，当关联 MR 的流水线状态变更时会自动同步回对应的工作区 Issue。
+- 在目标仓库使用相同 URL 和 Secret token，启用 **Merge request、Comments、Emoji、Pipeline、Deployment** 事件。
 
 ---
 
@@ -113,16 +124,18 @@ E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab
 
 真实模式下，GitLab 公布的 HTTP 克隆地址应与 `E2E_GITLAB_URL` 同源。允许 GitLab 容器向 `host.docker.internal` 投递项目 Webhook。使用其他路由时，以 `E2E_DETENT_PUBLIC_URL` 指定 GitLab 可访问的地址，以 `E2E_POD_PORT` 指定对应的宿主监听端口。每次运行保留独立的 `e2e-*/workspace-hub` 和三个目标项目供复核，并撤销临时令牌。
 
-两种模式均重复运行 bootstrap，检查九份 Hub 文件、十个标签、Webhook、凭证及客户自定义 SOP，并执行相同的六个场景。
+两种模式均重复运行 bootstrap，检查 Hub 文件、标签、Webhook、凭证及客户自定义 SOP，并覆盖六个 SOP 场景和 V6 MR 交互。
 
-1. 无标签和缺能力的 Issue 收到对应指引，保持打开和 `IDLE`，模型请求数为零。
+1. 缺能力时给出指引，模型请求数为零。无标签的镜像请求经澄清后路由到对应 Agent，审批通过后完成同步。
 2. 跨库代码交付生成两个 MR。两个和一个 MR 待合并时均拒绝关单，最后一个合并后关单并归档两个 Worktree。
 3. 在线修改发版 SOP，维护者批准后创建锁定 SHA 的 Tag 和 Release。
 4. 在线新增热修复 SOP，仅打 Tag，随后须单独获得生产档位的关单审批。
 5. 只读巡检确认 `web01` 上 nginx 状态后关单，审批记录为零。
 6. 环境变更在 Pod 重启后恢复方案。人工合并 Ansible MR 并批准生产执行，随后校验 ZIP、执行审计、变更后巡检和沙箱清理。
 
-完成的流程均检查 GitLab `closed`、`claude::done` 与 MySQL `DONE`。默认使用本地缓存的 `mysql:8.0` 镜像启动容器。如需复用本地 MySQL 8.0，设置 `E2E_MYSQL_HOST=127.0.0.1`。可选的 `E2E_MYSQL_PORT`、`E2E_MYSQL_USER`、`E2E_MYSQL_PASSWORD`、`E2E_MYSQL_DATABASE` 分别默认为 `3306`、`root`、空密码和 `detent`。请使用专用测试库。脚本会创建 Detent 所需的表，结束时清理本次测试的会话数据。
+两种模式均检查行内评审、MR 折叠工具轨迹、独立会话收尾，以及外部 MR 的单次提及和分配。离线驱动还模拟 Bot 触发的失败流水线和部署失败，检查分支提交、在线策略切换、轮中指示和 Hub 告警 Issue。
+
+完成的 Issue 流程均检查 GitLab `closed`、`claude::done` 与 MySQL `DONE`。默认使用本地缓存的 `mysql:8.0` 镜像启动容器。如需复用本地 MySQL 8.0，设置 `E2E_MYSQL_HOST=127.0.0.1`。可选的 `E2E_MYSQL_PORT`、`E2E_MYSQL_USER`、`E2E_MYSQL_PASSWORD`、`E2E_MYSQL_DATABASE` 分别默认为 `3306`、`root`、空密码和 `detent`。请使用专用测试库。脚本会创建 Detent 所需的表，结束时清理本次测试的会话数据。
 
 ## Issue 内交互使用手册
 
@@ -223,7 +236,7 @@ detent/
 ├── .gitlab-ci.yml                  # GitLab CI 兜底流水线
 ├── docs/
 │   ├── DESIGN.md                   # 完整系统架构、时序图与 MySQL 增量数据模型设计文档
-│   └── IMPLEMENTATION_PLAN.md      # V2 与 V3 实施与验收标准
+│   └── IMPLEMENTATION_PLAN.md      # V2–V6 实施与验收标准
 ├── AGENT.md                        # AI Agent 架构红线、现有代码基线与分阶段开发规范
 ├── README.md                       # 英文主文档（默认）
 ├── README.zh-CN.md                 # 中文文档

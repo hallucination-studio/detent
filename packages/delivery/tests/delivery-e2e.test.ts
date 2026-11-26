@@ -1,3 +1,5 @@
+import { MergeRequestOrchestrator } from '../../core/src/orchestrator/mr-orchestrator.js';
+import { GitLabClient } from '../../core/src/gitlab/client.js';
 import { randomUUID } from 'node:crypto';
 import { appendFile, mkdir, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -82,7 +84,9 @@ it('governs Issue #88 through inspection, Plan, MR !205, production approval, ex
     renderStatusExtra: async s => formatDeliveryExecutionsStatus(await tracker.listSessionExecutions(s.id)),
   });
   const report = vi.fn();
-  const queue = new WebhookQueue(event => dispatchWebhook(orchestrator, event), report);
+  const clientForMr = Object.assign(new GitLabClient(config, async () => { throw Error('Unexpected GitLab API call'); }), gitlab);
+  const mrs = new MergeRequestOrchestrator(config, repo, clientForMr, { run }, { runHubEvent: vi.fn() });
+  const queue = new WebhookQueue((event, id) => dispatchWebhook(orchestrator, event, id, mrs), report);
   const app = createWebhookApp(config, gitlab, (id, event) => queue.submit(id, event), matchMergeRequestWebhook);
   const post = async (payload: object) => {
     const response = await app.inject({ method: 'POST', url: '/webhooks/gitlab', payload,

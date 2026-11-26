@@ -23,7 +23,7 @@
    - **第二道（MR 人工合并硬校验）**：调用 JumpServer 执行 Ansible 变更前，必须由硬代码 `guard()` 校验目标 MR 在 MySQL 中已是 `merged` 且 `merge_commit_sha` 与执行版本一致，绝不依赖 Prompt 软约束。
    - **第三道（执行前人工二次审批 + 凭证隔离）**：`jms_run_ansible_job` 治理级别必须为 `always_approve`；JumpServer 只读账号与任务中心执行账号的凭证必须物理分离且严禁透传给 Claude 子进程环境变量；高敏感交付 Agent 禁用裸连 SSH / 本地直跑 Ansible。
 6. **严格防止 GitLab Bot 无限自环（Loop Prevention）与脱敏**
-   - 收到任何 GitLab Webhook 时，必须校验 `X-Gitlab-Token` 并第一时间通过 `isBotUser` 过滤 Bot 自身事件；所有评论与错误日志必须经过 `redactGitUrl` 脱敏。
+   - 收到任何 GitLab Webhook 时，必须校验 `X-Gitlab-Token` 并第一时间通过 `isBotUser` 过滤 Bot 自身的人为操作事件。pipeline、build、deployment 保留 Bot 触发的状态变化；所有评论与错误日志必须经过 `redactGitUrl` 脱敏。
 
 ---
 
@@ -66,6 +66,24 @@ Core 持有通用 System One 客户端（百炼 Decision Model API、TypeSafe、
 有匹配标签时按当前 Hub 定义选 Agent。普通轮次无匹配标签时可由 Jev 结合工单与非 Bot 用户评论路由。高置信度且能力齐备时先持久化 Plan，再写回 Agent 标签。无法明确匹配且无默认 Agent 时进入只读 Triage，询问补充信息后回到 `IDLE`。`/use` 在租约内作废旧待审单并持久化 Plan 重置，再替换 Agent 标签。`purpose === 'approval'` 只按现有标签或默认 Agent 解析授权，严禁触发 Jev 或 Triage。
 
 服务端通过 `DETENT_MCP_CAPABILITIES_FILE` 加载 Streamable HTTP 能力包，由 Agent 的 `requires` 选用。代理工具默认 `always_approve`，由既有 Plan 与工具门禁治理。认证信息由服务端解析，代理对工具元数据、审批卡、调用结果和错误脱敏。Delivery 对 `approverTier: prod` 包的工具审批强制校验生产权限，SOP 的 `approver_tier: standard` 无法降级。
+
+### V6 控制面基础（Stage 10）
+
+Issue 与 MR 按 `(session_kind, hub_project_id, hub_issue_iid)` 独立标识。新增的 `session_inbox` 按会话和事件去重。持租约的 Issue 与 MR 轮次在 PostToolUse 注入新指示，并在工具结束、沙箱清理与释放租约之间接续晚到的评论。Watchdog 默认每 30 秒加抖动扫描，最小间隔 15 秒，设为 0 可关闭。扫描只读，恢复在租约内完成。
+
+沙箱内 Hub 根目录的 `events.json` 受写保护。WebhookQueue 从 Hub 默认分支读取规则，按首条命中规则处理扩展匹配器交还的事件。人为事件带有 actor ID 且处置为 `run` 时，先校验来源项目的审批权限；缺少项目 ID 时使用 Hub。`semantic` 仅在规则命中时调用 Jev。通知通过 GitLab 客户端渲染后触发 `onNotify`。
+
+### V6 独立 MR 工作轮次（Stage 11）
+
+MR 编排器复用 TurnRuntime 租约、审批和恢复机制。分配给 Bot 的打开事件、首次添加 Bot 的分配变更以及有效提及可启动编码轮次。人为接单、评论和审批均校验目标项目权限。MR 回复使用原讨论串，状态仅写入数据库。源项目为 Fork 时，Bot 至少有 Developer 权限才能写入。
+
+MR 沙箱只检出源分支。SDK 与门禁共用工作区工具白名单，限于提交推送和两项 CI 查询。另提供当前 MR 的差异、讨论串和目标分支同步工具。推送时复核目录与当前分支。流水线先更新关联记录，再按 Hub 策略路由；无命中规则时，Bot 受理的 MR 可自动修复，未受理的关联 MR 向 Hub Issue 发通知。合并事件分别调度 MR 收尾与扩展处理器。
+
+### V6 双目标验收（Stage 12）
+
+Issue 与 MR 复用 NoteStreamer 折叠工具轨迹。双目标共用真实 Claude Code、MySQL 8.0 和 Delivery 入口，验证分配、单次提及、行内修复与双 MR 合并闭环。离线驱动额外投递带 Bot 身份的流水线失败与部署失败，验证策略在线切换、Hub 告警和轮中指示进入同一轮提交。真实 GitLab 通过 REST 操作触发自身的 Webhook。
+
+`MR_MAX_AUTO_FIX_ATTEMPTS` 默认 3（0–10），`WATCHDOG_INTERVAL_MS` 默认 30000，`WATCHDOG_MAX_RECOVERIES` 默认 1（0–5）。既有库由初始化程序原子替换旧唯一键，升级 SQL 见[设计文档](docs/DESIGN.md#v6-mysql-upgrade)。
 
 ## 二、 质量门禁：本地提交前检查与推送前 OpenCodeReview 委托审查（必须遵守）
 

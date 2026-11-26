@@ -15,7 +15,51 @@ export type ApprovalStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'EXPIRED';
 
 export type WorktreeStatus = 'ACTIVE' | 'ARCHIVED';
 
+export type SessionKind = 'issue' | 'mr';
+export type InboxStatus = 'PENDING' | 'CONSUMED' | 'EXPIRED';
+
+export interface SessionInboxRow {
+  id: number;
+  sessionId: string;
+  eventId: string;
+  sourceKind: string;
+  senderUsername: string | null;
+  discussionId: string | null;
+  content: string;
+  status: InboxStatus;
+  createdAt: Date;
+  consumedAt: Date | null;
+}
+
+interface EventResource {
+  iid: number;
+  title?: string;
+  description?: string;
+  assignees: { id?: number; username?: string }[];
+}
+export interface NormalizedGitLabEvent {
+  eventId: string;
+  kind: string;
+  action?: string;
+  status?: string;
+  project: { id?: number; path?: string };
+  ref?: string;
+  sha?: string;
+  issue?: EventResource;
+  mr?: EventResource;
+  note?: { id?: number; body: string; discussionId?: string };
+  emoji?: string;
+  actor?: { id?: number; username?: string };
+  url?: string;
+  summary: string;
+  raw: Record<string, unknown>;
+}
+
 export interface IssueSessionRow {
+  sessionKind: SessionKind;
+  autoFixAttempts: number;
+  lastFailedPipelineId: number | null;
+  recoveryAttempts: number;
   id: string;
   hubProjectId: number;
   hubIssueIid: number;

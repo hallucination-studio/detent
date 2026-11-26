@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   validateSequence,
+  type InboxInput,
   type Decision,
   type Message,
   type MR,
@@ -13,6 +14,8 @@ import type {
   ApprovalRequestRow,
   ApprovalType,
   IssueSessionRow,
+  SessionKind,
+  SessionInboxRow,
   SessionMergeRequestRow,
   SessionMessageRow,
   SessionWorktreeRow,
@@ -34,9 +37,16 @@ export class InMemoryDetentRepository implements DetentRepository {
   private trees = new Map<string, SessionWorktreeRow>();
   private mrs = new Map<string, SessionMergeRequestRow>();
   private approvals = new Map<string, ApprovalRequestRow>();
-  async getOrCreateSession(project: number, iid: number, title: string) {
+  private inbox: SessionInboxRow[] = [];
+  getOrCreateSession(project: number, iid: number, title: string) {
+    return this.createSession('issue', project, iid, title);
+  }
+  getOrCreateMrSession(project: number, iid: number, title: string) {
+    return this.createSession('mr', project, iid, title);
+  }
+  private async createSession(sessionKind: SessionKind, project: number, iid: number, title: string) {
     const existing = [...this.sessions.values()].find(
-      (s) => s.hubProjectId === project && s.hubIssueIid === iid,
+      (s) => s.sessionKind === sessionKind && s.hubProjectId === project && s.hubIssueIid === iid,
     );
     if (existing) return structuredClone(existing);
     const now = new Date();
@@ -45,8 +55,9 @@ export class InMemoryDetentRepository implements DetentRepository {
       hubProjectId: project,
       hubIssueIid: iid,
       issueTitle: title,
-      status: 'PLANNING',
-      permissionMode: 'plan',
+      sessionKind, recoveryAttempts: 0, lastFailedPipelineId: null, autoFixAttempts: 0,
+      status: sessionKind === 'issue' ? 'PLANNING' : 'CODING',
+      permissionMode: sessionKind === 'issue' ? 'plan' : 'default',
       claudeSessionId: null,
       lastMessageSeq: 0,
       activeNoteId: null,
@@ -62,16 +73,23 @@ export class InMemoryDetentRepository implements DetentRepository {
   async getSession(id: string) {
     return structuredClone(this.sessions.get(id) ?? null);
   }
-  async getSessionByIssue(project: number, iid: number) {
+  getSessionByIssue(project: number, iid: number) {
+    return this.byResource('issue', project, iid);
+  }
+  getSessionByMr(project: number, iid: number) {
+    return this.byResource('mr', project, iid);
+  }
+  private async byResource(sessionKind: SessionKind, project: number, iid: number) {
     return structuredClone(
-      [...this.sessions.values()].find((s) => s.hubProjectId === project && s.hubIssueIid === iid) ?? null,
+      [...this.sessions.values()].find((s) => s.sessionKind === sessionKind && s.hubProjectId === project && s.hubIssueIid === iid) ?? null,
     );
   }
   async updateSessionState(id: string, state: State) {
     Object.assign(this.sessions.get(id)!, state, { updatedAt: new Date() });
   }
-  async acquireSessionLease(id: string, pod: string, ttl: number) {
+  async acquireSessionLease(id: string, pod: string, ttl: number, expiredAt?: Date) {
     const s = this.sessions.get(id)!;
+    if (expiredAt && (Number(s.lockExpiresAt) !== Number(expiredAt) || !['PLANNING', 'CODING'].includes(s.status))) return false;
     if (s.lockedByPod && s.lockedByPod !== pod && Number(s.lockExpiresAt) > Date.now()) return false;
     if (s.lockedByPod !== pod) this.stops.delete(id);
     s.lockedByPod = pod;
@@ -82,6 +100,11 @@ export class InMemoryDetentRepository implements DetentRepository {
     const s = this.sessions.get(id)!;
     if (s.lockedByPod !== pod || Number(s.lockExpiresAt) <= Date.now()) return false;
     return this.acquireSessionLease(id, pod, ttl);
+  }
+  async releaseIfInboxEmpty(id: string, owner: string) {
+    if (this.sessions.get(id)?.lockedByPod !== owner || this.inbox.some(i => i.sessionId === id && i.status === 'PENDING')) return false;
+    await this.releaseSessionLease(id, owner);
+    return true;
   }
   async releaseSessionLease(id: string, pod: string) {
     const s = this.sessions.get(id)!;
@@ -102,8 +125,8 @@ export class InMemoryDetentRepository implements DetentRepository {
     Object.assign(this.sessions.get(id)!, {
       lastMessageSeq: 0,
       claudeSessionId: null,
-      permissionMode: 'plan',
-      status: 'PLANNING',
+      permissionMode: this.sessions.get(id)!.sessionKind === 'mr' ? 'default' : 'plan',
+      status: this.sessions.get(id)!.sessionKind === 'mr' ? 'CODING' : 'PLANNING',
       updatedAt: new Date(),
     });
   }
@@ -164,6 +187,54 @@ export class InMemoryDetentRepository implements DetentRepository {
   }
   async findMergeRequest(targetProjectId: number, mrIid: number) {
     return structuredClone([...this.mrs.values()].filter((m) => m.targetProjectId === targetProjectId && m.mrIid === mrIid));
+  }
+  async getMrSessionByApprovalNote(project: number, note: number) {
+    const card = [...this.approvals.values()].find(a => a.gitlabNoteId === note && a.status === 'PENDING');
+    const s = card && this.sessions.get(card.sessionId);
+    return s?.sessionKind === 'mr' && s.hubProjectId === project ? structuredClone(s) : null;
+  }
+  async claimPipelineFailure(id: string, pipeline: number, max: number, content: string) {
+    const s = this.sessions.get(id)!;
+    if (s.status === 'DONE' || (s.lastFailedPipelineId ?? 0) >= pipeline) return 'skip' as const;
+    s.lastFailedPipelineId = pipeline;
+    if (s.autoFixAttempts >= max) return 'escalate' as const;
+    s.autoFixAttempts++;
+    await this.enqueueSessionInbox({ sessionId: id, eventId: 'pipeline/' + pipeline, sourceKind: 'pipeline', content });
+    return 'run' as const;
+  }
+  async markMergeRequestClosed(id: string) {
+    const mr = this.mrs.get(id);
+    if (mr?.mrState !== 'opened') return false;
+    Object.assign(mr, { mrState: 'closed', updatedAt: new Date() });
+    return true;
+  }
+  async enqueueSessionInbox(input: InboxInput) {
+    if (this.inbox.some(row => row.sessionId === input.sessionId && row.eventId === input.eventId)) return false;
+    if (!this.sessions.has(input.sessionId)) return false;
+    this.inbox.push({ ...input, senderUsername: input.senderUsername ?? null, discussionId: input.discussionId ?? null,
+      id: this.inbox.length + 1, status: 'PENDING', createdAt: new Date(), consumedAt: null });
+    return true;
+  }
+  async drainSessionInbox(sessionId: string, owner?: string, sourceKind?: string) {
+    const session = this.sessions.get(sessionId);
+    if (owner && (session?.lockedByPod !== owner || Number(session.lockExpiresAt) <= Date.now())) return [];
+    const pending = this.inbox.filter(row => row.sessionId === sessionId && row.status === 'PENDING' && (!sourceKind || row.sourceKind === sourceKind));
+    const snapshot = structuredClone(pending);
+    for (const row of pending) Object.assign(row, { status: 'CONSUMED', consumedAt: new Date() });
+    return snapshot;
+  }
+  async failRecovery(sessionId: string) {
+    for (const i of this.inbox) if (i.sessionId === sessionId && i.status === 'PENDING') i.status = 'EXPIRED';
+    await this.updateSessionState(sessionId, { status: 'FAILED' });
+  }
+  async listExpiredActiveSessions(limit = 50) {
+    return structuredClone([...this.sessions.values()].filter(s => ['PLANNING','CODING'].includes(s.status) &&
+      s.lockExpiresAt && Number(s.lockExpiresAt) <= Date.now()).sort((a,b) => Number(a.lockExpiresAt) - Number(b.lockExpiresAt)).slice(0, limit));
+  }
+  async listSessionsWithPendingInbox(limit = 50) {
+    return structuredClone([...this.sessions.values()].filter(s => !['WAITING_PLAN','WAITING_TOOL','DONE'].includes(s.status) &&
+      (!s.lockedByPod || Number(s.lockExpiresAt) <= Date.now()) && this.inbox.some(i => i.sessionId === s.id && i.status === 'PENDING'))
+      .sort((a,b) => Number(a.updatedAt) - Number(b.updatedAt)).slice(0, limit));
   }
   async markMergeRequestMerged(id: string, mergeCommitSha: string | null, mergedBy: string) {
     const mr = this.mrs.get(id);

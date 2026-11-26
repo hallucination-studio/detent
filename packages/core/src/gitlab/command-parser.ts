@@ -9,12 +9,36 @@ const commands = {
   status: 'STATUS',
   use: 'USE',
 } as const;
+const protectedMarkdown = /```[\s\S]*?```|```[\s\S]*|`[^`\n]*`|^[^\S\n]*>.*$/gm;
+function mentionPattern(username: string) {
+  const escaped = username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<![\\w.+-])@${escaped}(?![\\w.-])`, 'gi');
+}
+export function hasBotMention(text: string, botUsername?: string) {
+  return !!botUsername && mentionPattern(botUsername).test(text.replace(protectedMarkdown, ' '));
+}
+export function stripBotMention(text: string, botUsername?: string) {
+  if (!botUsername) return text;
+  // Keep examples and quotations intact in the user's prompt.
+  const visible = text.replace(protectedMarkdown, span => ' '.repeat(span.length));
+  let end = 0;
+  let result = '';
+  for (const match of visible.matchAll(mentionPattern(botUsername))) {
+    result += text.slice(end, match.index);
+    end = match.index + match[0].length;
+  }
+  return (result + text.slice(end)).trim();
+}
 export function parseNoteIntent({
   noteBody,
   sessionStatus,
+  botUsername,
   ...actor
-}: Actor & { noteBody: string; sessionStatus: SessionStatus }): ParsedUserIntent {
-  const body = noteBody.trim();
+}: Actor & { noteBody: string; sessionStatus: SessionStatus; botUsername?: string }): ParsedUserIntent {
+  const original = noteBody.trim();
+  const prefix = original.match(/^@[^\s]+(?=\s)/)?.[0];
+  const body = prefix && stripBotMention(prefix, botUsername) === ''
+    ? original.slice(prefix.length).trimStart() : original;
   const match = /^\/(approve|reject|plan|abort|reset|status|use)(?:\s+([\s\S]+))?$/i.exec(body);
   if (match) {
     const type = commands[match[1].toLowerCase() as keyof typeof commands];

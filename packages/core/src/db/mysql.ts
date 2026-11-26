@@ -1,4 +1,4 @@
-import mysql, { type Pool } from 'mysql2/promise';
+import mysql, { type Pool, type RowDataPacket } from 'mysql2/promise';
 import type { AppConfig } from '../config.js';
 
 export function createMySqlPool(config: AppConfig) {
@@ -16,13 +16,26 @@ export function createMySqlPool(config: AppConfig) {
 const timestamps = `created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)`;
 const sessionFK = 'session_id CHAR(36) NOT NULL, FOREIGN KEY (session_id) REFERENCES issue_sessions(id)';
+const controlColumns = [
+  "session_kind VARCHAR(16) NOT NULL DEFAULT 'issue'",
+  'auto_fix_attempts INT NOT NULL DEFAULT 0',
+  'last_failed_pipeline_id BIGINT NULL',
+  'recovery_attempts INT NOT NULL DEFAULT 0',
+];
+const sessionKey = 'UNIQUE KEY session_resource(session_kind, hub_project_id, hub_issue_iid)';
+
 export async function initMySqlSchema(pool: Pool) {
   const tables = [
     `issue_sessions (id CHAR(36) PRIMARY KEY, hub_project_id BIGINT NOT NULL, hub_issue_iid BIGINT NOT NULL,
       issue_title VARCHAR(512) NOT NULL, claude_session_id VARCHAR(128), last_message_seq INT NOT NULL DEFAULT 0,
       status VARCHAR(32) NOT NULL DEFAULT 'PLANNING',
       permission_mode VARCHAR(32) NOT NULL DEFAULT 'plan', active_note_id BIGINT,
-      stop_requested BOOLEAN NOT NULL DEFAULT FALSE, locked_by_pod VARCHAR(192), lock_expires_at DATETIME(3), ${timestamps}, UNIQUE(hub_project_id, hub_issue_iid))`,
+      stop_requested BOOLEAN NOT NULL DEFAULT FALSE, locked_by_pod VARCHAR(192), lock_expires_at DATETIME(3), ${timestamps}, ${controlColumns.join(', ')}, ${sessionKey})`,
+    `session_inbox (id BIGINT AUTO_INCREMENT PRIMARY KEY, ${sessionFK},
+      event_id VARCHAR(64) NOT NULL, source_kind VARCHAR(32) NOT NULL,
+      sender_username VARCHAR(128), discussion_id VARCHAR(128), content MEDIUMTEXT NOT NULL,
+      status VARCHAR(16) NOT NULL DEFAULT 'PENDING', created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      consumed_at DATETIME(3), UNIQUE(session_id, event_id), INDEX(session_id, status, id))`,
     `session_messages (id BIGINT AUTO_INCREMENT PRIMARY KEY, ${sessionFK}, seq INT NOT NULL,
       message_uuid VARCHAR(64), message_type VARCHAR(64) NOT NULL, raw_json_line MEDIUMTEXT NOT NULL,
       created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), UNIQUE(session_id, seq))`,
@@ -48,4 +61,16 @@ export async function initMySqlSchema(pool: Pool) {
     await pool.query(
       'CREATE TABLE IF NOT EXISTS ' + table + ' ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin',
     );
+  // The legacy unnamed unique key takes its first column's name in MySQL.
+  const [legacy] = await pool.query<RowDataPacket[]>("SHOW INDEX FROM issue_sessions WHERE Key_name='hub_project_id'");
+  if (legacy.length) {
+    try {
+      await pool.query('ALTER TABLE issue_sessions DROP INDEX hub_project_id, ' +
+        [...controlColumns, sessionKey].map(definition => 'ADD ' + definition).join(', '));
+    } catch (error) {
+      // Another pod can finish this atomic ALTER after the read above.
+      const [current] = await pool.query<RowDataPacket[]>("SHOW INDEX FROM issue_sessions WHERE Key_name='session_resource'");
+      if (!current.length) throw error;
+    }
+  }
 }

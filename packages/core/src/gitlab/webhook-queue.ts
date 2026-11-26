@@ -1,10 +1,12 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import type { QueuedWebhook } from './webhook.js';
-import { SessionBusy } from '../orchestrator/session-orchestrator.js';
+import { SessionBusy } from '../orchestrator/turn-runtime.js';
 import { parseNoteIntent } from './command-parser.js';
 
-function queueKey(event: QueuedWebhook, id: string) {
+function queueKey(event: QueuedWebhook, id: string, canSteer: boolean, botUsername?: string) {
   if ('handle' in event) return event.key;
+  if (event.object_kind === 'merge_request')
+    return `mr-session/${event.object_attributes.target_project_id ?? event.project.id}/${event.object_attributes.iid}`;
   if (event.object_kind === 'pipeline')
     return `pipeline/${event.project.id}/${event.merge_request?.source_branch ?? event.object_attributes.ref}`;
   // A decision or interrupt must reach a running turn even while it holds the issue queue.
@@ -13,13 +15,14 @@ function queueKey(event: QueuedWebhook, id: string) {
     return event.object_attributes.action === 'close'
       ? id
       : `issue/${event.project.id}/${event.object_attributes.iid}`;
+  if (event.object_attributes.noteable_type === 'MergeRequest') return id;
   const { type } = parseNoteIntent({
-    noteBody: event.object_attributes.note,
+    noteBody: event.object_attributes.note, botUsername,
     sessionStatus: 'WAITING_TOOL', // Include natural-language approvals. Dispatch checks the actual status.
     userId: event.user.id,
     username: event.user.username,
   });
-  return type === 'PROMPT' || type === 'PLAN' ? `issue/${event.project.id}/${event.issue?.iid}` : id;
+  return (type === 'PROMPT' && !canSteer) || type === 'PLAN' ? `issue/${event.project.id}/${event.issue?.iid}` : id;
 }
 
 export class WebhookQueue {
@@ -29,16 +32,16 @@ export class WebhookQueue {
   private stopping = new AbortController();
 
   constructor(
-    private dispatch: (event: QueuedWebhook) => Promise<void>,
+    private dispatch: (event: QueuedWebhook, id: string) => Promise<void>,
     private report: (error: unknown) => void,
     private maxRetryWaitMs = 10 * 60 * 1000,
   ) {}
 
-  submit(id: string, event: QueuedWebhook) {
+  submit(id: string, event: QueuedWebhook, canSteer = false, botUsername?: string) {
     this.stopping.signal.throwIfAborted();
     if (this.pending.has(id) || this.recent.has(id)) return;
     this.pending.add(id);
-    const key = queueKey(event, id);
+    const key = queueKey(event, id, canSteer, botUsername);
     const previous = this.tails.get(key) ?? Promise.resolve();
     const task = previous
       .then(() => this.run(event, id))
@@ -56,7 +59,7 @@ export class WebhookQueue {
     const { signal } = this.stopping;
     for (;;) {
       try {
-        await this.dispatch(event);
+        await this.dispatch(event, id);
         break;
       } catch (error) {
         if (!(error instanceof SessionBusy)) throw error;

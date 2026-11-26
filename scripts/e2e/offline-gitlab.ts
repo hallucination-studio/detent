@@ -49,10 +49,14 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
   const projects: Project[] = [];
   const firstProjectId = randomInt(1, 2 ** 31 - 1);
   const members = new Map<string, number>();
+  const namespaceMaintainers = new Map<number, Set<number>>();
   const labels = new Map<number, { name: string; color: string }[]>();
   const hooks = new Map<number, Hook[]>();
   const mrs = new Map<number, MR[]>();
   const pipelines: Pipeline[] = [];
+  let noteCheck: { botId: number; check: (body: string) => void } | undefined;
+  const traces = new Map<number, string>();
+  const commitComments = new Map<string, { note: string }[]>();
   let nextNoteId = 1;
   const issues = new Map<number, Issue>();
   const notes = new Map<number, { issueIid: number; body: string; author: User }>();
@@ -175,6 +179,8 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
     const [resource, ref, section, item, sub, child, operation, noteId] = url.pathname.slice(8).split('/').map(decodeURIComponent);
     const get = req.method === 'GET', post = req.method === 'POST', put = req.method === 'PUT';
     const body = get || req.method === 'DELETE' ? {} : await req.json();
+    if (actor.id === noteCheck?.botId && ['issues', 'merge_requests'].includes(section) &&
+        ['notes', 'discussions'].includes(sub) && typeof body.body === 'string') noteCheck.check(body.body);
     if (get && resource === 'user') return reply(actor);
     if (resource === 'users') {
       if (get && !ref) {
@@ -201,6 +207,13 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
       return reply(ref ? groups.find(g => g.full_path === ref) : groups);
     }
     if (resource === 'groups') {
+      if (post && ref && section === 'members') {
+        if (credential !== admin || body.access_level !== 40) return forbidden();
+        const users = namespaceMaintainers.get(Number(ref)) ?? new Set<number>();
+        users.add(body.user_id);
+        namespaceMaintainers.set(Number(ref), users);
+        return reply({ id: body.user_id, access_level: 40 });
+      }
       if (get) return reply(ref ? groups.find(g => g.full_path === ref) : groups);
       if (post) {
         assert.match(body.path, safePart);
@@ -215,20 +228,22 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
     if (!ref && post) {
       assert.match(body.path, safePart);
       const group = groups.find(g => g.id === body.namespace_id)!;
+      if (credential !== admin && !namespaceMaintainers.get(group.id)?.has(actor.id)) return forbidden();
       const path = group.full_path + '/' + body.path;
       const p = { id: firstProjectId + projects.length, path_with_namespace: path, http_url_to_repo: url.origin + '/' + path + '.git',
-        default_branch: body.default_branch };
-      assert.equal(body.initialize_with_readme, true);
+        default_branch: body.default_branch ?? 'main' };
+
       await mkdir(dirname(repo(p)), { recursive: true });
       git(root, 'init', '--bare', '-b', p.default_branch, repo(p));
       git(repo(p), 'config', 'http.receivepack', 'true');
-      await commitFile(p, 'README.md', '# ' + body.name + '\n', 'Initialize repository');
+      if (body.initialize_with_readme) await commitFile(p, 'README.md', '# ' + body.name + '\n', 'Initialize repository');
       register(p);
+      members.set(p.id + '/' + actor.id, 40);
       return reply(p);
     }
     const p = find(ref);
     if (!p) return absent();
-    if (!section && get) return reply(p);
+    if (!section && get) return reply({ ...p, empty_repo: !commitSha(p, p.default_branch) });
     if (section === 'members') {
       const key = p.id + '/' + (sub ?? item ?? body.user_id);
       if (post || put) members.set(key, body.access_level);
@@ -242,6 +257,7 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
       return reply(get ? rows : body);
     }
     if (section === 'hooks') {
+      if (credential !== admin && (members.get(p.id + '/' + actor.id) ?? 0) < 40) return forbidden();
       const rows = hooks.get(p.id)!;
       if (get) return reply(rows.map(({ token, ...hook }) => hook));
       if (post) rows.push({ ...body, id: rows.length + 1 });
@@ -275,11 +291,23 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
       }
       if ((post || put) && item === 'files') {
         const start = body.start_branch ?? body.branch;
-        const exists = git(repo(p), 'ls-tree', '--name-only', 'refs/heads/' + start, '--', sub).length > 0;
+        const exists = !!commitSha(p, start) && git(repo(p), 'ls-tree', '--name-only', 'refs/heads/' + start, '--', sub).length > 0;
         if (exists !== put) return new Response(null, { status: exists ? 400 : 404 });
         const content = body.encoding === 'base64' ? Buffer.from(body.content, 'base64') : body.content;
         await commitFile(p, sub, content, body.commit_message, body.branch, start);
         return reply({ file_path: sub, branch: body.branch });
+      }
+    }
+    if (section === 'repository' && item === 'commits' && child === 'comments') {
+      if (!commitSha(p, sub)) return absent();
+      const key = p.id + '/' + sub;
+      const comments = commitComments.get(key) ?? [];
+      if (get) return reply(comments);
+      if (post) {
+        const comment = { note: body.note };
+        comments.push(comment);
+        commitComments.set(key, comments);
+        return reply(comment);
       }
     }
     if (section === 'repository' && item === 'commits' && sub && get) {
@@ -292,7 +320,7 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
     if (section === 'jobs' && get) {
       const pipeline = projectPipelines.find(pipe => job(pipe).id === Number(item));
       if (!pipeline) return absent();
-      if (sub === 'trace') return new Response('Missing ci/ready.txt: expected ready');
+      if (sub === 'trace') return new Response(traces.get(pipeline.id) ?? 'Missing ci/ready.txt: expected ready');
       return sub ? absent() : reply(job(pipeline));
     }
     if (section === 'pipelines' && get) {
@@ -367,9 +395,9 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
         return new Response(null, { status: 204 });
       }
       if (!sub && put) {
-        if (body.state_event === 'close') {
-          issue.state = 'closed';
-          await dispatch(p, 'issue', 'issues_events', actor, { ...issue, action: 'close' });
+        if (['close', 'reopen'].includes(body.state_event)) {
+          issue.state = body.state_event === 'close' ? 'closed' : 'opened';
+          await dispatch(p, 'issue', 'issues_events', actor, { ...issue, action: body.state_event });
         }
         const remove = (body.remove_labels ?? '').split(',');
         const add = (body.add_labels ?? '').split(',').filter(Boolean);
@@ -422,10 +450,10 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
       }
       const resource = mrResource(p, mr);
       if (!sub && get) return reply(resource);
-      if (!sub && put && body.state_event === 'close') {
-        mr.state = 'closed';
+      if (!sub && put && ['close', 'reopen'].includes(body.state_event)) {
+        mr.state = body.state_event === 'close' ? 'closed' : 'opened';
         const closed = mrResource(p, mr);
-        await dispatch(p, 'merge_request', 'merge_requests_events', actor, { ...closed, action: 'close' });
+        await dispatch(p, 'merge_request', 'merge_requests_events', actor, { ...closed, action: body.state_event });
         return reply(closed);
       }
       if (!sub && put && ('title' in body || 'labels' in body || 'add_labels' in body || 'remove_labels' in body)) {
@@ -455,6 +483,10 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
         return reply({ ...resource, state: mr.state, merge_commit_sha: sha });
       }
       if (get && sub === 'pipelines') return reply(projectPipelines.filter(pipe => pipe.ref === mr.source_branch));
+      if (get && sub === 'commits') {
+        const range = resource.diff_refs.base_sha + '..' + resource.sha;
+        return reply(git(repo(find(mr.source_project_id)!), 'rev-list', range).toString().trim().split('\n').filter(Boolean).map(id => ({ id })));
+      }
       if (get && sub === 'diffs') {
         const { base_sha, head_sha } = resource.diff_refs;
         const diff = (...args: string[]) => git(repo(find(mr.source_project_id)!), 'diff', '--no-renames', ...args).toString();
@@ -506,10 +538,11 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
   const server = await serve(handle);
   const baseUrl = server.baseUrl;
   const api = gitlabApi(baseUrl, admin);
-  async function pipelineEvent(id: number, iid: number, botId: number, status: string, sha?: string) {
+  async function pipelineEvent(id: number, iid: number, botId: number, status: string, sha?: string, trace?: string) {
     const p = find(id)!;
     const mr = mrResource(p, mrs.get(id)!.find(m => m.iid === iid)!);
     const pipeline = { id: pipelines.length + 1, project_id: id, ref: mr.source_branch, sha: sha ?? mr.sha, status };
+    if (trace) traces.set(pipeline.id, trace);
     pipelines.unshift(pipeline);
     const bot = users.find(u => u.id === botId);
     assert.ok(bot, 'Expected the provisioned bot as the pipeline actor');
@@ -522,7 +555,8 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
     devUsername: 'dev', sreUsername: 'sre', reporterUsername: 'reporter', podHost: '127.0.0.1',
     detentPublicUrl: port => 'http://127.0.0.1:' + port,
     synthetic: {
-      failPipeline: (id, iid, bot, sha) => pipelineEvent(id, iid, bot, 'failed', sha),
+      checkNoteWrites(botId, check) { noteCheck = { botId, check }; },
+      failPipeline: (id, iid, bot, sha, trace) => pipelineEvent(id, iid, bot, 'failed', sha, trace),
       succeedPipeline: (id, iid, bot) => pipelineEvent(id, iid, bot, 'success'),
       pushAttempts: id => pushes.get(id) ?? 0,
       async openReadonlyForkMr(id, botId) {

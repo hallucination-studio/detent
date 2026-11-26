@@ -19,9 +19,9 @@ const review = 'Please review and merge the nginx reload MR.';
 const playbook = 'deploy/nginx-reload.yml';
 const inspect = { asset_ids: ['web01'], command: 'systemctl status nginx' };
 
-interface Repos { webRepo: string; apiRepo: string; ansibleRepo: string }
+interface Repos { webRepo: string; apiRepo: string; ansibleRepo: string; securityReport: string }
 
-function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | Use {
+function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }: Repos): Text | Use {
   // The CLI also sends small auxiliary requests without the workspace tools.
   if (!body.tools?.length) return text('Delivery request');
   const blocks = body.messages.flatMap(m => typeof m.content === 'string' ? [text(m.content)] : m.content);
@@ -61,12 +61,29 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
   const mr = /^GitLab MR (\d+)!(\d+) · (.+)$/m.exec(system);
   if (mr) {
     // A resumed session includes old tool calls. Select only the current webhook's prompt and results.
-    const trigger = /@[\w-]+: (?:Pipeline #\d+ failed|(?:hello\.txt:1 )?Add a regression test|Please inspect this contribution|请检查新分配的 MR|Check the config defaults|Resume the interrupted review)|Refactor config loader|实施方案已获批准，请按方案开始实施/;
+    const trigger = /@[\w-]+: (?:Pipeline #\d+ failed|(?:hello\.txt:1 )?Add a regression test|Please inspect this contribution|请检查新分配的 MR|Check the config defaults|Resume the interrupted review|Anyone free for lunch)|实施方案未获批准|Refactor config loader|实施方案已获批准，请按方案开始实施/;
     const prompt = blocks.filter((b): b is Text => b.type === 'text' && trigger.test(b.text)).at(-1);
     assert.ok(prompt, 'Missing MR event in SDK prompt');
     const event = prompt.text;
     const history = blocks.slice(blocks.indexOf(prompt));
     const current = (name: string) => result(name, history);
+    if (mr[3] === 'Verify shared steering' && event.includes('Check the config defaults')) {
+      const diff = current('detent_get_mr_diff');
+      if (!diff) return use('detent_get_mr_diff', {});
+      success(diff);
+      const receipts = JSON.stringify(history.slice(history.indexOf(diff))).match(/receipt-[a-f0-9-]+/g);
+      assert.ok(receipts?.length, 'Active SDK turn did not receive the inbox context');
+      return text('Applied ' + [...new Set(receipts)].sort().join(' '));
+    }
+    if (event.includes('Anyone free for lunch')) {
+      assert.match(system, /casual teammate discussion acknowledge briefly/);
+      return text('Enjoy lunch!');
+    }
+    if (event.includes('实施方案未获批准')) {
+      assert.match(event, /Preserve existing defaults/);
+      assert.match(system, /当前为方案阶段/);
+      return text('Revised loader plan preserves existing defaults.');
+    }
     if (event.includes('Please inspect this contribution')) return text('Inspected the external contribution.');
 
     const directory = /^Active worktree: projects\/(.+)$/m.exec(system)?.[1];
@@ -118,7 +135,7 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
       const diff = current('detent_get_mr_diff');
       if (!diff) return use('detent_get_mr_diff', {});
       const greeting = /^\+Hello from (.+)!$/m.exec(JSON.parse(success(diff)))?.[1];
-      assert.equal(greeting, apiRepo);
+      assert.equal(greeting, mr[3] === 'Storm inline review' ? apiRepo + ' storm' : apiRepo);
       const threads = current('detent_list_mr_discussions');
       if (!threads) return use('detent_list_mr_discussions', {});
       assert.ok(JSON.parse(success(threads)).some((t: { notes: { type: string; position?: { new_path: string; new_line: number } }[] }) =>
@@ -136,6 +153,10 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
       const trace = current('detent_get_pipeline_job_log');
       if (!trace) return use('detent_get_pipeline_job_log', { project: Number(mr[1]), job_id: job.id });
       assert.match(success(trace), /Missing ci\/ready.txt: expected ready/);
+      if (mr[3] === 'Verify trace redaction') {
+        assert.ok(success(trace).includes('https://oauth2:***@127.0.0.1/repo.git'));
+        return text(JSON.parse(success(trace)));
+      }
       file = 'ci/ready.txt';
       content = 'ready\n';
       report = 'Restored the CI readiness file.';
@@ -146,6 +167,11 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
         report += ' ' + receipt;
       }
     }
+    if (mr[3] === 'Storm CI repair' || mr[3] === 'Storm inline review') {
+      const original = current('Read');
+      if (!original) return use('Read', { file_path: join(workspaceRoot(), 'projects', directory, file) });
+      assert.ok(success(original).includes('broken'));
+    }
     const write = current('Write');
     if (!write) return use('Write', { file_path: join(workspaceRoot(), 'projects', directory, file), content });
     success(write);
@@ -155,6 +181,72 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
     return text(report);
   }
   assert.ok(issue, 'Missing Hub Issue number in the SDK system prompt');
+
+  const userText = body.messages.filter(m => m.role === 'user').flatMap(m =>
+    typeof m.content === 'string' ? [m.content] : m.content.flatMap(b => b.type === 'text' ? [b.text] : []));
+  const has = (phrase: string) => userText.some(t => t.includes(phrase));
+  if (system.includes('Verify note redaction')) return text(securityReport);
+  if (system.includes('Cluster plan decision')) {
+    if (has('实施方案未获批准')) return text('Revised cluster plan.');
+    return text(approved < 0 ? 'Cluster plan ready.' : 'Cluster plan executed.');
+  }
+  if (system.includes('Verify release guard')) {
+    if (approved < 0) return text('Check existing release tag.');
+    const denied = result('detent_create_release');
+    if (!denied) {
+      const sha = userText.join(' ').match(/\b[a-f0-9]{40}\b/)?.[0];
+      assert.ok(sha);
+      return use('detent_create_release', { project: webRepo, tag_name: 'rel-1.0.0', commit_sha: sha });
+    }
+    assert.ok(denied.is_error && contents(denied.content).includes('目标 Tag 已存在'));
+    return text('Existing tag preserved.');
+  }
+  if (system.includes('Verify standalone runtime')) {
+    if (has('Continue from the historical checkpoint')) {
+      assert.ok(blocks.some(b => b.type === 'text' && b.text.includes('Standalone turn complete')));
+      return text('Resumed the historical checkpoint.');
+    }
+    if (approved < 0) return text('Standalone plan');
+    return text('Standalone turn complete.');
+  }
+  if (system.includes('Revise the public API')) {
+    if (approved >= 0) {
+      assert.ok(has('附加说明：Add inline comments'));
+      const listed = result('detent_list_projects');
+      if (!listed) return use('detent_list_projects', { search: apiRepo });
+      success(listed);
+      return text('Revised implementation complete.');
+    }
+    return text(has('修改意见：Keep API signature unchanged') ? 'Plan v2 preserves the API signature.' : 'Plan v1 changes the API signature.');
+  }
+  if (system.includes('Select service port') || system.includes('Switch audit to coding')) {
+    if (has('Please open a fix MR')) {
+      assert.equal(sopPath, 'agents/code-delivery/AGENT.md');
+      assert.match(system, /当前为方案阶段/);
+      return text('Plan to open a fix MR.');
+    }
+    if (system.includes('Select service port') && approved < 0) return text('Confirm the deployment port.');
+    const question = 'Which service port?';
+    const answer = result('AskUserQuestion');
+    if (!answer) return use('AskUserQuestion', { questions: [{ question }] });
+    assert.deepEqual(JSON.parse(success(answer)), { [question]: 'Use port 6380' });
+    return text('Confirmed port 6380.');
+  }
+  if (system.includes('Approve in context')) {
+    if (has('可以')) return text('Received the ordinary follow-up.');
+    return text(approved >= 0 ? 'Plan executed.' : 'Check the service defaults.');
+  }
+  if (system.includes('Interrupt maintenance')) {
+    if (has('Fresh start')) {
+      assert.ok(!has('实施方案已获批准'));
+      return text('Fresh maintenance plan.');
+    }
+    if (approved >= 0) return use('detent_list_projects', { search: apiRepo });
+    const tree = result('detent_checkout_worktree');
+    if (!tree) return use('detent_checkout_worktree', { project: apiRepo, branch_name: 'main' });
+    success(tree);
+    return text('Maintenance plan ready.');
+  }
 
   function closeIssue(summary: string, report: string, expectDenied = false) {
     const closed = result('detent_close_issue', turn);
@@ -268,7 +360,33 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo }: Repos): Text | 
     return { sha, targetProjectId, mrIid, mrWebUrl, after: history.slice(history.indexOf(mr) + 1) };
   }
 
+  if (system.includes('Verify production guards')) {
+    if (approved < 0) return text('Prepare a reviewed playbook.');
+    if (!lastMerge) {
+      const step = deliverFile(ansibleRepo, 'guard/issue-' + issue[1], 'deploy/guard.yml', '- hosts: all\n  tasks: []\n', 'Review guard playbook', blocks.slice(approved));
+      return 'type' in step ? step : text('Ready for guard review.');
+    }
+    const linked = result('detent_create_mr');
+    assert.ok(linked);
+    const { targetProjectId, mrIid } = JSON.parse(success(linked));
+    const sha = /合并提交 SHA：([a-f0-9]{40})/.exec(lastMerge.text)![1];
+    let history = turn;
+    for (const [asset, commit, reason] of [['blocked-db-01', sha, '黑名单'], ['web01', '0'.repeat(40), '提交不一致'],
+      ['web01', sha, '最新流水线失败']]) {
+      const denied = result('jms_run_ansible_job', history);
+      if (!denied) return use('jms_run_ansible_job', { target_project_id: targetProjectId, mr_iid: mrIid,
+        commit_sha: commit, playbook_path: 'deploy/guard.yml', asset_ids: [asset] });
+      assert.ok(denied.is_error && contents(denied.content).includes(reason), 'Expected guard denial: ' + reason);
+      history = history.slice(history.indexOf(denied) + 1);
+    }
+    return text('All three production requests denied.');
+  }
   if (sopPath === 'agents/code-delivery/AGENT.md') {
+    if (system.includes('Storm code change')) {
+      if (approved < 0) return text('Add cluster.txt for review.');
+      const step = deliverFile(webRepo, 'storm/issue-' + issue[1], 'cluster.txt', 'cluster ready\n', 'Add cluster readiness', blocks.slice(approved));
+      return 'type' in step ? step : text('Review cluster readiness: ' + step.mrWebUrl);
+    }
     if (system.includes('Review CI readiness change')) {
       if (approved < 0) return text('Propose the readiness probe for review.');
       const step = deliverFile(apiRepo, 'ci/readiness-probe', 'probe.txt', 'check readiness\n', 'Add readiness probe', blocks.slice(approved));
@@ -356,6 +474,7 @@ function respond(body: Messages, block: Text | Use) {
 
 export function createOfflineAnthropic(repos: Repos) {
   let requests = 0;
+  let observeRequest: ((system: string) => Promise<void>) | undefined;
   let nextTool: { name: string; observe: () => Promise<void> } | undefined;
   let checkPayload: (body: Messages) => void = () => {};
   return {
@@ -364,6 +483,7 @@ export function createOfflineAnthropic(repos: Repos) {
       if (req.method !== 'POST' || new URL(req.url).pathname !== '/v1/messages') return new Response(null, { status: 404 });
       const body: Messages = await req.json();
       checkPayload(body);
+      if (body.tools?.length && observeRequest) await observeRequest(contents(body.system ?? ''));
       const block = next(body, repos);
       if (nextTool && block.type === 'tool_use' && block.name === 'mcp__detent__' + nextTool.name) {
         const { observe } = nextTool;
@@ -372,6 +492,7 @@ export function createOfflineAnthropic(repos: Repos) {
       }
       return respond(body, block);
     },
+    observeTurns(observer?: (system: string) => Promise<void>) { observeRequest = observer; },
     beforeNextTool(name: string, observe: () => Promise<void>) {
       assert.equal(nextTool, undefined);
       nextTool = { name, observe };

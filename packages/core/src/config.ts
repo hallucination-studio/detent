@@ -57,7 +57,7 @@ const ConfigSchema = z.object({
     ),
 });
 
-export type AppConfig = z.infer<typeof ConfigSchema>;
+export type AppConfig = z.infer<typeof ConfigSchema> & { additionalSecrets?: readonly string[] };
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const config = ConfigSchema.parse({

@@ -2,16 +2,22 @@ import assert from 'node:assert/strict';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
-import { parseEnv, promisify } from 'node:util';
+import { isDeepStrictEqual, parseEnv, promisify } from 'node:util';
 import mysql, { type RowDataPacket } from 'mysql2/promise';
 import { createOfflineAnthropic } from './offline-anthropic.js';
-import { runMrScenarios } from './mr-scenarios.js';
+import { checkStartupFailures, brownfieldOnboarding, standaloneAndUpgrade } from './suites/phase0-install.js';
+import { runIssueScenarios } from './suites/phase1-issues.js';
+import { checkSession } from './suites/harness.js';
+import { runConcurrency } from './suites/phase3-concurrency.js';
+import { runSecurity } from './suites/phase4-security.js';
+import { webhookProxy } from './suites/cluster.js';
+import { runMrScenarios } from './suites/phase2-mrs.js';
 import { gitlabApi } from './gitlab-driver.js';
 import { liveGitLab } from './live-gitlab.js';
 import { offlineGitLab } from './offline-gitlab.js';
@@ -37,7 +43,7 @@ async function main() {
   const tmp = await mkdtemp('/tmp/detent-e2e-');
   const cleanup: (() => Promise<unknown>)[] = [() => rm(tmp, { recursive: true, force: true })];
   let failure: Error | undefined;
-  let pod: ChildProcess | undefined;
+  const pods = new Set<ChildProcess>();
   const interrupt = () => { failure = Error('E2E interrupted'); };
   process.on('SIGINT', interrupt);
   process.on('SIGTERM', interrupt);
@@ -45,7 +51,7 @@ async function main() {
     const deadline = Date.now() + 90000;
     while (Date.now() < deadline) {
       if (failure) throw failure;
-      if (pod && (pod.exitCode !== null || pod.signalCode !== null)) throw Error('Delivery exited while waiting for ' + label);
+      for (const pod of pods) if ((pod.exitCode !== null || pod.signalCode !== null)) throw Error('Delivery exited while waiting for ' + label);
       const value = await probe();
       if (value) return value;
       await delay(150);
@@ -54,7 +60,7 @@ async function main() {
   }
 
   // Serve the same HTTP Request/Response contract for JSON, SSE, multipart, and binary Git traffic.
-  async function serve(handler: (req: Request) => Promise<Response>) {
+  async function serve(handler: (req: Request) => Promise<Response>, bindPort = 0) {
     const server = createServer(async (req, res) => {
       try {
         const chunks: Buffer[] = [];
@@ -72,13 +78,16 @@ async function main() {
         res.writeHead(500).end();
       }
     });
-    const port = await listen(server);
+    const port = await listen(server, bindPort);
     return { baseUrl: 'http://' + loopback + ':' + port, close: () => close(server) };
   }
 
   async function stopPod(requireCleanExit = false) {
-    const child = pod;
-    pod = undefined;
+    await Promise.all([...pods].map(child => stopChild(child, requireCleanExit)));
+  }
+
+  async function stopChild(child: ChildProcess, requireCleanExit: boolean) {
+    pods.delete(child);
     if (!child?.pid || child.exitCode !== null || child.signalCode !== null) {
       assert.ok(!requireCleanExit, 'Expected a running Pod for a planned restart');
       return;
@@ -104,7 +113,8 @@ async function main() {
     const jms = offlineJumpServer({ ansibleRepo });
     const jmsServer = await serve(jms.handle);
     cleanup.push(jmsServer.close);
-    const anthropic = createOfflineAnthropic({ webRepo, apiRepo, ansibleRepo });
+    const { securityReport } = jms;
+    const anthropic = createOfflineAnthropic({ webRepo, apiRepo, ansibleRepo, securityReport });
     const mock = await serve(anthropic.handle);
     cleanup.push(mock.close);
     const jev = offlineJev();
@@ -125,11 +135,12 @@ async function main() {
     const password = external ? env.E2E_MYSQL_PASSWORD ?? '' : randomUUID();
     const database = external ? env.E2E_MYSQL_DATABASE ?? 'detent' : 'detent';
     let port = Number(env.E2E_MYSQL_PORT ?? 3306);
+    const rootPassword = external ? password : randomUUID();
     if (!external) {
       const name = 'detent-e2e-' + randomUUID();
       await run('docker', ['run', '--pull=never', '--rm', '-d', '--name', name, '-p', loopback + '::3306',
-        '-e', 'MYSQL_RANDOM_ROOT_PASSWORD=yes', '-e', 'MYSQL_DATABASE=detent', '-e', 'MYSQL_USER=detent',
-        '-e', 'MYSQL_PASSWORD', 'mysql:8.0'], { env: { ...env, MYSQL_PASSWORD: password } });
+        '-e', 'MYSQL_ROOT_PASSWORD', '-e', 'MYSQL_ROOT_HOST=%', '-e', 'MYSQL_DATABASE=detent', '-e', 'MYSQL_USER=detent',
+        '-e', 'MYSQL_PASSWORD', 'mysql:8.0'], { env: { ...env, MYSQL_ROOT_PASSWORD: rootPassword, MYSQL_PASSWORD: password } });
       cleanup.push(() => run('docker', ['rm', '-f', name]));
       const binding = await run('docker', ['port', name, '3306/tcp']);
       port = Number(binding.stdout.trim().split(':').at(-1));
@@ -149,6 +160,7 @@ async function main() {
     cleanup.push(async () => { if (reservation.listening) await close(reservation); });
     const publicUrl = gitlab.detentPublicUrl(podPort);
     const sandbox = join(tmp, 'sandboxes'), envFile = join(tmp, '.env');
+    await mkdir(sandbox);
     const localEnv = { PATH: env.PATH, HOME: tmp, TMPDIR: tmp };
     const provision = (extra: Record<string, string> = {}) => run(join(process.cwd(), 'node_modules/.bin/tsx'), ['scripts/bootstrap.ts', '--env-out', envFile], {
       env: { ...localEnv, GITLAB_BASE_URL: gitlab.baseUrl, GITLAB_ADMIN_TOKEN: gitlab.adminToken, DETENT_PUBLIC_URL: publicUrl,
@@ -162,6 +174,8 @@ async function main() {
       timeout: 180000,
     });
     await provision({ DETENT_MCP_CAPABILITIES_FILE: capabilitiesFile });
+    const noJmsFile = join(tmp, 'initial.env');
+    await copyFile(envFile, noJmsFile);
     const config = parseEnv(await readFile(envFile, 'utf8'));
     assert.equal((await stat(envFile)).mode & 0o777, 0o600);
     assert.equal(config.GITLAB_ADMIN_TOKEN, undefined);
@@ -191,7 +205,7 @@ async function main() {
     const jmsEnv = { JUMPSERVER_BASE_URL: jmsServer.baseUrl, JUMPSERVER_READONLY_TOKEN: jms.readonly, JUMPSERVER_JOB_TOKEN: jms.job };
     await provision(jmsEnv);
     const withJms = parseEnv(await readFile(envFile, 'utf8'));
-    assert.deepEqual({ ...withJms }, { ...config, ...jmsEnv }, 'Bootstrap changed existing settings or credentials');
+    assert.ok(isDeepStrictEqual({ ...withJms }, { ...config, ...jmsEnv }), 'Bootstrap changed existing settings or credentials');
     assert.equal(await hubFile(releasePath), savedSop, 'Bootstrap overwrote the customer Agent');
     assert.equal(await gitlab.headSha(hub), hubHead, 'Bootstrap changed the Hub repository on its second run');
     const labels = await admin.json<{ name: string }[]>('/projects/' + hub + '/labels?per_page=100');
@@ -211,29 +225,30 @@ async function main() {
       assert.equal(hooks[0].deployment_events, p.id !== hub);
       assert.equal(hooks[0].push_events, false);
     }
-    const podGets = new Map<string, number>();
-    async function observeGet(path: string, act: () => Promise<unknown>) {
-      const key = '/api/v4' + path;
-      const before = podGets.get(key) ?? 0;
+    const observed = new Map<string, number>();
+    async function observe(key: string, act: () => Promise<unknown>) {
+      const before = observed.get(key) ?? 0;
       await act();
-      await until('Pod read ' + path, () => (podGets.get(key) ?? 0) > before);
+      await until('Pod observed ' + key, () => (observed.get(key) ?? 0) > before);
     }
+    const observeGet = (path: string, act: () => Promise<unknown>) => observe('/api/v4' + path, act);
     const secrets = [gitlab.adminToken, config.GITLAB_TOKEN, config.GITLAB_WEBHOOK_SECRET, config.ANTHROPIC_API_KEY,
       'offline-jev-key', mcp.token, jms.readonly, jms.job];
-    if (!external) secrets.push(password);
+    if (password) secrets.push(password);
     function checkSecrets(value: unknown) {
       const body = JSON.stringify(value);
       assert.ok(!secrets.some(secret => secret && body.includes(secret)), 'A credential appeared in E2E output');
       assert.ok(!/https?:\/\/oauth2:(?!\*\*\*@)[^\s/@]+@/i.test(body), 'A Git URL exposed credentials');
     }
     anthropic.checkRequests(checkSecrets);
-    async function startPod(id: string, settings: NodeJS.ProcessEnv) {
-      assert.equal(settings.ANTHROPIC_BASE_URL, mock.baseUrl, 'Claude Code requires the loopback mock');
-      pod = spawn(process.execPath, ['--import', './scripts/e2e/observe-gitlab.mjs', 'packages/delivery/dist/server.js'], {
+    async function startPod(id: string, settings: NodeJS.ProcessEnv = {}, service: 'core' | 'delivery' = 'delivery', file = noJmsFile) {
+      assert.equal(config.ANTHROPIC_BASE_URL, mock.baseUrl, 'Claude Code requires the loopback mock');
+      const pod = spawn(process.execPath, ['--env-file=' + file, '--import', './scripts/e2e/observe-gitlab.mjs', 'packages/' + service + '/dist/server.js'], {
         env: { ...localEnv, ...settings, POD_ID: id, JEV_PROVIDER: 'bailian',
           JEV_BASE_URL: jevServer.baseUrl + '/compatible-mode/v1/systemone', JEV_API_KEY: 'offline-jev-key', HARBOR_SYNC_TOKEN: mcp.token },
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'], detached: true,
       });
+      pods.add(pod);
       for (const [stream, output] of [[pod.stdout!, process.stdout], [pod.stderr!, process.stderr]] as const) {
         createInterface({ input: stream }).on('line', line => {
           try { checkSecrets(line); output.write(line + '\n'); }
@@ -241,11 +256,11 @@ async function main() {
         });
       }
       pod.on('message', path => {
-        if (typeof path === 'string') podGets.set(path, (podGets.get(path) ?? 0) + 1);
+        if (typeof path === 'string') observed.set(path, (observed.get(path) ?? 0) + 1);
       });
       pod.on('error', error => { failure = error; });
       await until(id + ' health check', async () => {
-        const res = await fetch('http://' + loopback + ':' + podPort + '/healthz').catch(() => undefined);
+        const res = await fetch('http://' + loopback + ':' + (settings.PORT ?? podPort) + '/healthz').catch(() => undefined);
         return res?.ok && (await res.json()).podId === id;
       });
     }
@@ -293,9 +308,6 @@ async function main() {
       if (errors.length) throw new AggregateError(errors, 'Could not remove GitLab fixtures');
     });
     cleanup.push(() => stopPod());
-    const noJms = Object.fromEntries(Object.entries(config).filter(([key]) => !key.startsWith('JUMPSERVER_')));
-    await startPod('detent-pod-nojms', noJms);
-    assert.deepEqual(await rows('SELECT id FROM issue_sessions WHERE hub_project_id=? LIMIT 1', [hub]), [], 'Hub already has sessions');
     const notes = (iid: number) => gitlab.listIssueNotes(hub, iid);
     const award = (iid: number, approval: RowDataPacket, actor: 'dev' | 'sre') =>
       gitlab.awardThumbsUp(hub, iid, approval.gitlab_note_id, actor);
@@ -330,10 +342,22 @@ async function main() {
       assert.equal((await rows('SELECT status FROM approval_requests WHERE id=?', [approval.id]))[0].status, 'PENDING');
     }
 
+    const shared = { gitlab, admin, hub, rows, records, state, until, openIssue, pendingCard, anthropic,
+      checkSecrets, observeGet, sandbox, stopPod: () => stopPod(true) };
+    const isolationIssue = await standaloneAndUpgrade({ ...shared, startPod, sql: { host, port, user, password, database },
+      adminSql: { host, port, user: external ? user : 'root', password: rootPassword } });
+    await checkStartupFailures(shared, localEnv, isolationIssue);
+    if (gitlab.synthetic) await brownfieldOnboarding(shared, localEnv, tmp, publicUrl);
+    await startPod('detent-issue-lifecycles', {}, 'delivery', envFile);
+    await runIssueScenarios({ ...shared, observeWebhook: act => observe('webhook-accepted', act), startPod: id => startPod(id, {}, 'delivery', envFile) });
+    await stopPod(true);
+    await startPod('detent-post-upgrade');
+
+    const requestsBeforeMissing = anthropic.getRequests();
     const missing = await openIssue('Inspect web01', '', 'delivery::env-change');
     await state(missing, 'IDLE');
     assert.equal((await gitlab.getIssue(hub, missing)).state, 'opened');
-    assert.equal(anthropic.getRequests(), 0);
+    assert.equal(anthropic.getRequests(), requestsBeforeMissing);
     const guidance = (await notes(missing)).map(n => n.body).join('\n');
     assert.match(guidance, /agents\/env-change\/AGENT\.md/);
     assert.match(guidance, /jumpserver：.*JUMPSERVER_BASE_URL/);
@@ -537,9 +561,10 @@ async function main() {
       console.log('Verified live policy changes, in-turn MR steering, and the deployment alert Issue.');
     }
 
-    await runMrScenarios({ gitlab, admin, db, until, rows, records, mrState, state, openIssue, pendingCard, trackMr,
-      anthropic, jev, bot, hub, api: api.id, missing, standalone, observeGet, checkSecrets, sandbox,
-      stopPod: () => stopPod(true), startPod: (id, overrides) => startPod(id, { ...noJms, ...overrides }) });
+    const harness = { gitlab, admin, db, until, rows, records, mrState, state, openIssue, pendingCard, trackMr,
+      anthropic, jev, bot, hub, api: api.id, isolationIssue, standalone, observeGet, checkSecrets, sandbox,
+      stopPod: () => stopPod(true), startPod: (id: string, overrides?: NodeJS.ProcessEnv) => startPod(id, overrides) };
+    await runMrScenarios(harness);
 
     const shaToPublish = await gitlab.headSha(web.id);
     for (const workflow of ['release', 'hotfix']) {
@@ -579,7 +604,7 @@ async function main() {
       console.log('Verified live ' + workflow + ' SOP, production approvals and closed Issue.');
     }
     await stopPod();
-    await startPod('detent-pod-1', withJms);
+    await startPod('detent-pod-1', {}, 'delivery', envFile);
     const inspection = await openIssue('Diagnose nginx on web01', '', 'delivery::audit');
     const inspected = await done(inspection);
     assert.deepEqual(await records(inspected.id, 'approval_requests'), []);
@@ -600,7 +625,7 @@ async function main() {
     assert.deepEqual(await readdir(sandbox), []);
     console.log('Plan persisted. Restarting the delivery pod.');
     await stopPod();
-    await startPod('detent-pod-2', withJms);
+    await startPod('detent-pod-2', {}, 'delivery', envFile);
     await award(change, plan, 'dev');
     const coding = await state(change, 'IDLE');
     assert.equal(coding.claude_session_id, first.claude_session_id);
@@ -660,6 +685,8 @@ async function main() {
     assert.equal(audit.agent_profile, 'env-change');
     assert.equal(audit.status, 'SUCCESS');
     assert.match(audit.output_summary, /nginx reloaded/);
+    assert.ok(audit.output_summary.includes('https://oauth2:***@127.0.0.1/repo.git'));
+    checkSecrets(audit.output_summary);
     assert.ok(audit.finished_at);
     assert.ok((await notes(change)).some(n => n.body.includes('Reload verified on web01')));
     const history = await transcript();
@@ -669,6 +696,34 @@ async function main() {
     assert.ok(history.every((row, i) => row.seq === i + 1));
     assert.deepEqual(await readdir(sandbox), []);
     console.log('Verified production approval, execution audit, /status, transcript and sandbox cleanup.');
+    await stopPod(true);
+    if (gitlab.synthetic) {
+      const sockets = [createServer(), createServer()];
+      const ports = await Promise.all(sockets.map(socket => listen(socket)));
+      await Promise.all(sockets.map(close));
+      const sandboxes = ['a', 'b'].map(name => join(tmp, 'sandboxes-' + name));
+      await Promise.all(sandboxes.map(dir => mkdir(dir)));
+      assert.ok(config.GITLAB_WEBHOOK_SECRET);
+      const proxy = await webhookProxy(serve, podPort, { a: ports[0], b: ports[1] }, config.GITLAB_WEBHOOK_SECRET);
+      cleanup.push(proxy.close);
+      cleanup.push(() => stopPod());
+      const cluster = { ...proxy, sandboxes, stop: () => stopPod(true), async start(settings: NodeJS.ProcessEnv = {}) {
+        await Promise.all(['a', 'b'].map((name, i) => startPod('detent-pod-' + name, {
+          PORT: String(ports[i]), EPHEMERAL_ROOT: sandboxes[i], WATCHDOG_INTERVAL_MS: '0',
+          JUMPSERVER_BLOCKED_ASSETS: 'blocked-db-01', JUMPSERVER_BLOCK_FAILED_PIPELINE: 'true', ...settings,
+        }, 'delivery', envFile)));
+      } };
+      await cluster.start();
+      await runConcurrency(harness, cluster, web.id);
+      await runSecurity(harness, cluster, web.id, target.id, jms, securityReport, iid => issueIds.push(iid));
+      await cluster.stop();
+      for (const dir of sandboxes) assert.deepEqual(await readdir(dir), []);
+    }
+    for (const session of await rows('SELECT * FROM issue_sessions WHERE hub_project_id IN (?,?,?,?)', projects.map(p => p.id))) {
+      await checkSession(shared, session);
+      checkSecrets(await records(session.id, 'delivery_executions'));
+    }
+    if (failure) throw failure;
   } finally {
     const errors = [];
     for (const dispose of cleanup.reverse()) {
@@ -680,4 +735,7 @@ async function main() {
   }
 }
 
-main().catch(error => { console.error(error); process.exitCode = 1; });
+main().then(() => {
+  if (!process.env.E2E_GITLAB_URL)
+    console.log('Offline E2E passed: install/upgrade (3), Issues (11), MRs (14), concurrency (4), security/events (4). Total: 36.');
+}).catch(error => { console.error(error); process.exitCode = 1; });

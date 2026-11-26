@@ -108,6 +108,17 @@ it('neutralizes quick actions and redacts credentials on both GitLab note endpoi
   for (const [, request] of http.mock.calls)
     expect(JSON.parse(request.body)).toEqual({ body: 'https://oauth2:***@git/repo\n\\/close\n \t\\/approve' });
 });
+it('redacts extension credentials in job traces and discussion replies, including a trace split by the length limit', async () => {
+  const http = vi.fn();
+  const config = { ...loadConfig({ JEV_API_KEY: 'decision-key' }), additionalSecrets: ['remote-token'] };
+  const client = new GitLabClient(config, http);
+  const padding = 'x'.repeat(15995);
+  http.mockResolvedValueOnce(new Response('remote-token' + padding));
+  expect(await client.getJobTrace(1, 42)).toBe('***' + padding);
+  http.mockResolvedValueOnce(Response.json({ id: 7 }));
+  await client.createMergeRequestDiscussionNote(1, 2, 'thread', 'remote-token decision-key\n/merge');
+  expect(JSON.parse(http.mock.calls[1][1].body)).toEqual({ body: '*** ***\n\\/merge' });
+});
 it('closes the Issue by IID and applies the done label', async () => {
   const http = vi.fn().mockResolvedValue(Response.json({}));
   const client = new GitLabClient(loadConfig({}), http);

@@ -83,7 +83,7 @@ const columns = (obj: object) =>
 export class MySqlDetentRepository implements DetentRepository {
   constructor(private pool: Pool) {}
   async requestStop(id: string, owner: string) {
-    await this.change('UPDATE issue_sessions SET stop_requested=TRUE WHERE id=? AND locked_by_pod=?', [
+    await this.change('UPDATE issue_sessions SET stop_requested=TRUE WHERE id=? AND locked_by_pod=? AND lock_expires_at>NOW(3)', [
       id,
       owner,
     ]);

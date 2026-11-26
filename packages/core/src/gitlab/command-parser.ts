@@ -43,7 +43,7 @@ export function parseNoteIntent({
   if (match) {
     const type = commands[match[1].toLowerCase() as keyof typeof commands];
     const args = match[2];
-    if (args ? ['PLAN', 'APPROVE', 'REJECT', 'USE'].includes(type) : type !== 'USE')
+    if (args ? ['PLAN', 'APPROVE', 'REJECT', 'USE', 'RESET'].includes(type) : type !== 'USE')
       return { ...actor, type, comment: args };
   }
   if (

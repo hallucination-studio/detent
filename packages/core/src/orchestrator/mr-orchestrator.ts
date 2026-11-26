@@ -6,6 +6,7 @@ import type { DetentExtensions } from '../extensions.js';
 import { PermissionGate, ColdHold } from '../claude/permission-gate.js';
 import { buildMrSystemPrompt, inlinePosition } from '../claude/prompts.js';
 import type { ClaudeRunner } from '../claude/runner.js';
+import { configuredSecrets } from '../gitlab/redact.js';
 import { TranscriptHydrator } from '../claude/transcript-hydrator.js';
 import { redactGitUrl, type GitLabClient } from '../gitlab/client.js';
 import { hasBotMention, parseNoteIntent, parseEmojiIntent } from '../gitlab/command-parser.js';
@@ -203,7 +204,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
       streamer = new NoteStreamer(this.config.noteStreamThrottleMs, body => channel.updateNote(note.id, redact(body)), async () => '');
       sandbox = await host.prepareTurnSandbox(s);
       const tree = await host.ensureMrWorktree(sandbox, s.id, { sourceProjectId: mr.source_project_id, sourceBranch: mr.source_branch, targetBranch: mr.target_branch });
-      const transcript = new TranscriptHydrator(this.repo);
+      const transcript = new TranscriptHydrator(this.repo, configuredSecrets(this.config));
       const { workspaceRoot, claudeHome } = sandbox;
       await transcript.hydrateTranscriptToTmp(s, claudeHome, workspaceRoot);
       const flush = () => transcript.flushIncrementalTranscriptToMySql(s, claudeHome, workspaceRoot, s.claudeSessionId!);

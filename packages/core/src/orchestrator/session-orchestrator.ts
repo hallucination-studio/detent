@@ -16,6 +16,7 @@ import type { WebhookEvent } from '../gitlab/webhook.js';
 import { escapeTableCell, NoteStreamer, renderPlanApprovalCard, renderSummary } from '../gitlab/note-streamer.js';
 import { EphemeralSandbox, type TurnSandbox, type WorkspaceGitLab } from '../workspace/ephemeral-sandbox.js';
 import { WorkspaceTools } from '../workspace/mcp-tools.js';
+import { configuredSecrets } from '../gitlab/redact.js';
 import { TranscriptHydrator } from '../claude/transcript-hydrator.js';
 import { ColdHold, PermissionGate } from '../claude/permission-gate.js';
 import { buildSystemPrompt } from '../claude/prompts.js';
@@ -84,8 +85,11 @@ export class SessionOrchestrator extends TurnRuntime {
     const issue = event.object_attributes;
     const s = await this.repo.getOrCreateSession(event.project.id, issue.iid, issue.title);
     await this.withLease(s, async (session, active) => {
-      if (session.status === 'PLANNING')
-        await this.run(session, active, issue.title + '\n' + (issue.description ?? ''));
+      if (issue.action === 'reopen' && session.status === 'DONE') {
+        if ((await this.gitlab.getIssue(session.hubProjectId, session.hubIssueIid)).state !== 'opened') return;
+        session.permissionMode = 'plan';
+      } else if (session.status !== 'PLANNING') return;
+      await this.run(session, active, issue.title + '\n' + (issue.description ?? ''));
     });
   }
   private channel(s: IssueSessionRow) {
@@ -129,7 +133,7 @@ export class SessionOrchestrator extends TurnRuntime {
     const channel = this.channel(s);
     const drainInbox = () => this.drainInbox(s.id, active);
     const host = new EphemeralSandbox(this.config, this.repo, this.gitlab);
-    const transcripts = new TranscriptHydrator(this.repo);
+    const transcripts = new TranscriptHydrator(this.repo, configuredSecrets(this.config));
     const { controller } = active;
     let sandbox: TurnSandbox | undefined;
     let streamer: NoteStreamer | undefined;

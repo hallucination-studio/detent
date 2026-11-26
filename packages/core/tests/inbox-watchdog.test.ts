@@ -10,6 +10,7 @@ import { GitLabClient } from '../src/gitlab/client.js';
 import { loadConfig } from '../src/config.js';
 import { SdkClaudeRunner, type TurnInput } from '../src/claude/runner.js';
 import { SessionOrchestrator } from '../src/orchestrator/session-orchestrator.js';
+import { StopTurn } from '../src/orchestrator/turn-runtime.js';
 import { Watchdog } from '../src/orchestrator/watchdog.js';
 import { bareProjects } from './bare-projects.js';
 import { InMemoryDetentRepository } from './memory-repository.js';
@@ -66,6 +67,29 @@ it('delivers busy comments through PostToolUse and starts a final follow-up unde
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+it('keeps the SDK transport open for in-flight control replies when a turn is interrupted', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'detent-interrupt-'));
+  try {
+    const { config, repo, run, pod } = await setup(root);
+    const session = await repo.getOrCreateSession(1, 5, 'interrupt');
+    const interrupt = vi.fn(async () => {});
+    let transportAborted: boolean | undefined;
+    run.mockImplementation(async turn => {
+      const messages = Object.assign((async function* () {
+        turn.controller.abort(new StopTurn());
+        transportAborted = vi.mocked(query).mock.lastCall![0].options!.abortController!.signal.aborted;
+      })(), { interrupt, setModel: vi.fn(), setPermissionMode: vi.fn(), supportedCommands: vi.fn(),
+        supportedModels: vi.fn(), mcpServerStatus: vi.fn() });
+      vi.mocked(query).mockReturnValueOnce(messages);
+      return new SdkClaudeRunner(config).run(turn);
+    });
+    await pod.resumeSession(session.id, 'start');
+    expect(interrupt).toHaveBeenCalledOnce();
+    expect(transportAborted).toBe(false);
+    expect(await repo.getSession(session.id)).toMatchObject({ status: 'IDLE', lockedByPod: null });
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 it('recovers an expired turn once across pods, reports exhaustion and wakes stranded inboxes', async () => {

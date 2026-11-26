@@ -112,10 +112,11 @@ export class TurnRuntime {
     }
   }
   protected async stop(s: IssueSessionRow) {
-    if (!s.lockedByPod || Number(s.lockExpiresAt) <= Date.now()) return;
+    if (!s.lockedByPod) return;
+    // The database evaluates lease expiry. The caller then acquires the lease or retries on SessionBusy.
     await this.repo.requestStop(s.id, s.lockedByPod);
-    this.active.get(s.id)?.controller.abort(new StopTurn());
-    throw new SessionBusy('Waiting for turn to checkpoint and release');
+    const active = this.active.get(s.id);
+    if (active?.owner === s.lockedByPod) active.controller.abort(new StopTurn());
   }
   protected async archiveWorktrees(sessionId: string) {
     for (const tree of await this.repo.listActiveWorktrees(sessionId)) await this.repo.archiveWorktree(tree.id);

@@ -1,6 +1,6 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { loadConfig, type AppConfig } from '@detent/core';
+import { loadConfig, redactGitUrl, type AppConfig } from '@detent/core';
 import { z } from 'zod';
 import { assertSeparateCredentials, redactSecrets, type DeliveryConfig } from '../config.js';
 import { playbookUpload } from './playbook.js';
@@ -67,7 +67,7 @@ export class HttpJumpServerClient implements JumpServerClient {
   private readonly base: string;
   constructor(
     private readonly config: DeliveryConfig,
-    private readonly gitlab: Pick<AppConfig, 'gitlabBaseUrl' | 'gitlabToken'> = loadConfig(),
+    private readonly gitlab: Pick<AppConfig, 'gitlabBaseUrl' | 'gitlabToken' | 'jevApiKey'> = loadConfig(),
   ) {
     assertSeparateCredentials(config);
     if (!config.jumpserverBaseUrl) throw Error('JumpServer base URL is not configured');
@@ -182,7 +182,8 @@ export class HttpJumpServerClient implements JumpServerClient {
         output += '\n' + log.data;
       }
     }
-    return { jobId, jobUrl: this.jobUrl(jobId), status, outputSummary: redactSecrets(output, this.config).slice(0, 16000) };
+    const safe = redactSecrets(redactGitUrl(output), this.config, this.gitlab.gitlabToken, this.gitlab.jevApiKey ?? '');
+    return { jobId, jobUrl: this.jobUrl(jobId), status, outputSummary: safe.slice(0, 16000) };
   }
 
   async getJobResult(jobId: string) {

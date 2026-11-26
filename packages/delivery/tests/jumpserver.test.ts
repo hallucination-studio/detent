@@ -164,6 +164,18 @@ it('redacts GitLab and JumpServer credentials when the playbook archive fetch fa
   await expect(client.runAnsibleJob(request)).rejects.toMatchObject({ message: 'Archive fetch failed: *** / "***" / *** / ***' });
 });
 
+it('scrubs mixed credentials from the structured job result used for the delivery audit', async () => {
+  const { reply } = http();
+  const client = new HttpJumpServerClient(loadDeliveryConfig(env), {
+    gitlabBaseUrl: 'https://git.test', gitlabToken: 'bot-token', jevApiKey: 'jev-token',
+  });
+  reply({ status: 'success', summary: { message: 'jev-token' } });
+  reply({ result: { trace: 'https://oauth2:unknown@git/repo bot-token ' + env.JUMPSERVER_JOB_TOKEN } });
+  expect((await client.getJobResult('execution')).outputSummary).toBe(
+    '{"message":"***"}\n{"trace":"https://oauth2:***@git/repo *** ***"}',
+  );
+});
+
 it('keeps secrets out of HTTP/transport errors and inspection output on older result APIs', async () => {
   const { fetch, reply } = http();
   const client = new HttpJumpServerClient(loadDeliveryConfig(env));

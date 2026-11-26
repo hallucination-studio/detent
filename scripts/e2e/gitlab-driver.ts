@@ -36,6 +36,9 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
   const issues = (id: number, iid: number) => project(id) + '/issues/' + iid;
   const mr = (id: number, iid: number) => project(id) + '/merge_requests/' + iid;
   const file = (id: number, path: string) => project(id) + '/repository/files/' + encodeURIComponent(path);
+  async function awardIssueEmoji(id: number, iid: number, noteId: number, actor: Actor, name: 'thumbsup' | 'thumbsdown') {
+    await api.request(issues(id, iid) + '/notes/' + noteId + '/award_emoji', 'POST', { name }, tokens[actor]);
+  }
   return {
     async ensureLabel(id: number, name: string) {
       const path = project(id) + '/labels';
@@ -61,9 +64,13 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
       return issue.iid;
     },
     getIssue(id: number, iid: number) { return api.json<Issue>(issues(id, iid)); },
+    setIssueState(id: number, iid: number, state_event: 'close' | 'reopen') {
+      return api.json<Issue>(issues(id, iid), 'PUT', { state_event }, tokens.dev);
+    },
     listIssueNotes(id: number, iid: number) { return api.json<Note[]>(issues(id, iid) + '/notes?per_page=100'); },
-    async awardThumbsUp(id: number, iid: number, noteId: number, actor: Actor) {
-      await api.request(issues(id, iid) + '/notes/' + noteId + '/award_emoji', 'POST', { name: 'thumbsup' }, tokens[actor]);
+    awardIssueEmoji,
+    awardThumbsUp(id: number, iid: number, noteId: number, actor: Actor) {
+      return awardIssueEmoji(id, iid, noteId, actor, 'thumbsup');
     },
     async postNote(id: number, iid: number, body: string, actor: Actor = 'dev') {
       await api.request(issues(id, iid) + '/notes', 'POST', { body }, tokens[actor]);
@@ -87,6 +94,9 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
     async unassignMr(id: number, iid: number) {
       await api.request(mr(id, iid), 'PUT', { assignee_ids: [] }, tokens.dev);
     },
+    reopenMr(id: number, iid: number) {
+      return api.json<MR>(mr(id, iid), 'PUT', { state_event: 'reopen' }, tokens.dev);
+    },
     async closeMr(id: number, iid: number) {
       await api.request(mr(id, iid), 'PUT', { state_event: 'close' }, tokens.dev);
     },
@@ -97,8 +107,8 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
     listMrDiscussions(id: number, iid: number) {
       return api.json<Discussion[]>(mr(id, iid) + '/discussions?per_page=100');
     },
-    openDiscussion(id: number, iid: number, body: string, position?: InlinePosition) {
-      return api.json<Discussion>(mr(id, iid) + '/discussions', 'POST', { body, position }, tokens.dev);
+    openDiscussion(id: number, iid: number, body: string, position?: InlinePosition, actor: Actor = 'dev') {
+      return api.json<Discussion>(mr(id, iid) + '/discussions', 'POST', { body, position }, tokens[actor]);
     },
     getDiscussion(id: number, iid: number, discussion: string) {
       return api.json<Discussion>(mr(id, iid) + '/discussions/' + encodeURIComponent(discussion));
@@ -140,7 +150,8 @@ export interface E2EGitLabDriver extends ReturnType<typeof projectActions> {
   readonly reporterUsername: string;
   readonly podHost: string;
   readonly synthetic?: {
-    failPipeline(project: number, iid: number, botId: number, sha?: string): Promise<number>;
+    checkNoteWrites(botId: number, check: (body: string) => void): void;
+    failPipeline(project: number, iid: number, botId: number, sha?: string, trace?: string): Promise<number>;
     succeedPipeline(project: number, iid: number, botId: number): Promise<number>;
     openReadonlyForkMr(project: number, botId: number): Promise<MR>;
     pushAttempts(project: number): number;

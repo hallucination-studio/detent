@@ -122,6 +122,8 @@ npm run e2e:offline
 E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab
 ```
 
+离线套件分五个阶段验证 36 个场景，覆盖安装升级、Issue 工作流、MR Worker、双 Pod 并发以及安全与事件处理。两个 Pod 共用 MySQL，通过回环代理接收 Webhook，验证并行 SDK 轮次、审批与恢复竞争、凭证脱敏和生产变更硬拦截。
+
 真实模式下，GitLab 公布的 HTTP 克隆地址应与 `E2E_GITLAB_URL` 同源。允许 GitLab 容器向 `host.docker.internal` 投递项目 Webhook。使用其他路由时，以 `E2E_DETENT_PUBLIC_URL` 指定 GitLab 可访问的地址，以 `E2E_POD_PORT` 指定对应的宿主监听端口。每次运行保留独立的 `e2e-*/workspace-hub` 和三个目标项目供复核，并撤销临时令牌。
 
 两种模式均重复运行 bootstrap，检查 Hub 文件、标签、Webhook、凭证及客户自定义 SOP，并覆盖六个 SOP 场景和 V6 MR 交互。

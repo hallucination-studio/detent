@@ -1,38 +1,8 @@
 import assert from 'node:assert/strict';
+import type { RowDataPacket } from 'mysql2/promise';
 import { randomUUID } from 'node:crypto';
-import { readdir } from 'node:fs/promises';
-import type { Pool, RowDataPacket } from 'mysql2/promise';
-import type { E2EGitLabDriver, gitlabApi } from './gitlab-driver.js';
-import type { createOfflineAnthropic } from './offline-anthropic.js';
-import type { offlineJev } from './offline-jev.js';
-
-type Mr = Awaited<ReturnType<E2EGitLabDriver['getMr']>>;
-type MrStatus = 'IDLE' | 'DONE' | 'WAITING_PLAN' | 'WAITING_TOOL' | 'FAILED';
-interface Harness {
-  gitlab: E2EGitLabDriver;
-  admin: ReturnType<typeof gitlabApi>;
-  db: Pool;
-  until<T>(label: string, probe: () => Promise<T> | T): Promise<NonNullable<T>>;
-  rows(sql: string, params?: (string | number)[]): Promise<RowDataPacket[]>;
-  records(session: string, table: string): Promise<RowDataPacket[]>;
-  mrState(project: number, iid: number, status: MrStatus, afterSeq?: number): Promise<RowDataPacket>;
-  state(iid: number, status: string): Promise<RowDataPacket>;
-  openIssue(title: string, description: string, label: string): Promise<number>;
-  pendingCard(iid: number, tool: string, fields: string[]): Promise<RowDataPacket>;
-  trackMr<T extends Mr>(mr: T): T;
-  observeGet(path: string, act: () => Promise<unknown>): Promise<void>;
-  checkSecrets(value: unknown): void;
-  startPod(id: string, overrides?: NodeJS.ProcessEnv): Promise<void>;
-  stopPod(): Promise<void>;
-  anthropic: ReturnType<typeof createOfflineAnthropic>;
-  jev: ReturnType<typeof offlineJev>;
-  bot: { id: number; username: string };
-  hub: number;
-  api: number;
-  missing: number;
-  standalone: Mr;
-  sandbox: string;
-}
+import { checkSession, type Harness } from './harness.js';
+type Mr = Harness['standalone'];
 
 export async function runMrScenarios(h: Harness) {
   const { gitlab, admin, api, hub, bot, standalone, anthropic, until, rows, records, mrState, trackMr } = h;
@@ -41,14 +11,7 @@ export async function runMrScenarios(h: Harness) {
   const requests = anthropic.getRequests;
   const tables = ['session_messages', 'session_inbox', 'session_worktrees', 'session_merge_requests', 'approval_requests'];
   const snapshot = (s: RowDataPacket) => Promise.all(tables.map(table => records(s.id, table)));
-  async function clean(s: RowDataPacket) {
-    const { hub_project_id: project, hub_issue_iid: iid } = s;
-    h.checkSecrets(await snapshot(s));
-    h.checkSecrets(s);
-    if (s.session_kind === 'mr') h.checkSecrets(await gitlab.listMrDiscussions(project, iid));
-    else h.checkSecrets(await gitlab.listIssueNotes(project, iid));
-    assert.deepEqual(await readdir(h.sandbox), [], 'A completed turn left a sandbox');
-  }
+  const clean = (s: RowDataPacket) => checkSession(h, s);
   async function archived(mr: Mr) {
     const s = await mrState(mr.target_project_id, mr.iid, 'DONE');
     assert.deepEqual((await records(s.id, 'session_worktrees')).map(t => t.status), ['ARCHIVED']);
@@ -278,6 +241,46 @@ export async function runMrScenarios(h: Harness) {
   assert.ok((await mrNotes()).every(n => !n.body.includes(privateText)));
   await clean(failed);
 
+  // M-14. A casual discussion leaves the assigned branch intact. Reopen the
+  // subsequently unassigned MR so only an explicit mention can wake its session.
+  const lifecycle = trackMr(await gitlab.openExternalMr(api, 'loader-lifecycle', 'Review loader lifecycle'));
+  const iid = lifecycle.iid;
+  const commits = () => admin.json<{ id: string }[]>(mrPath(iid) + '/commits?per_page=100');
+  await gitlab.assignMr(api, iid, bot.id);
+  const assigned = await mrState(api, iid, 'IDLE', 0);
+  const originalCommits = (await commits()).map(c => c.id);
+  assert.ok(originalCommits.includes(lifecycle.sha));
+  const lunch = await gitlab.openDiscussion(api, iid, 'Anyone free for lunch?');
+  const chatted = await mrState(api, iid, 'IDLE', assigned.last_message_seq);
+  const repliesToLunch = (await gitlab.getDiscussion(api, iid, lunch.id)).notes.filter(n => n.author.username === bot.username);
+  assert.equal(repliesToLunch.length, 1);
+  assert.equal(repliesToLunch[0].body.trim(), 'Enjoy lunch!');
+  assert.equal((await gitlab.getMr(api, iid)).sha, lifecycle.sha);
+  assert.deepEqual((await commits()).map(c => c.id), originalCommits);
+  await gitlab.openDiscussion(api, iid, '/plan Refactor config loader');
+  const firstPlan = await mrState(api, iid, 'WAITING_PLAN', chatted.last_message_seq);
+  const [v1] = await records(firstPlan.id, 'approval_requests');
+  assert.equal(v1.status, 'PENDING');
+  await gitlab.openDiscussion(api, iid, '/reject Preserve existing defaults');
+  const revised = await mrState(api, iid, 'WAITING_PLAN', firstPlan.last_message_seq);
+  const cards = await records(revised.id, 'approval_requests');
+  assert.equal(cards.find(a => a.id === v1.id)?.status, 'REJECTED');
+  const v2 = cards.find(a => a.status === 'PENDING' && a.approval_type === 'PLAN');
+  assert.ok(v2 && v2.gitlab_note_id !== v1.gitlab_note_id);
+  const revisions = (await gitlab.listMrDiscussions(api, iid)).flatMap(d => d.notes);
+  assert.match(revisions.find(n => n.id === v2.gitlab_note_id)?.body ?? '', /Revised loader plan preserves existing defaults/);
+  await gitlab.unassignMr(api, iid);
+  await gitlab.closeMr(api, iid);
+  await archived(lifecycle);
+  assert.equal((await gitlab.reopenMr(api, iid)).state, 'opened');
+  const mentionAgain = await gitlab.openDiscussion(api, iid, '@' + bot.username + ' Please inspect this contribution');
+  const awake = await mrState(api, iid, 'IDLE', revised.last_message_seq);
+  assert.equal(awake.id, assigned.id);
+  assert.equal(awake.claude_session_id, assigned.claude_session_id);
+  assert.ok((await gitlab.getDiscussion(api, iid, mentionAgain.id)).notes.some(n =>
+    n.author.username === bot.username && n.body.includes('Inspected the external contribution.')));
+  await clean(awake);
+
   if (!synthetic) return;
   // M-12. The semantic decision sees the actual event summary and current MR title.
   await withPolicy({ event: 'pipeline', status: 'failed', action: 'semantic', allowedActions: ['notify', 'run'],
@@ -330,12 +333,12 @@ export async function runMrScenarios(h: Harness) {
   assert.ok(!tree.uncommitted_diff);
   await clean(readonly);
 
-  const issue = await h.state(h.missing, 'IDLE');
+  const issue = await h.state(h.isolationIssue, 'IDLE');
   const beforeIssue = await snapshot(issue);
-  const resource = await gitlab.getIssue(hub, h.missing);
-  const notes = await gitlab.listIssueNotes(hub, h.missing);
+  const resource = await gitlab.getIssue(hub, h.isolationIssue);
+  const notes = await gitlab.listIssueNotes(hub, h.isolationIssue);
   const twin = trackMr(await gitlab.openExternalMr(hub, 'hub-isolation'));
-  assert.equal(twin.iid, h.missing);
+  assert.equal(twin.iid, h.isolationIssue);
   assert.equal(twin.iid, 1);
   const mention = await gitlab.openDiscussion(hub, twin.iid, '@' + bot.username + ' Please inspect this contribution');
   const independent = await mrState(hub, twin.iid, 'IDLE', 0);
@@ -343,10 +346,10 @@ export async function runMrScenarios(h: Harness) {
   const kinds = await rows('SELECT session_kind FROM issue_sessions WHERE hub_project_id=? AND hub_issue_iid=? ORDER BY session_kind', [hub, twin.iid]);
   assert.deepEqual(kinds.map(s => s.session_kind), ['issue', 'mr']);
   assert.ok((await gitlab.getDiscussion(hub, twin.iid, mention.id)).notes.some(n => n.author.username === bot.username && n.body.includes('Inspected the external contribution.')));
-  assert.deepEqual(await h.state(h.missing, 'IDLE'), issue);
+  assert.deepEqual(await h.state(h.isolationIssue, 'IDLE'), issue);
   assert.deepEqual(await snapshot(issue), beforeIssue);
-  assert.deepEqual(await gitlab.getIssue(hub, h.missing), resource);
-  assert.deepEqual(await gitlab.listIssueNotes(hub, h.missing), notes);
+  assert.deepEqual(await gitlab.getIssue(hub, h.isolationIssue), resource);
+  assert.deepEqual(await gitlab.listIssueNotes(hub, h.isolationIssue), notes);
   await clean(independent);
   await clean(issue);
 }

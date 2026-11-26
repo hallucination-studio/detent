@@ -5,7 +5,7 @@ export function neutralizeQuickActions(text: string) {
   return text.replace(/\r\n?/g, '\n').replace(/^([^\S\n]*)\/(?=[A-Za-z_])/gm, '$1\\/');
 }
 
-export function renderNote(text: string, secret?: string) {
+export function renderNote(text: string, secret?: string | readonly string[]) {
   return neutralizeQuickActions(redactGitUrl(text, secret));
 }
 

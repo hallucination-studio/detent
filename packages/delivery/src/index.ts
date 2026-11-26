@@ -4,7 +4,7 @@ import {
 } from '@detent/core';
 import { createDeliveryTurnProfileResolver } from './agents/profiles.js';
 import { MySqlDeliveryAuditRepository, formatDeliveryExecutionsStatus, type DeliveryAuditRepository } from './db/audit.js';
-import { loadDeliveryConfig, type DeliveryConfig } from './config.js';
+import { authSecrets, loadDeliveryConfig, type DeliveryConfig } from './config.js';
 import { HttpJumpServerClient, type JumpServerClient } from './jumpserver/client.js';
 import { createJumpServerTools, type DeliveryExecutionTracker } from './jumpserver/tools.js';
 import { matchMergeRequestWebhook } from './webhooks/merge-request.js';
@@ -30,6 +30,8 @@ export interface DeliveryOptions extends DetentExtensions {
 
 export function createDeliveryApp(config: AppConfig = loadConfig(), options: DeliveryOptions = {}): ReturnType<typeof createDetentApp> {
   const { deliveryConfig = loadDeliveryConfig(), jumpserverClient, gitlabClient, executionTracker, ...extensions } = options;
+  config = { ...config, additionalSecrets: [...(config.additionalSecrets ?? []),
+    ...authSecrets(deliveryConfig.jumpserverReadonlyAuth), ...authSecrets(deliveryConfig.jumpserverJobAuth)] };
   const decision = extensions.decisionClient ?? createDecisionClient(config);
   const client = jumpserverClient ?? (deliveryConfig.jumpserverBaseUrl ? new HttpJumpServerClient(deliveryConfig, config) : undefined);
   const auditRepo = executionTracker ? undefined : new MySqlDeliveryAuditRepository();

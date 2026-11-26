@@ -1,4 +1,5 @@
 import * as fs from 'node:fs/promises';
+import { redactGitUrl } from '../gitlab/redact.js';
 import path from 'node:path';
 import type { DetentRepository } from '../db/repository.js';
 import type { IssueSessionRow } from '../types.js';
@@ -9,7 +10,7 @@ export function transcriptPath(home: string, cwd: string, id: string) {
   return path.join(home, '.claude', 'projects', encodeProjectPath(cwd), id + '.jsonl');
 }
 export class TranscriptHydrator {
-  constructor(private repo: DetentRepository) {}
+  constructor(private repo: DetentRepository, private secrets: readonly string[] = []) {}
   async hydrateTranscriptToTmp(session: IssueSessionRow, home: string, cwd: string) {
     if (!session.claudeSessionId) return;
     const messages = await this.repo.getSessionMessages(session.id);
@@ -31,11 +32,17 @@ export class TranscriptHydrator {
     const offset = session.lastMessageSeq;
     if (lines.length < offset) throw Error('Claude transcript was truncated');
     const batch = lines.slice(offset).map((rawJsonLine, i) => {
-      const parsed: unknown = JSON.parse(rawJsonLine);
+      let changed = false;
+      const parsed: unknown = JSON.parse(rawJsonLine, (_key, value: unknown) => {
+        if (typeof value !== 'string') return value;
+        const safe = redactGitUrl(value, this.secrets);
+        if (safe !== value) changed = true;
+        return safe;
+      });
       if (!parsed || typeof parsed !== 'object') throw Error('Invalid JSONL message');
       return {
         seq: session.lastMessageSeq + i + 1,
-        rawJsonLine,
+        rawJsonLine: changed ? JSON.stringify(parsed) : rawJsonLine,
         messageUuid: 'uuid' in parsed && typeof parsed.uuid === 'string' ? parsed.uuid : null,
         messageType: 'type' in parsed && typeof parsed.type === 'string' ? parsed.type : 'unknown',
       };

@@ -101,8 +101,12 @@ export class SdkClaudeRunner implements ClaudeRunner {
     };
     if (this.config.anthropicBaseUrl) env.ANTHROPIC_BASE_URL = this.config.anthropicBaseUrl;
     let diagnostic = '';
+    const transport = new AbortController();
+    let interrupt: (() => void) | undefined;
+    let shutdown: NodeJS.Timeout | undefined;
     try {
       let resultText: string | undefined;
+      t.controller.signal.throwIfAborted();
       const messages = query({
         prompt: t.prompt,
         options: {
@@ -125,7 +129,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
                   'data:text/javascript,import buffer from "node:buffer"%3Bbuffer.SlowBuffer=buffer.Buffer',
                 ],
           cwd: sandbox.workspaceRoot,
-          abortController: t.controller,
+          abortController: transport,
           env,
           permissionMode: gate.readonly ? 'default' : session.permissionMode,
           resume: t.resume ? id : undefined,
@@ -155,6 +159,14 @@ export class SdkClaudeRunner implements ClaudeRunner {
             : canUseTool(name, input),
         },
       });
+      // Stop the turn through the CLI control channel. Killing its transport while
+      // an MCP handler is replying makes SDK 1.x reject outside the message iterator.
+      interrupt = () => {
+        shutdown = setTimeout(() => transport.abort(), 10000);
+        void messages.interrupt().catch(() => transport.abort());
+      };
+      t.controller.signal.addEventListener('abort', interrupt, { once: true });
+      if (t.controller.signal.aborted) interrupt();
       for await (const message of messages) {
         if (message.session_id !== id) throw Error('Claude session identity changed');
         if (message.type === 'stream_event' && t.appendText) {
@@ -167,6 +179,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
           resultText = message.result;
         }
       }
+      t.controller.signal.throwIfAborted();
       if (resultText === undefined) throw Error('Claude ended without a result');
       return resultText;
     } catch (error) {
@@ -177,6 +190,9 @@ export class SdkClaudeRunner implements ClaudeRunner {
         if (secret) message = message.replaceAll(secret, '***');
       }
       throw Error(message);
+    } finally {
+      clearTimeout(shutdown);
+      if (interrupt) t.controller.signal.removeEventListener('abort', interrupt);
     }
   }
 }

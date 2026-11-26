@@ -9,3 +9,8 @@ subscribe('undici:request:headers', ({ request, response }) => {
   const path = request.path.slice(prefix.length);
   if (/^\/api\/v4\/projects\/\d+\/(?:members\/all|merge_requests)\/\d+$/.test(path)) process.send?.(path);
 });
+
+// A live GitLab REST write may return before its webhook reaches the pod.
+subscribe('http.server.response.finish', ({ request, response }) => {
+  if (request.url === '/webhooks/gitlab' && response.statusCode === 202) process.send?.('webhook-accepted');
+});

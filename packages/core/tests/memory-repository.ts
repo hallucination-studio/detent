@@ -24,7 +24,8 @@ import type {
 export class InMemoryDetentRepository implements DetentRepository {
   private stops = new Map<string, string>();
   async requestStop(id: string, owner: string) {
-    if (this.sessions.get(id)?.lockedByPod === owner) this.stops.set(id, owner);
+    const session = this.sessions.get(id);
+    if (session?.lockedByPod === owner && Number(session.lockExpiresAt) > Date.now()) this.stops.set(id, owner);
   }
   async stopRequested(id: string, owner: string) {
     return this.stops.get(id) === owner;

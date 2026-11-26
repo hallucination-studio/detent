@@ -253,17 +253,40 @@ it('revises plans, ignores superseded cards, resets transcript context and repor
     await send(note('/status'));
     expect(gitlab.notes.at(-1)).toContain('IDLE');
     expect(await repo.getLatestPendingApproval(first.id)).toBeNull();
-    await send(note('/reset'));
+    await send(note('/reset Fresh start'));
+    expect(runner.run.mock.calls.at(-1)![0].prompt).toBe('Fresh start');
     expect(modes).toEqual(['plan', 'plan', 'plan', 'default', 'plan', 'plan']);
     const reset = (await repo.getSessionByIssue(1, 42))!;
     expect(reset.id).toBe(first.id);
     expect(reset.claudeSessionId).not.toBe(first.claudeSessionId);
     expect(reset.lastMessageSeq).toBe(1);
     expect(await repo.getSessionMessages(first.id)).toHaveLength(1);
+    await pod.handleIssueClosed(1, 42);
+    const reopened = { ...opened, object_attributes: { ...issue, action: 'reopen' as const } };
+    await send(reopened);
+    await send(reopened);
+    expect(await repo.getSessionByIssue(1, 42)).toMatchObject({
+      id: reset.id, status: 'WAITING_PLAN', permissionMode: 'plan', claudeSessionId: reset.claudeSessionId,
+      lastMessageSeq: 2,
+    });
     expect(await readdir(config.ephemeralRoot)).toEqual([]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+it('interrupts a lease using the database clock when the pod reads its DATETIME in a different timezone', async () => {
+  const repo = new InMemoryDetentRepository();
+  const session = await repo.getOrCreateSession(1, 42, issue.title);
+  await repo.acquireSessionLease(session.id, 'worker', 300);
+  const live = (await repo.getSession(session.id))!;
+  vi.spyOn(repo, 'getSessionByIssue').mockResolvedValue({ ...live, lockExpiresAt: new Date(Date.now() - 8 * 3600_000) });
+  const dir = await mkdtemp(path.join(tmpdir(), 'detent-stop-'));
+  try {
+    const pod = new SessionOrchestrator(loadConfig({}), repo, await mockGitLab(dir), { run: vi.fn() });
+    await expect(pod.handleUserIntent(1, 42, { userId: 7, username: 'dev', type: 'ABORT' })).rejects.toBeInstanceOf(SessionBusy);
+    expect(await repo.stopRequested(session.id, 'worker')).toBe(true);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 it('stops waiting for an approval lease when the original pod resumes coding', async () => {

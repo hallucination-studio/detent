@@ -58,19 +58,19 @@ export function loadDeliveryConfig(env: NodeJS.ProcessEnv = process.env): Delive
   return config;
 }
 
-function secrets(auth?: JumpServerAuth) {
+export function authSecrets(auth?: JumpServerAuth) {
   if (!auth) return [];
   return auth.kind === 'bearer' ? [auth.token] : [auth.accessKeyId, auth.accessKeySecret];
 }
 
 export function assertSeparateCredentials(config: DeliveryConfig) {
-  const readonly = secrets(config.jumpserverReadonlyAuth);
-  if (secrets(config.jumpserverJobAuth).some(secret => readonly.includes(secret)))
+  const readonly = authSecrets(config.jumpserverReadonlyAuth);
+  if (authSecrets(config.jumpserverJobAuth).some(secret => readonly.includes(secret)))
     throw Error('JumpServer readonly and job-center credentials must be separate');
 }
 
 export function redactSecrets(value: string, config: DeliveryConfig, ...additionalSecrets: string[]) {
-  return redactValues(value, [...secrets(config.jumpserverReadonlyAuth), ...secrets(config.jumpserverJobAuth), ...additionalSecrets]);
+  return redactValues(value, [...authSecrets(config.jumpserverReadonlyAuth), ...authSecrets(config.jumpserverJobAuth), ...additionalSecrets]);
 }
 
 export function redactValues(value: string, values: string[]) {

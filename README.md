@@ -176,6 +176,8 @@ E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab
 
 Set the live URL to the origin GitLab advertises for HTTP clones. Allow the GitLab container to send project webhooks to `host.docker.internal`. For another route, set `E2E_DETENT_PUBLIC_URL` to the address GitLab can reach and `E2E_POD_PORT` to the corresponding host listener port. Each live run leaves its own `e2e-*/workspace-hub` and three target projects for inspection and revokes its temporary tokens.
 
+The offline suite covers 36 scenarios across installation and upgrades, Issue workflows, MR workers, two-Pod concurrency, and security and event handling. The cluster shares MySQL and receives webhooks through a loopback proxy. The suite checks simultaneous SDK turns, competing approvals and watchdogs, credential redaction, and production guard denials.
+
 Both targets run bootstrap twice to verify Hub files, labels, hooks, and preservation of credentials and a customized SOP. They exercise the six SOP scenarios and the V6 MR interactions.
 
 1. A missing capability produces guidance with zero model calls. An unlabeled image request is clarified, routed to its Agent, approved, and completed.

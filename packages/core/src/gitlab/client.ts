@@ -1,5 +1,5 @@
 import { renderNote } from './note-streamer.js';
-import { redactGitUrl } from './redact.js';
+import { configuredSecrets, redactGitUrl } from './redact.js';
 import type { AppConfig } from '../config.js';
 import type { GitLabUser, SessionStatus } from '../types.js';
 
@@ -90,11 +90,12 @@ async function onNotFound<T, F>(request: Promise<T>, fallback: F): Promise<T | F
   }
 }
 export class GitLabClient {
+  private readonly secrets: string[];
   private identity?: GitLabUser;
   constructor(
     private config: AppConfig,
     private http: typeof fetch = fetch,
-  ) {}
+  ) { this.secrets = configuredSecrets(config); }
   private async request(path: string, method = 'GET', body?: object) {
     const response = await this.http(this.config.gitlabBaseUrl.replace(/\/$/, '') + '/api/v4' + path, {
       method,
@@ -215,13 +216,13 @@ export class GitLabClient {
   }
   createTag(project: number, input: { tag_name: string; ref: string; message?: string }) {
     return this.json<Tag>(this.project(project) + '/repository/tags', 'POST', {
-      ...input, message: input.message && renderNote(input.message, this.config.jevApiKey),
+      ...input, message: input.message && renderNote(input.message, this.secrets),
     });
   }
   createRelease(project: number, input: { tag_name: string; ref: string; name?: string; description?: string }) {
     return this.json<Release>(this.project(project) + '/releases', 'POST', {
-      ...input, name: input.name && renderNote(input.name, this.config.jevApiKey),
-      description: input.description && renderNote(input.description, this.config.jevApiKey),
+      ...input, name: input.name && renderNote(input.name, this.secrets),
+      description: input.description && renderNote(input.description, this.secrets),
     });
   }
   private mrPath(project: number, iid: number) {
@@ -249,10 +250,10 @@ export class GitLabClient {
     return this.mrPath(project, mrIid) + '/discussions/' + encodeURIComponent(discussionId) + '/notes';
   }
   private createNote(path: string, body: string) {
-    return this.json<{ id: number }>(path, 'POST', { body: renderNote(body, this.config.jevApiKey) });
+    return this.json<{ id: number }>(path, 'POST', { body: renderNote(body, this.secrets) });
   }
   private async updateNote(path: string, noteId: number, body: string) {
-    await this.request(path + '/' + noteId, 'PUT', { body: renderNote(body, this.config.jevApiKey) });
+    await this.request(path + '/' + noteId, 'PUT', { body: renderNote(body, this.secrets) });
   }
   createMergeRequestNote(project: number, mrIid: number, body: string) {
     return this.createNote(this.mrPath(project, mrIid) + '/notes', body);
@@ -268,11 +269,11 @@ export class GitLabClient {
   }
   async createCommitComment(project: number, sha: string, note: string) {
     await this.request(this.project(project) + '/repository/commits/' + encodeURIComponent(sha) + '/comments',
-      'POST', { note: renderNote(note, this.config.jevApiKey) });
+      'POST', { note: renderNote(note, this.secrets) });
   }
   createIssue(project: number, input: { title: string; description: string; labels?: readonly string[] }) {
     return this.json<Issue>(this.project(project) + '/issues', 'POST', {
-      title: renderNote(input.title, this.config.jevApiKey), description: renderNote(input.description, this.config.jevApiKey),
+      title: renderNote(input.title, this.secrets), description: renderNote(input.description, this.secrets),
       labels: input.labels?.join(','),
     });
   }
@@ -286,8 +287,8 @@ export class GitLabClient {
       return await this.json<MergeRequest>(resource, 'POST', {
         source_branch,
         target_branch,
-        title: renderNote(title, this.config.jevApiKey),
-        description: renderNote(description, this.config.jevApiKey),
+        title: renderNote(title, this.secrets),
+        description: renderNote(description, this.secrets),
         assignee_ids: input.assignee_ids,
       });
     } catch (error) {
@@ -330,8 +331,8 @@ export class GitLabClient {
       }
     }
     return redactGitUrl(
-      (await (await this.request(this.project(p) + '/jobs/' + id + '/trace')).text()).slice(-16000), this.config.jevApiKey,
-    );
+      await (await this.request(this.project(p) + '/jobs/' + id + '/trace')).text(), this.secrets,
+    ).slice(-16000);
   }
   buildAuthenticatedCloneUrl(httpUrl: string) {
     const url = new URL(httpUrl);

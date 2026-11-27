@@ -28,7 +28,7 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
   if (!body.tools?.length) return text('Delivery request');
   const blocks = body.messages.flatMap(m => typeof m.content === 'string' ? [text(m.content)] : m.content);
   const prefix = 'mcp__detent__';
-  const toolName = (name: string) => ['Read', 'Write', 'Bash', 'Task'].includes(name) ? name : prefix + name;
+  const toolName = (name: string) => ['Read', 'Write', 'Bash'].includes(name) ? name : prefix + name;
   const use = (name: string, input: object): Use => {
     assert.ok(body.tools?.some(t => t.name === toolName(name)), 'SDK did not advertise ' + toolName(name));
     return { type: 'tool_use', id: 'toolu_' + randomUUID(), name: toolName(name), input };
@@ -47,7 +47,7 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
   }
   const approved = blocks.findIndex(b => b.type === 'text' && b.text.includes('实施方案已获批准'));
   const system = contents(body.system ?? '');
-  const sopPath = /^当前(?: Agent|工作流)：(.+)$/m.exec(system)?.[1];
+  const sopPath = /^当前 Agent：(.+)$/m.exec(system)?.[1];
   const issue = /Issue #(\d+)\b/.exec(system);
   const merges = blocks.filter((b): b is Text => b.type === 'text' && /合并提交 SHA：[a-f0-9]{40}/.test(b.text));
   const lastMerge = merges.at(-1);
@@ -182,10 +182,16 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
     assert.match(JSON.parse(success(push)), /^[a-f0-9]{40}$/);
     return text(report);
   }
-  const delegate = blocks.find((b): b is Text => b.type === 'text' && b.text.startsWith('Kafka handoff: '));
-  if (delegate) {
-    if (delegate.text.includes('inspect')) {
-      assert.equal(sopPath, 'agents/audit/AGENT.md');
+  if (system.includes(kafkaTitle)) {
+    assert.ok(!body.tools.some(tool => tool.name === 'Task'));
+    const fix = blocks.findIndex(b => b.type === 'text' && b.text.includes('中的 Kafka 配置并开 MR'));
+    const history = blocks.slice(Math.max(approved, fix, 0));
+    const file = fix < 0 ? 'agents/audit/AGENT.md' : 'agents/code-delivery/AGENT.md';
+    assert.ok(system.includes(file));
+    const sop = result('Read', history);
+    if (!sop) return use('Read', { file_path: join(workspaceRoot(), file) });
+    assert.match(success(sop), fix < 0 ? /只读巡检/ : /跨项目代码交付/);
+    if (fix < 0) {
       const assets = result('jms_list_assets');
       if (!assets) return use('jms_list_assets', {});
       assert.match(success(assets), /web01/);
@@ -199,20 +205,14 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
       }
       return text('web01 Kafka 诊断：' + evidence.join('，'));
     }
-    assert.equal(sopPath, 'agents/code-delivery/AGENT.md');
-    if (delegate.text.includes('plan')) return text('Update kafka.properties in ' + apiRepo + ' and open an MR.');
-    const step = deliverFile(apiRepo, 'fix/kafka-config', 'kafka.properties', 'bootstrap.servers=localhost:9092\n', 'Fix Kafka bootstrap configuration', blocks);
+    if (approved < 0) {
+      const receipt = result('detent_submit_plan', history);
+      if (!receipt) return use('detent_submit_plan', { plan: 'Update kafka.properties in ' + apiRepo + ' and open an MR.' });
+      assert.equal(JSON.parse(success(receipt)).submitted, true);
+      return text('等待方案审批。');
+    }
+    const step = deliverFile(apiRepo, 'fix/kafka-config', 'kafka.properties', 'bootstrap.servers=localhost:9092\n', 'Fix Kafka bootstrap configuration', history);
     return 'type' in step ? step : text('Kafka config MR ' + step.mrWebUrl);
-  }
-  if (system.includes(kafkaTitle)) {
-    assert.match(system, /你负责协调当前 Issue/);
-    const fix = blocks.findIndex(b => b.type === 'text' && b.text.includes('中的 Kafka 配置并开 MR'));
-    const mode = approved >= 0 ? 'implement' : fix >= 0 ? 'plan' : 'inspect';
-    const history = blocks.slice(Math.max(approved, fix, 0));
-    const child = result('Task', history);
-    if (!child) return use('Task', { subagent_type: mode === 'inspect' ? 'audit' : 'code-delivery',
-      description: 'Kafka ' + mode, prompt: 'Kafka handoff: ' + mode + ' ' + apiRepo + '\nWorking directory: ' + workspaceRoot() + '\n' });
-    return text(success(child));
   }
   assert.ok(issue, 'Missing Hub Issue number in the SDK system prompt');
 
@@ -263,7 +263,7 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
       assert.ok(blocks.some(b => b.type === 'text' && b.text.includes('Standalone turn complete')));
       return text('Resumed the historical checkpoint.');
     }
-    if (approved < 0) return text('Standalone plan');
+    if (approved < 0) return result('detent_submit_plan') ? text('Waiting for approval.') : use('detent_submit_plan', { plan: 'Standalone plan' });
     return text('Standalone turn complete.');
   }
   if (system.includes('Revise the public API')) {
@@ -280,19 +280,16 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
     }
     return text(has('修改意见：Keep API signature unchanged') ? 'Plan v2 preserves the API signature.' : 'Plan v1 changes the API signature.');
   }
-  if (system.includes('Select service port') || system.includes('Switch audit to coding')) {
-    if (has('Please open a fix MR')) {
-      assert.equal(sopPath, 'agents/code-delivery/AGENT.md');
-      assert.match(system, /当前为方案阶段/);
-      return text('Plan to open a fix MR.');
-    }
-    if (system.includes('Select service port') && approved < 0) return text('Confirm the deployment port.');
+  if (system.includes('Select service port')) {
+    if (approved < 0) return text('Confirm the deployment port.');
     const question = 'Which service port?';
     const answer = result('AskUserQuestion');
     if (!answer) return use('AskUserQuestion', { questions: [{ question }] });
     assert.deepEqual(JSON.parse(success(answer)), { [question]: 'Use port 6380' });
     return text('Confirmed port 6380.');
   }
+  if (system.includes('Check the service defaults'))
+    return text(has('Review a configuration change') ? 'Review the configuration and test the change.' : 'Defaults checked.');
   if (system.includes('Approve in context')) {
     if (has('可以')) return text('Received the ordinary follow-up.');
     return text(approved >= 0 ? 'Plan executed.' : 'Check the service defaults.');
@@ -319,23 +316,6 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
       assert.equal(JSON.parse(success(closed)).scheduled, true);
     }
     return text(report);
-  }
-
-  if (system.includes('你负责协调当前 Issue') && system.includes('同步 nginx 镜像')) {
-    assert.match(system, /未开通：[\s\S]*audit：jumpserver/);
-    return text('请提供带 Tag 的完整源镜像地址和目标镜像仓库地址。');
-  }
-  if (system.includes('需求澄清与引导模式（只读）')) {
-    assert.equal(sopPath, undefined);
-    assert.match(system, /本轮仅允许只读检查/);
-    const [ready, unavailable] = system.split('### 未开通');
-    for (const label of ['delivery::audit', 'delivery::env-change'])
-      assert.ok(unavailable.split('\n').some(line => line.includes(label) && line.includes('待配置 jumpserver')));
-    for (const label of ['delivery::code', 'delivery::release', 'agent::image-sync'])
-      assert.ok(ready.includes(label));
-    assert.ok(!body.tools.some(t => ['Edit', 'Write', 'Bash', toolName('detent_close_issue')].includes(t.name) ||
-      t.name.startsWith(prefix + 'harbor-sync__')), 'Triage advertised a restricted tool');
-    return text('请提供带 Tag 的完整源镜像地址和目标镜像仓库地址。');
   }
 
   if (sopPath === 'agents/onboarding/AGENT.md') {
@@ -380,7 +360,7 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
     return closeIssue('已核对同步结果。', `镜像同步完成，目标为 ${target_image}。`);
   }
 
-  const hotfix = sopPath === 'workflows/hotfix.md';
+  const hotfix = sopPath === 'agents/hotfix/AGENT.md';
   if (hotfix || sopPath === 'agents/release/AGENT.md') {
     const marker = hotfix ? 'CUSTOM_HOTFIX_WORKFLOW: hotfix-' : 'CUSTOM_RELEASE_TAG_PREFIX: rel-';
     assert.ok(system.includes(marker), 'Missing live Hub SOP in the SDK system prompt');
@@ -426,7 +406,7 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
       }
     }
     if (file === 'kafka.properties' || (file === playbook && system.includes('Verify failed playbook'))) {
-      const read = result('Read', history);
+      const read = result('Read', history.slice(history.indexOf(checkout) + 1));
       if (!read) return use('Read', { file_path: join(workspaceRoot(), 'projects', directory, file) });
       assert.match(success(read), file === playbook ? /state: reloaded/ : /bootstrap.servers=localhost:19092/);
     }
@@ -581,8 +561,9 @@ function respond(body: Messages, block: Text | Use) {
     { headers: { 'Content-Type': 'text/event-stream' } });
 }
 
-export function createOfflineAnthropic(repos: Repos) {
+export function createOfflineAnthropic(repos: Repos, expectedModel: string) {
   let requests = 0;
+  let modelMismatches = 0;
   let observeRequest: ((system: string) => Promise<void>) | undefined;
   let nextTool: { name: string; observe: () => Promise<void> } | undefined;
   let checkPayload: (body: Messages) => void = () => {};
@@ -592,6 +573,10 @@ export function createOfflineAnthropic(repos: Repos) {
       if (req.method !== 'POST' || new URL(req.url).pathname !== '/v1/messages') return new Response(null, { status: 404 });
       assert.ok(req.headers.get('x-api-key') === 'offline-api-key', 'Model transport did not authenticate the upstream request');
       const body: Messages = await req.json();
+      if (body.model !== expectedModel) {
+        modelMismatches++;
+        return Response.json({ code: 'InvalidParameter', message: 'Model not exist.' }, { status: 400 });
+      }
       checkPayload(body);
       if (body.tools?.length && observeRequest) await observeRequest(contents(body.system ?? ''));
       const block = next(body, repos);
@@ -609,5 +594,6 @@ export function createOfflineAnthropic(repos: Repos) {
     },
     checkRequests(check: (body: Messages) => void) { checkPayload = check; },
     getRequests: () => requests,
+    verifyModel() { assert.equal(modelMismatches, 0, 'Every Messages request must use the configured gateway model'); },
   };
 }

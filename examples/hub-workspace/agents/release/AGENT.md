@@ -5,7 +5,6 @@ requires: [gitlab-release]
 close_policy: auto
 approver_tier: prod
 description: 标准仓库发版（合并 main 后打 Tag 并创建 GitLab Release）
-routing_hint: 为指定项目和提交打版本 Tag、准备发布说明或创建 GitLab Release
 ---
 
 # 仓库发版

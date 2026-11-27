@@ -12,10 +12,7 @@ export { GitLabClient, redactGitUrl, type IssueNote, type MergeRequestDiscussion
 export { createGitLabOnboardingCapability, createGitLabOnboardingTools, type OnboardingGitLab } from './workspace/onboarding-tools.js';
 export { createGitLabReleaseTools, createGitLabReleaseCapability, type ReleaseGitLab } from './workspace/release-tools.js';
 export {
-  parseHubWorkflowMarkdown, loadHubWorkflows, matchHubWorkflow, findMatchingHubDefinitions as findMatchingHubAgents,
-  type HubWorkflow, type WorkflowMode, type WorkflowApproverTier,
-} from './workflows/hub-workflows.js';
-export {
+  missingHubCapabilities, type WorkflowMode, type WorkflowApproverTier,
   parseHubAgentMarkdown, parseHubSkillMarkdown, loadHubAgents, matchHubAgent, resolveHubAgentCapabilities, renderAgentSystemPrompt,
   type HubAgent, type HubSkill,
 } from './workflows/hub-agents.js';
@@ -29,4 +26,3 @@ export type {
   EventNotification, IssueClosePolicy, SandboxScope, ToolGovernancePolicy, TurnProfile, TurnProfileResolver, WebhookExtension,
 } from './extensions.js';
 export { createDecisionClient, resolveJevEndpoint, type DecisionClient, type DecisionQuestion, type DecisionAnswer, type JevProvider } from './decision/jev-client.js';
-export { routeHubAgent, buildTriageSystemPrompt, type AgentRouteResult, type AgentRoutingCandidate } from './decision/agent-router.js';

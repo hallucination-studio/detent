@@ -79,7 +79,7 @@ it('governs Issue #88 through inspection, Plan, MR !205, production approval, ex
       return run(turn);
     },
   }, {
-    tools: createJumpServerTools({ client, config: deliveryConfig, tracker }),
+    capabilities: [{ name: 'jumpserver', enabled: true, tools: createJumpServerTools({ client, config: deliveryConfig, tracker }) }],
     resolveTurnProfile: createDeliveryTurnProfileResolver(deliveryConfig),
     renderStatusExtra: async s => formatDeliveryExecutionsStatus(await tracker.listSessionExecutions(s.id)),
   });
@@ -139,7 +139,7 @@ it('governs Issue #88 through inspection, Plan, MR !205, production approval, ex
     expect(client.runAnsibleJob).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ commitSha: job.commit_sha, playbookPath: playbook }));
     expect(await repo.getApproval(approval.id)).toMatchObject({ status: 'APPROVED', decidedBy: maintainer.username });
     expect(rows).toMatchObject([{
-      sessionId: session.id, mrId: mr.id, approvalId: approval.id, agentProfile: 'EnvChangeAgent', jumpserverJobId: 'job-88',
+      sessionId: session.id, mrId: mr.id, approvalId: approval.id, agentProfile: 'env-change', jumpserverJobId: 'job-88',
       playbookPath: playbook, commitSha: job.commit_sha, targetAssets: ['web01'], status: 'SUCCESS', outputSummary: 'nginx reloaded',
     }]);
     expect(client.runReadonlyInspect).toHaveBeenCalledTimes(2);
@@ -149,7 +149,7 @@ it('governs Issue #88 through inspection, Plan, MR !205, production approval, ex
       object_attributes: { id: 1000, noteable_type: 'Issue', note: '/status' } });
     await queue.drain();
     for (const value of ['ops/ansible!205', 'merged @ ' + job.commit_sha.slice(0, 8), '### 交付执行记录',
-      'EnvChangeAgent', 'SUCCESS', playbook, rows[0].jumpserverJobUrl, approval.id]) expect(notes.at(-1)).toContain(value);
+      'env-change', 'SUCCESS', playbook, rows[0].jumpserverJobUrl, approval.id]) expect(notes.at(-1)).toContain(value);
     expect(report).not.toHaveBeenCalled();
     expect(run).toHaveBeenCalledTimes(3);
     expect(await readdir(config.ephemeralRoot)).toEqual([]);

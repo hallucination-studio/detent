@@ -33,7 +33,7 @@ async function readModelError(response: IncomingMessage, status: number, secrets
 
 // Claude Code runs shell tools with its own environment. Authenticate only the
 // upstream Messages request in the parent and stream SSE back to this turn.
-export async function openModelTransport(baseUrl: string, apiKey: string, secrets: readonly string[]) {
+export async function openModelTransport(baseUrl: string, apiKey: string, secrets: readonly string[], modelName?: string) {
   const base = new URL(baseUrl);
   if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash)
     throw Error('Invalid ANTHROPIC_BASE_URL');
@@ -55,6 +55,7 @@ export async function openModelTransport(baseUrl: string, apiKey: string, secret
       for (const key of ['messages', 'system', 'tools', 'metadata']) {
         if (Object.hasOwn(message, key)) message[key] = scrubJson(message[key], value => redactGitUrl(value, credentials));
       }
+      if (modelName !== undefined) message.model = modelName;
       body = JSON.stringify(message);
     } catch (error) {
       const detail = logError('model-transport', error, credentials);

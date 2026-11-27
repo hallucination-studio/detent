@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { createDecisionClient, type DecisionClient } from '../decision/jev-client.js';
 import { randomUUID } from 'node:crypto';
 import { createIssueChannel } from './channel.js';
@@ -20,30 +21,22 @@ import { TranscriptHydrator } from '../claude/transcript-hydrator.js';
 import { ColdHold, PermissionGate } from '../claude/permission-gate.js';
 import { buildSystemPrompt } from '../claude/prompts.js';
 import type { ClaudeRunner } from '../claude/runner.js';
-import { missingHubCapabilities } from '../workflows/hub-workflows.js';
-import { loadHubAgents } from '../workflows/hub-agents.js';
+import { loadHubAgents, missingHubCapabilities } from '../workflows/hub-agents.js';
 import { normalizeHubValue } from '../workflows/hub-frontmatter.js';
 import { connectMcpCapabilityPack } from '../extensions/mcp-bridge.js';
 import { loadHubCapabilities, resolveHubMcpCapabilities } from '../workflows/hub-capabilities.js';
-import type { DetentCapabilityPack, DetentExtensions } from '../extensions.js';
+import { defineExtensionTool, type DetentCapabilityPack, type DetentExtensions } from '../extensions.js';
 import { checkIssueClosure, createCloseIssueTool } from './close-issue.js';
 import { notifyHook } from './lifecycle.js';
 
 export { SessionBusy } from './turn-runtime.js';
 const helpHint = '> 💡 发送 `/help` 可随时查看当前工作区的能力与指令。';
-function coordinatorAgents(card?: ApprovalRequestRow, recheckIssuer = false): string[] | undefined {
-  const scope = card?.toolInput.__detentCoordinator;
-  if (!scope || typeof scope !== 'object' || !('agents' in scope) || !Array.isArray(scope.agents) ||
-      !scope.agents.every(id => typeof id === 'string')) return;
-  if (recheckIssuer && card?.approvalType !== 'PLAN')
-    return 'issuer' in scope && typeof scope.issuer === 'string' ? [scope.issuer] : [];
-  return scope.agents;
-}
+type TurnTrigger = 'request' | 'continuation' | 'plan';
 type Client = WorkspaceGitLab &
   Pick<
     GitLabClient,
     'createIssueNote' | 'updateIssueNote' | 'syncIssueStatusLabel' | 'getIssue' | 'hasApprovalPermission'
-  > & Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile' | 'listIssueNotes' | 'updateIssueLabels' | 'isBotUser' | 'closeIssue'>>;
+  > & Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile' | 'closeIssue'>>;
 export class SessionOrchestrator extends TurnRuntime {
   private readonly denialNotices = new Set<string>();
   private readonly decision?: DecisionClient;
@@ -78,10 +71,9 @@ export class SessionOrchestrator extends TurnRuntime {
     return [...packs.values()];
   }
   private resolveTurnProfile(session: IssueSessionRow, capabilities: readonly DetentCapabilityPack[],
-    context: { purpose: 'turn'; prompt: string } | { purpose: 'approval'; approval: Pick<ApprovalRequestRow, 'approvalType' | 'toolName'> },
-    card?: ApprovalRequestRow) {
+    context: { purpose: 'turn' } | { purpose: 'approval'; approval: Pick<ApprovalRequestRow, 'approvalType' | 'toolName'> }) {
     return this.extensions.resolveTurnProfile?.({
-      session, repo: this.repo, gitlab: this.gitlab, decision: this.decision, capabilities, coordinatorAgents: coordinatorAgents(card, context.purpose === 'approval'), ...context,
+      session, repo: this.repo, gitlab: this.gitlab, capabilities, ...context,
     });
   }
   async resumeSession(id: string, prompt: string, options?: {
@@ -96,7 +88,7 @@ export class SessionOrchestrator extends TurnRuntime {
       if (s.status === 'WAITING_PLAN' || s.status === 'WAITING_TOOL')
         throw Error('Session is waiting for approval');
       s.permissionMode = options?.permissionMode ?? s.permissionMode;
-      await this.run(s, active, prompt, undefined, options?.permissionMode);
+      await this.run(s, active, prompt, undefined, options?.permissionMode ? 'continuation' : 'request');
     });
   }
   async wakeSession(candidate: IssueSessionRow, reason: 'expired' | 'inbox') {
@@ -107,7 +99,8 @@ export class SessionOrchestrator extends TurnRuntime {
       if (reason === 'expired' && !await this.recover(s, this.channel(s))) return;
       const items = await this.drainInbox(s.id, active);
       if (!items.length && reason === 'inbox') return;
-      await this.run(s, active, formatInboxMessages(items, this.secrets) || '上轮执行中断，请检查已保存的进度并继续。');
+      await this.run(s, active, formatInboxMessages(items, this.secrets) || '上轮执行中断，请检查已保存的进度并继续。',
+        undefined, reason === 'expired' && !items.length ? 'continuation' : 'request');
     }, undefined, reason === 'expired' ? candidate.lockExpiresAt! : undefined);
   }
   async handleIssueOpened(event: Extract<WebhookEvent, { object_kind: 'issue' }>) {
@@ -140,12 +133,12 @@ export class SessionOrchestrator extends TurnRuntime {
     active: Active,
     prompt: string,
     previousDecision?: ApprovalRequestRow,
-    resumeMode?: PermissionMode,
+    trigger: TurnTrigger = 'request',
   ) {
     let next: string | undefined = prompt;
     while (next !== undefined) {
-      next = await this.runTurn(s, active, next, previousDecision, resumeMode);
-      resumeMode = undefined;
+      next = await this.runTurn(s, active, next, previousDecision, trigger);
+      trigger = 'request';
       previousDecision = undefined;
       if (next === undefined && !active.controller.signal.aborted && ['IDLE', 'WAITING_PLAN'].includes(s.status)) {
         // A comment can arrive during the final GitLab write or sandbox cleanup.
@@ -161,7 +154,7 @@ export class SessionOrchestrator extends TurnRuntime {
       }
     }
   }
-  private async runTurn(s: IssueSessionRow, active: Active, prompt: string, previousDecision?: ApprovalRequestRow, resumeMode?: PermissionMode): Promise<string | undefined> {
+  private async runTurn(s: IssueSessionRow, active: Active, prompt: string, previousDecision?: ApprovalRequestRow, trigger: TurnTrigger = 'request'): Promise<string | undefined> {
     const channel = this.channel(s);
     const drainInbox = () => this.drainInbox(s.id, active);
     const host = new EphemeralSandbox(this.config, this.repo, this.gitlab);
@@ -172,17 +165,16 @@ export class SessionOrchestrator extends TurnRuntime {
     let issueClosed = false;
     try {
       const capabilities = await this.getCapabilities();
-      const profile = await this.resolveTurnProfile(s, capabilities, { purpose: 'turn', prompt }, previousDecision);
+      const profile = await this.resolveTurnProfile(s, capabilities, { purpose: 'turn' });
       controller.signal.throwIfAborted();
       if (profile?.blockedMessage?.trim()) {
         await channel.createNote(redactGitUrl(profile.blockedMessage + '\n\n' + helpHint, this.secrets));
         await this.state(s, 'IDLE');
         return;
       }
-      // A new coordinator request cannot inherit a different turn's implementation approval.
-      if (profile?.coordinator && !resumeMode && !coordinatorAgents(previousDecision)) s.permissionMode = 'plan';
+      const unified = !profile?.sandboxScope?.agentDir;
+      if (unified && trigger === 'request') s.permissionMode = 'plan';
       const plan = s.permissionMode === 'plan';
-      const routingPrefix = profile?.routingNotice ? redactGitUrl(profile.routingNotice, this.secrets) + '\n\n' : '';
       await this.state(s, plan ? 'PLANNING' : 'CODING', s.permissionMode);
       const note = await channel.createNote(
         plan ? '正在分析需求…' : '正在执行已审批方案…',
@@ -203,12 +195,23 @@ export class SessionOrchestrator extends TurnRuntime {
       const effectivePlan = plan || (profile?.readonly ?? false);
       let closeRequested: { summary: string } | undefined;
       const closeTool = profile && createCloseIssueTool(profile, request => { closeRequested = request; });
+      let submittedPlan: string | undefined;
+      const turnTools = [];
+      if (closeTool) turnTools.push(closeTool);
+      if (plan && !profile?.readonly) turnTools.push(defineExtensionTool({
+        name: 'detent_submit_plan', policy: 'readonly', description: '提交本轮实施方案供 GitLab 用户审批。',
+        schema: { plan: z.string().trim().min(1).max(16000) },
+        async execute({ plan }) {
+          submittedPlan = plan;
+          return { submitted: true, nextAction: '方案已登记，请直接结束本轮等待用户在 GitLab 点 👍 批准。' };
+        },
+      }));
       const gate = new PermissionGate({
         decision: this.decision,
         capabilities,
-        extensionTools: closeTool ? [...(this.extensions.tools ?? []), closeTool] : this.extensions.tools,
-        profile: closeTool && profile?.enabledExtensionTools
-          ? { ...profile, enabledExtensionTools: [...profile.enabledExtensionTools, closeTool.name] }
+        extensionTools: [...(this.extensions.tools ?? []), ...turnTools],
+        profile: profile?.enabledExtensionTools
+          ? { ...profile, enabledExtensionTools: [...profile.enabledExtensionTools, ...turnTools.map(tool => tool.name)] }
           : profile,
         onApprovalResolved: this.extensions.hooks?.onApprovalResolved,
         session: s,
@@ -218,7 +221,7 @@ export class SessionOrchestrator extends TurnRuntime {
         channel,
         workspaceRoot,
         checkpoint,
-        previousDecision: profile?.routingNotice ? undefined : previousDecision,
+        previousDecision,
       });
       active.gate = gate;
       streamer = new NoteStreamer(
@@ -238,7 +241,6 @@ export class SessionOrchestrator extends TurnRuntime {
       try {
         result = await this.runner.run({
           session: s,
-          subagents: profile?.subagents,
           sandbox,
           resume,
           prompt,
@@ -249,7 +251,6 @@ export class SessionOrchestrator extends TurnRuntime {
             closeTool && '全部验收条件满足后调用 detent_close_issue 完结工单（含只读巡检模式，该工具已获授权）；汇报正文无需提及该工具名。',
           ].filter(Boolean).join('\n'),
           tools: new WorkspaceTools(host, sandbox, s.id, effectivePlan),
-          readonlyTools: profile?.subagents?.length && !effectivePlan ? new WorkspaceTools(host, sandbox, s.id, true) : undefined,
           drainInbox,
           progress: (step) => streamer!.push(step),
           appendText: (delta) => streamer!.appendText(delta),
@@ -262,13 +263,12 @@ export class SessionOrchestrator extends TurnRuntime {
       controller.signal.throwIfAborted();
       const pending = await drainInbox();
       if (pending.length) {
-        await streamer.flush(routingPrefix + result);
-      } else if (plan && !profile?.readonly && (!profile?.coordinator || gate.governedAgents.size || gate.requestedMutation)) {
-        const agents = gate.governedAgents.size ? [...gate.governedAgents] : profile?.subagents?.filter(a => !a.readonly).map(a => a.id);
-        const approval = await this.repo.createApprovalRequest(s.id, 'PLAN', 'Plan', profile?.coordinator ? { __detentCoordinator: { agents: agents ?? [] } } : {});
+        await streamer.flush(result);
+      } else if (plan && (submittedPlan || trigger === 'plan' || (!unified && !profile?.readonly && !closeRequested))) {
+        const approval = await this.repo.createApprovalRequest(s.id, 'PLAN', 'Plan', {});
         await this.repo.updateApprovalNoteId(approval.id, note.id);
         await this.state(s, 'WAITING_PLAN');
-        await streamer.flush(routingPrefix + renderPlanApprovalCard(result));
+        await streamer.flush(renderPlanApprovalCard(submittedPlan ?? result));
       } else if (closeRequested && profile) {
         // Tools may have created new work after the close request.
         const checked = await checkIssueClosure(profile, { session: s, repo: this.repo, permissionMode: s.permissionMode });
@@ -276,15 +276,15 @@ export class SessionOrchestrator extends TurnRuntime {
         controller.signal.throwIfAborted();
         await this.archiveWorktrees(s.id);
         controller.signal.throwIfAborted();
-        await streamer.flush(routingPrefix + result);
+        await streamer.flush(result);
         controller.signal.throwIfAborted();
         await this.gitlab.closeIssue?.(s.hubProjectId, s.hubIssueIid);
         issueClosed = true;
         await this.state(s, 'DONE');
       } else {
-        await streamer.flush(routingPrefix + result);
-        if (profile?.coordinator) s.permissionMode = 'plan';
-        await this.state(s, 'IDLE', profile?.coordinator ? s.permissionMode : undefined);
+        await streamer.flush(result);
+        if (unified) s.permissionMode = 'plan';
+        await this.state(s, 'IDLE', unified ? s.permissionMode : undefined);
       }
       if (s.recoveryAttempts) {
         await this.repo.updateSessionState(s.id, { recoveryAttempts: 0 });
@@ -340,12 +340,12 @@ export class SessionOrchestrator extends TurnRuntime {
         }).join('、')) + '）' : '✅ 已就绪';
         return `| ${escapeTableCell(agent.description)} | ${escapeTableCell(agent.label, 'code')} | ${status} |`;
       });
-      await this.gitlab.createIssueNote(project, iid, [
+      await this.gitlab.createIssueNote(project, iid, redactGitUrl([
         '### 可用能力',
         menu.length === 0 ? '当前工作区尚未登记能力。' : ['| 能力场景 | 触发方式 / 标签 | 状态 |', '| :--- | :--- | :--- |', ...menu].join('\n'),
-        '`/status` 查看进度 · `/plan` 拟定方案 · `/use <agent>` 切换能力',
+        '`/status` 查看进度 · `/plan` 拟定方案',
         '审批卡上点 👍 批准或 👎 拒绝 · `/abort` 中止 · `/reset` 重置会话',
-      ].join('\n\n'));
+      ].join('\n\n'), this.secrets));
       return;
     }
     const s = await this.repo.getSessionByIssue(project, iid);
@@ -355,11 +355,10 @@ export class SessionOrchestrator extends TurnRuntime {
       return;
     }
     if (
-      ['RESET', 'ABORT', 'USE'].includes(intent.type) &&
+      ['RESET', 'ABORT'].includes(intent.type) &&
       !(await this.gitlab.hasApprovalPermission(project, intent.userId))
     )
       return;
-    if (intent.type === 'USE') return this.handleUseAgent(s, intent);
     if (intent.type === 'APPROVE' || intent.type === 'REJECT') return this.handleApprovalIntent(s, intent);
     if (intent.type !== 'PROMPT') return this.handleSessionCommand(s, intent);
     if (s.status === 'WAITING_TOOL') {
@@ -408,7 +407,7 @@ export class SessionOrchestrator extends TurnRuntime {
         : await this.repo.getLatestPendingApproval(s.id));
     if (pending?.status !== 'PENDING') return;
     const { approvalType, toolName } = pending;
-    const profile = await this.resolveTurnProfile(s, await this.getCapabilities(), { purpose: 'approval', approval: { approvalType, toolName } }, pending);
+    const profile = await this.resolveTurnProfile(s, await this.getCapabilities(), { purpose: 'approval', approval: { approvalType, toolName } });
     if (profile?.blockedMessage?.trim()) return;
     const { approvalProjectId } = this.channel(s);
     const permitted = profile?.canApprove
@@ -433,44 +432,7 @@ export class SessionOrchestrator extends TurnRuntime {
       return;
     }
     await this.applyApproval(s, pending, intent, (session, active, prompt, decision) =>
-      this.run(session, active, prompt, decision ?? (coordinatorAgents(pending) ? pending : undefined)));
-  }
-  private async handleUseAgent(s: IssueSessionRow, intent: ParsedUserIntent) {
-    const args = intent.comment?.trim() ?? '';
-    const target = args.split(/\s+/, 1)[0];
-    const prompt = args.slice(target.length).trim();
-    const idOrLabel = normalizeHubValue(target);
-    const { agents } = await loadHubAgents(this.gitlab, s.hubProjectId, this.config.gitlabHubDefaultBranch);
-    const matched = agents.find(agent => agent.id === idOrLabel || agent.label === idOrLabel);
-    if (!matched) {
-      const message = agents.length ? [
-        '未找到指定的 Agent。可用 Agent：',
-        ...agents.map(agent => `- ${escapeTableCell(agent.id, 'code')}（标签 ${escapeTableCell(agent.label, 'code')}）`),
-      ].join('\n') : 'Hub 仓库尚未配置可用 Agent。';
-      await this.gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, redactGitUrl(message, this.secrets));
-      return;
-    }
-    if (!this.gitlab.updateIssueLabels) {
-      await this.gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, '无法更新 Issue 标签，请手动添加目标 Agent 的标签。');
-      return;
-    }
-
-    const otherLabels = new Set(agents.map(agent => agent.label).filter(label => label !== matched.label));
-    await this.stop(s);
-    await this.withLease(s, async (session, active) => {
-      const { hubProjectId, hubIssueIid } = session;
-      await this.expire(session);
-      active.controller.signal.throwIfAborted();
-      // Clear the waiting state and persist the Plan reset before GitLab can change the route.
-      await this.repo.updateSessionState(session.id, { status: 'IDLE', permissionMode: 'plan' });
-      session.status = 'IDLE';
-      session.permissionMode = 'plan';
-      const issue = await this.gitlab.getIssue(hubProjectId, hubIssueIid);
-      const remove = issue.labels.filter(label => otherLabels.has(normalizeHubValue(label)));
-      active.controller.signal.throwIfAborted();
-      await this.gitlab.updateIssueLabels?.(hubProjectId, hubIssueIid, { add: [matched.label], remove });
-      await this.run(session, active, prompt || session.issueTitle);
-    });
+      this.run(session, active, prompt, decision, 'continuation'));
   }
   private async handleSessionCommand(s: IssueSessionRow, intent: ParsedUserIntent) {
     if (intent.type === 'ABORT' || intent.type === 'RESET') await this.stop(s);
@@ -487,7 +449,7 @@ export class SessionOrchestrator extends TurnRuntime {
       }
       await this.expire(session);
       if (intent.type === 'PLAN' || session.status === 'WAITING_PLAN') session.permissionMode = 'plan';
-      await this.run(session, active, intent.comment || session.issueTitle);
+      await this.run(session, active, intent.comment || session.issueTitle, undefined, intent.type === 'PLAN' ? 'plan' : 'request');
     });
   }
 }

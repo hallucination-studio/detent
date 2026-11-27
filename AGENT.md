@@ -38,11 +38,11 @@ Stage 2 的 Delivery 合并事件处理器按目标项目 ID 和 MR IID 查找�
 
 Stage 3 的只读和自动工具在 `preflight` 执行守卫。生产任务在发卡前、批准后复核，提交前重读当前会话 MR。Hub 的单个 `auth` 同时用于巡检和执行，旧环境可显式配置两套凭证。资产黑名单同时约束巡检和执行。结果查询必须由注入的 `DeliveryExecutionTracker` 验证会话归属。审批卡渲染、执行与归属判断均读取仓储。
 
-### V3 兼容基线（Stage 5–7）
+### Hub 能力检查
 
-V3 从 Hub 默认分支加载 `workflows/*.md`，按当前 Issue 标签选择 SOP 并检查 `requires`。沙箱内的 Hub `CLAUDE.md` 和顶层 `workflows/` 受写保护。`TurnProfile.blockedMessage` 在创建沙箱和调用 Claude 前将引导写入 Issue，会话回到 `IDLE`。V5 的无标签路由与澄清见下文。
+显式流程标签使用对应 SOP 的能力、账号、命令前缀、审批等级和关单策略。缺少必需能力时，编排器在创建沙箱前发布配置指引并回到 `IDLE`。
 
-`DetentCapabilityPack` 以 `enabled` 表达能力是否就绪，未启用的包通过 `setupHint` 提供配置指引。Delivery 的 `jumpserver` 包可空。默认启用的 `gitlab-release` 包提供只读的 `detent_list_tags` 和须审批的 `detent_create_release`，发布审批绑定项目、Tag 和完整提交 SHA。旧 Hub 无 SOP 时沿用兼容路由，未配置 JumpServer 时默认代码交付。
+`DetentCapabilityPack` 以 `enabled` 表达能力是否就绪，未启用的包通过 `setupHint` 提供配置指引。Delivery 的 `jumpserver` 包可空。默认启用的 `gitlab-release` 包提供只读的 `detent_list_tags` 和须审批的 `detent_create_release`，发布审批绑定项目、Tag 和完整提交 SHA。
 
 `npm run bootstrap` 只补齐缺失的 Hub 规范、流程、Issue 模板和标签，复用同一输出文件内的凭证。
 
@@ -56,17 +56,25 @@ Hub SOP 的 `close_policy` 默认 `manual`。`auto` 和 `approve` 启用每轮�
 
 ### Stage 9 确定性 E2E
 
-`npm run e2e:offline` 使用回环 GitLab 与 git-http-backend。导出 `E2E_GITLAB_ADMIN_TOKEN` 后，`E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab` 使用独立命名空间和真实 GitLab CE 18.3.0 的 API、用户及 Webhook。两种目标共用缺能力引导、镜像同步、跨库双 MR、在线定制发版、旧热修复与关单审批、只读巡检和跨 Pod 环境变更场景。真实 Claude Code 使用本地 Anthropic SSE 替身，Jev、JumpServer 与外部 MCP 也使用回环替身。用 GitLab Issue、审批人身份、MySQL 状态和归档记录验收闭环。
+`npm run e2e:offline` 使用回环 GitLab 与 git-http-backend。导出 `E2E_GITLAB_ADMIN_TOKEN` 后，`E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab` 使用独立命名空间和真实 GitLab CE 18.3.0 的 API、用户及 Webhook。两种目标共用缺能力引导、镜像同步、跨库双 MR、在线定制发版、热修复与关单审批、只读巡检和跨 Pod 环境变更场景。真实 Claude Code 使用本地 Anthropic SSE 替身，Jev、JumpServer 与外部 MCP 也使用回环替身。用 GitLab Issue、审批人身份、MySQL 状态和归档记录验收闭环。
 
 ### Jev 命令风控
 
 Core 持有通用 System One 客户端（百炼 Decision Model API、TypeSafe、custom）和沙箱 Bash 门禁。先硬拦截，再走静态规则，其余可评估命令通过分类、无副作用概率和影响分联合判断。评估失败一律收紧权限，编码转人工，只读或 Plan 拒绝。Delivery 通过 `DetentExtensions.decisionClient` 共享实例，仅为只读巡检扩展命令判断。密钥禁止进入 Claude 环境、日志和 Issue 评论。方案、生产执行、发版及 `close_policy: approve` 始终由人按权限审批。
 
-### V5 Multi-Agent Hub、Jev 路由与外部 MCP 能力包
+### Stage 17 统一工程会话
 
-每轮从 Hub 默认分支发现 `agents/<id>/AGENT.md`、Agent 私有 Skills 和经 `shared_skills` 引用的共享 Skills。只将选定 Agent 及其引用的 Skills 放入工作区，提示词列出 Skill 摘要供 `Read` 按需加载。写保护覆盖根目录的 `CLAUDE.md`、`agents/`、`skills/` 和 `workflows/`。同 ID 的新版 Agent 优先，其余 `workflows/*.md` 继续可用。Bootstrap 递归补齐缺失的模板文件。
+无流程标签的 Issue 使用一个工程会话。主会话按索引读取 `agents/<id>/AGENT.md` 和相关 Skill，直接调用已就绪的工具。只读诊断结束后汇报证据并进入 `IDLE`。变更通过 `detent_submit_plan` 登记方案，进入 `WAITING_PLAN`，用户在 GitLab 点 👍 批准后继续实施。
 
-有匹配标签时按当前 Hub 定义选 Agent。普通轮次无匹配标签时可由 Jev 结合工单与非 Bot 用户评论路由。高置信度且能力齐备时先持久化 Plan，再写回 Agent 标签。无法明确匹配且有就绪 Agent 时，由协调者通过 Claude Code 原生 `--agents` 注册流程并按序调用 `Task(subagent_type=…)`。每次委派独立校验工具权限与账号，父子调用都进入工具轨迹。只读诊断直接回到 `IDLE`，同一工单的后续变更委派进入 `WAITING_PLAN`，批准后才可编辑和开 MR。无需添加流程标签或发送 `/use`。没有可委派的 Agent 时保留澄清路径。`/use` 在租约内作废旧待审单并持久化 Plan 重置，再替换 Agent 标签。`purpose === 'approval'` 按既有审批单的委派范围或当前标签、默认 Agent 复核授权，严禁触发 Jev 或 Triage。
+统一会话挂载全部 SOP 和 Skills；显式标签只挂载所选 SOP 及其共享 Skills。Hub 规范与能力配置受写保护。
+
+父进程按三档执行工具门禁。
+
+- `readonly` 允许方案阶段和实施阶段使用。
+- `coding_auto` 在方案批准后开放。
+- `always_approve` 要求单次工具审批，生产工具额外校验生产审批人。
+
+模型代理在父进程脱敏并认证请求，向上游发送 Messages 和 token 计数请求前，将模型名统一为配置的 `CLAUDE_MODEL`。
 
 服务端通过 `DETENT_MCP_CAPABILITIES_FILE` 加载 Streamable HTTP 能力包，由 Agent 的 `requires` 选用。代理工具默认 `always_approve`，由既有 Plan 与工具门禁治理。认证信息由服务端解析，代理对工具元数据、审批卡、调用结果和错误脱敏。Delivery 对 `approverTier: prod` 包的工具审批强制校验生产权限，SOP 的 `approver_tier: standard` 无法降级。
 
@@ -96,7 +104,7 @@ Hub 和 MR 的 `/help` 在检查成员权限后直接发评论，禁止创建会
 
 ### 用户交互与审批反馈
 
-能力缺失时直接列出所需能力与已就绪流程，管理员配置提示来自 `setupHint`。无更强就绪候选时，未开通流程的路由建议同样在沙箱和 Claude 调用前结束。Hub 示例只提供协作规范，仓库与资产以实时查询为准。
+能力缺失时直接列出所需能力与已就绪流程，管理员配置提示来自 `setupHint`。Hub 示例只提供协作规范，仓库与资产以实时查询为准。
 
 Issue 与 MR 的普通回复只可回答当前待审的 `ASK_USER`，沿用审批身份校验与热唤醒或冷恢复。`TOOL_USE` 保留显式审批。审批时按待审类型和工具名复核当前流程，已撤销授权的工具保持静默。生产审批权限不足的项目成员收到去重提示，外部人员无反馈。Issue 与 MR 的折叠工具轨迹逐次展示所有工具的名称、原始路径与参数，原位更新执行结果、错误或拒绝原因。参数和结果先脱敏再截断。超过 60 步时展示首尾各 30 步及省略数量，无工具调用时省略轨迹。
 

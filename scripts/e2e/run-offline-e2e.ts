@@ -1,5 +1,5 @@
 import { runJumpServerMatrix, verifyFailedPlaybook } from './suites/jumpserver-matrix.js';
-import { runKafkaHandoff } from './suites/kafka.js';
+import { runKafkaSession } from './suites/kafka.js';
 import { runHubCapabilities } from './suites/phase5-hub-capabilities.js';
 import assert from 'node:assert/strict';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
@@ -118,7 +118,8 @@ async function main() {
     cleanup.push(jmsServer.close);
     const vaultCanary = randomUUID();
     const securityReport = jms.securityReport + '\n' + vaultCanary;
-    const anthropic = createOfflineAnthropic({ webRepo, apiRepo, ansibleRepo, securityReport });
+    const expectedModel = 'custom-gateway-model-v1';
+    const anthropic = createOfflineAnthropic({ webRepo, apiRepo, ansibleRepo, securityReport }, expectedModel);
     const mock = await serve(anthropic.handle);
     cleanup.push(mock.close);
     const jev = offlineJev();
@@ -174,7 +175,7 @@ async function main() {
         DETENT_BOT_TOKEN_EXPIRES_AT: new Date(Date.now() + 86400000).toISOString().slice(0, 10),
         HOST: gitlab.podHost, PORT: String(podPort), EPHEMERAL_ROOT: sandbox, MYSQL_HOST: host, MYSQL_PORT: String(port),
         MYSQL_USER: user, MYSQL_PASSWORD: password, MYSQL_DATABASE: database, ANTHROPIC_API_KEY: 'offline-api-key',
-        ANTHROPIC_BASE_URL: mock.baseUrl, ...extra },
+        ANTHROPIC_BASE_URL: mock.baseUrl, CLAUDE_MODEL: expectedModel, ...extra },
       timeout: 180000,
     });
     await provision({ DETENT_MCP_CAPABILITIES_FILE: capabilitiesFile });
@@ -184,7 +185,6 @@ async function main() {
     assert.equal((await stat(envFile)).mode & 0o777, 0o600);
     assert.equal(config.GITLAB_ADMIN_TOKEN, undefined);
     assert.equal(config.DETENT_MCP_CAPABILITIES_FILE, capabilitiesFile);
-    assert.equal(config.JEV_ROUTING_THRESHOLD, '0.8');
     const hub = Number(config.GITLAB_HUB_PROJECT_ID);
     const admin = gitlabApi(gitlab.baseUrl, gitlab.adminToken);
     if (env.E2E_GITLAB_URL) cleanup.push(() => admin.request('/personal_access_tokens/self', 'DELETE', undefined, config.GITLAB_TOKEN));
@@ -395,7 +395,6 @@ async function main() {
     assert.match(guidance, /jumpserver：.*jumpserver.base_url/);
     const alternatives = guidance.split('<details>')[0];
     for (const label of ['delivery::release', 'delivery::code', 'agent::image-sync']) assert.ok(alternatives.includes(label));
-    assert.deepEqual(jev.routingRequests, []);
     console.log('Missing-capability guidance posted with zero Anthropic requests.');
 
     await gitlab.upsertFile(hub, 'capabilities.json', JSON.stringify({ 'harbor-sync': {
@@ -406,32 +405,11 @@ async function main() {
     assert.match(imageAgent, /^requires: \[\]$/m);
     assert.match(imageAgent, /^approver_tier: standard$/m);
     await gitlab.upsertFile(hub, imagePath, imageAgent.replace(/^requires: \[\]$/m, 'requires: [harbor-sync]'), 'Enable Harbor MCP capability');
-    const mirror = await openIssue('同步 nginx 镜像');
-    const triage = await state(mirror, 'IDLE', 0);
-    const unrouted = await gitlab.getIssue(hub, mirror);
-    assert.equal(unrouted.state, 'opened');
-    assert.deepEqual(unrouted.labels, ['claude::idle']);
-    assert.deepEqual(await records(triage.id, 'approval_requests'), []);
-    assert.ok(anthropic.getRequests() > 0);
-    assert.ok((await notes(mirror)).some(n => /请提供带 Tag .*目标镜像仓库地址/.test(n.body)));
-    const lowConfidence = { recentMessages: [], confidence: 0.55, ambiguity: 2 };
-    assert.deepEqual(jev.routingRequests, [lowConfidence]);
-    assert.deepEqual(mcp.calls, []);
-
-    // Include a prior user note so routing must read GitLab history and discard bot replies.
-    await gitlab.postNote(hub, mirror, '/status');
-    await until('triage /status reply', async () => (await notes(mirror)).some(n => n.body.startsWith('💤 **待命**')));
     const { source_image, target_image } = imageMirror;
-    const clarification = `请将 ${source_image} 同步到 ${target_image}。`;
-    await gitlab.postNote(hub, mirror, clarification);
-    const mirrorPlan = await pendingCard(mirror, 'Plan', ['🧭 已进入', '实施方案审批',
+    const mirror = await openIssue('同步 nginx 镜像', `请将 ${source_image} 同步到 ${target_image}。`, 'agent::image-sync');
+    const mirrorPlan = await pendingCard(mirror, 'Plan', ['实施方案审批',
       source_image, target_image, '🔍 工具调用轨迹（2 步）', '1. **`Read`**', 'mirror-to-harbor/SKILL.md',
       '2. **`harbor-sync__check_image_exists`**', JSON.stringify({ target_image })]);
-    const routed = await state(mirror, 'WAITING_PLAN', triage.last_message_seq);
-    assert.equal(routed.permission_mode, 'plan');
-    assert.equal(routed.claude_session_id, triage.claude_session_id);
-    assert.ok((await gitlab.getIssue(hub, mirror)).labels.includes('agent::image-sync'));
-    assert.deepEqual(jev.routingRequests, [lowConfidence, { recentMessages: ['/status', clarification], confidence: 0.96, ambiguity: 0.1 }]);
     const check = { name: 'check_image_exists', arguments: { target_image } };
     assert.deepEqual(mcp.calls, [check]);
 
@@ -442,8 +420,6 @@ async function main() {
     await award(mirror, mirrorSync, 'sre');
     const mirrored = await done(mirror);
     assert.deepEqual(mcp.calls, [check, { name: 'sync_image', arguments: imageMirror }]);
-    assert.equal(jev.routingRequests.length, 2, 'The sticky label should resolve subsequent turns and approvals');
-    assert.equal(mirrored.claude_session_id, triage.claude_session_id);
     const mirrorApprovals = await records(mirrored.id, 'approval_requests');
     assert.equal(mirrorApprovals.length, 2);
     for (const approval of mirrorApprovals) {
@@ -460,7 +436,6 @@ async function main() {
     checkSecrets(mirrorNotes);
     checkSecrets(await records(mirrored.id, 'session_messages'));
     console.log('Stage 15 branch 7 passed: Hub MCP bearer, tool results, traces, transcripts and production approval.');
-    console.log('Triage clarified and routed image-sync. The scoped Skill and MCP tools ran with production approval.');
 
     const code = await openIssue('Deliver hello.txt', 'Update ' + webRepo + ' and ' + apiRepo, 'delivery::code');
     await award(code, await pendingCard(code, 'Plan', [webRepo, apiRepo]), 'dev');
@@ -623,7 +598,7 @@ async function main() {
       const sop = hotfix ? ['---', 'label: ' + label, 'mode: governed', 'requires: [gitlab-release]', 'approver_tier: prod',
         'close_policy: approve', '---', marker, 'List tags and publish the pinned commit after approval.', ''].join('\n')
         : savedSop + '\n' + marker + '\n';
-      await gitlab.upsertFile(hub, hotfix ? 'workflows/hotfix.md' : releasePath, sop, 'Customize ' + workflow + ' SOP');
+      await gitlab.upsertFile(hub, hotfix ? 'agents/hotfix/AGENT.md' : releasePath, sop, 'Customize ' + workflow + ' SOP');
       const iid = await openIssue('Publish ' + tag, 'Publish ' + webRepo + ' at ' + shaToPublish, label);
       await award(iid, await pendingCard(iid, 'Plan', [tag, shaToPublish]), 'dev');
       const publish = await pendingCard(iid, 'detent_create_release', ['GitLab 发布审批', webRepo, tag, shaToPublish]);
@@ -764,7 +739,7 @@ async function main() {
     console.log('Stage 15 branch 4 passed: signed multi-account inspection and approved Ansible execution with one AccessKey.');
     await verifyFailedPlaybook(shared, jms);
     await runJumpServerMatrix({ ...shared, jev }, jms, jmsServer.baseUrl, hubTemplate, podStderr);
-    await runKafkaHandoff({ ...shared, jev }, jms, api.id);
+    await runKafkaSession({ ...shared, jev }, jms, api.id);
     console.log('J-8 passed: production approval, ZIP upload, job parameters, SUCCESS audit, /status and auto-close.');
     await stopPod(true);
     if (gitlab.synthetic) {
@@ -794,6 +769,7 @@ async function main() {
       await checkSession(shared, session);
       checkSecrets(await records(session.id, 'delivery_executions'));
     }
+    anthropic.verifyModel();
     if (failure) throw failure;
   } finally {
     const errors = [];

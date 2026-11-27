@@ -2,6 +2,8 @@
 
 ## 协作约定
 
+- 按本轮能力索引用 Read 读取匹配的 `agents/<id>/AGENT.md` 和引用的 Skill。未开通的能力向用户说明配置要求。
+- 只读问答和巡检直接汇报证据。变更前用 `detent_submit_plan` 提交简明方案，等待用户在 GitLab 点 👍 批准。无标签工单保持开放。
 - 开单时写明目标项目、范围、验收条件及风险。资产或分支有歧义时，先在 Issue 中确认。
 - 用 `detent_list_projects` 查询可访问的 GitLab 仓库。巡检前用已开通的 `jms_list_assets` 查询授权资产。
 - 在各项目分支提交变更，MR 关联本 Issue，由项目负责人审查合并。

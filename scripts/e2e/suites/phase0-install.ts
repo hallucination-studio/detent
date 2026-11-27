@@ -158,7 +158,7 @@ export async function standaloneAndUpgrade(h: Install & {
   await h.startPod('standalone-core', {}, 'core');
   assert.deepEqual(await h.rows('SELECT id FROM issue_sessions WHERE hub_project_id=? LIMIT 1', [h.hub]), [], 'Hub already has sessions');
   await h.checkWelcome();
-  const iid = await h.openIssue('Verify standalone runtime', '', 'delivery::code');
+  const iid = await h.openIssue('Verify standalone runtime', '', '');
   const plan = await h.pendingCard(iid, 'Plan', ['Standalone plan']);
   await h.gitlab.awardThumbsUp(h.hub, iid, plan.gitlab_note_id, 'dev');
   const original = await h.state(iid, 'IDLE', 0);

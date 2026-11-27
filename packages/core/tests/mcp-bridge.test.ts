@@ -519,7 +519,7 @@ it('wires onReady packs into profile resolution and permits an MCP mutation only
     const result = { content: [{ type: 'text', text: '{"status":"ok","echoed":"***"}' }] };
     if (options.permissionMode === 'plan') {
       await expect(readonly.handler({ target: 'item' }, {})).resolves.toEqual(result);
-      await expect(mutation.handler({ target: 'item' }, {})).rejects.toThrow('只读');
+      await expect(mutation.handler({ target: 'item' }, {})).rejects.toThrow('detent_submit_plan');
       return 'Plan complete';
     }
     await expect(mutation.handler({ target: 'item' }, {})).resolves.toEqual(result);

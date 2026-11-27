@@ -113,7 +113,7 @@ it('recovers an expired turn once across pods, reports exhaustion and wakes stra
     expect(run.mock.calls.map(([t]) => t.session.id).sort()).toEqual([recover.id, inbox.id].sort());
     expect(counts.sort()).toEqual([0, 1]);
     expect(run.mock.calls.find(([t]) => t.session.id === inbox.id)?.[0].prompt).toContain('follow up');
-    expect(await repo.getSession(recover.id)).toMatchObject({ status: 'WAITING_PLAN', recoveryAttempts: 0, lockedByPod: null });
+    expect(await repo.getSession(recover.id)).toMatchObject({ status: 'IDLE', recoveryAttempts: 0, lockedByPod: null });
     expect(await repo.getSession(exhaust.id)).toMatchObject({ status: 'FAILED', recoveryAttempts: 1 });
     expect(gitlab.createIssueNote.mock.calls).toContainEqual([1, 2, expect.stringContaining('恢复')]);
     expect(await repo.drainSessionInbox(exhaust.id)).toHaveLength(0);
@@ -140,6 +140,10 @@ it('revises a plan when a comment arrives during publication of its approval car
   try {
     const { repo, gitlab, run, pod, other } = await setup(root);
     const session = await repo.getOrCreateSession(1, 5, 'plan');
+    run.mockImplementation(async ({ gate, prompt }) => {
+      await gate.invokeExtension('mcp__detent__detent_submit_plan', { plan: prompt });
+      return 'Waiting for review';
+    });
     let firstCard: string | undefined;
     gitlab.updateIssueNote.mockImplementationOnce(async () => {
       firstCard = (await repo.getLatestPendingApproval(session.id))!.id;

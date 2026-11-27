@@ -268,7 +268,7 @@ it.each(['plan', 'default'] as const)('gates readonly inspection and lists asset
 it('denies jobs in plan mode before looking up the MR', async () => {
   const { gate, client, gitlab, repo } = await setup('plan');
   const list = vi.spyOn(repo, 'listSessionMergeRequests');
-  await expect(gate.invokeExtension(asTool('run_ansible_job'), input)).rejects.toThrow('只读');
+  await expect(gate.invokeExtension(asTool('run_ansible_job'), input)).rejects.toThrow('detent_submit_plan');
   expect(list).not.toHaveBeenCalled(); expect(gitlab.createIssueNote).not.toHaveBeenCalled(); expect(client.runAnsibleJob).not.toHaveBeenCalled();
 });
 
@@ -313,7 +313,7 @@ it.each([true, false])('binds the approved execution and result to this session 
   expect(list).toHaveBeenCalledTimes(4);
   expect(client.runAnsibleJob).toHaveBeenCalledExactlyOnceWith({ ...request, extraVars: args.extra_vars, comment: expect.stringContaining(approval.id) });
   expect(tracker.recordExecution).toHaveBeenCalledExactlyOnceWith({
-    sessionId: session.id, mrId: row.id, approvalId: approval.id, agentProfile: 'EnvChangeAgent', jumpserverJobId: submission.jobId, jumpserverJobUrl: submission.jobUrl,
+    sessionId: session.id, mrId: row.id, approvalId: approval.id, agentProfile: 'unified', jumpserverJobId: submission.jobId, jumpserverJobUrl: submission.jobUrl,
     playbookPath: request.playbookPath, commitSha: sha, targetAssets: input.asset_ids, status: submission.status,
   });
   expect(await gate.invokeExtension(asTool('get_job_result'), { job_id: submission.jobId })).toEqual(result);

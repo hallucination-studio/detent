@@ -1,3 +1,8 @@
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { once } from 'node:events';
+import { openModelTransport } from '../src/claude/model-transport.js';
+
 import { it, expect, vi } from 'vitest';
 import { mkdtemp, realpath, appendFile, readFile, rm, symlink, link, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -175,4 +180,29 @@ it('aborts on timeout and retains the pending question for another pod', async (
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+it('normalizes SDK models for messages and token counts before forwarding upstream', async () => {
+  const config = loadConfig({ CLAUDE_MODEL: 'custom-gateway-model-v1' });
+  const requests: { path?: string; model: string }[] = [];
+  const upstream = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    requests.push({ path: req.url, model: JSON.parse(Buffer.concat(chunks).toString()).model });
+    res.end('{}');
+  });
+  upstream.listen(0, '127.0.0.1');
+  await once(upstream, 'listening');
+  try {
+    const base = 'http://127.0.0.1:' + (upstream.address() as AddressInfo).port;
+    const proxy = await openModelTransport(base, '', [], config.claudeModel);
+    try {
+      for (const [path, model] of [['/v1/messages', 'claude-sonnet-4'], ['/v1/messages/count_tokens', 'claude-3-5-haiku-latest']]) {
+        const response = await fetch(proxy.url + path, { method: 'POST', headers: { authorization: 'Bearer detent-local' },
+          body: JSON.stringify({ model, messages: [] }) });
+        expect(response.status).toBe(200);
+      }
+      expect(requests).toEqual(['/v1/messages', '/v1/messages/count_tokens'].map(path => ({ path, model: config.claudeModel })));
+    } finally { proxy.close(); }
+  } finally { upstream.close(); upstream.closeAllConnections(); }
 });

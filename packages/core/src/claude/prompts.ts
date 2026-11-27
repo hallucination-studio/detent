@@ -5,7 +5,7 @@ import { renderSummary } from '../gitlab/note-streamer.js';
 
 function permissionPrompt(readonly: boolean, mode: IssueSessionRow['permissionMode']) {
   if (readonly) return '本轮仅允许只读检查（不可修改文件或仓库）。完成检查后直接输出精炼结论，不要提及 plan 模式。';
-  if (mode === 'plan') return '当前为方案阶段（只读）。直接输出精炼方案正文并结束本轮，系统会自动生成方案审批卡；严禁用 AskUserQuestion 询问“是否批准方案”。仅在缺少关键业务信息无法规划时才使用 AskUserQuestion。';
+  if (mode === 'plan') return '当前为方案阶段（只读）。只读问答直接报告证据；需要变更时调用 detent_submit_plan 提交精炼方案并结束本轮；严禁用 AskUserQuestion 询问“是否批准方案”。仅在缺少关键业务信息无法规划时才使用 AskUserQuestion。';
   return '已获方案审批。检出仓库位于相对路径 projects/<directory_name>（每轮临时目录会重建，勿硬编码绝对路径或使用 cd && / ; 复合命令）。读写与检索优先用 Read/Glob/Grep/Edit/Write，提交用 detent_commit_and_push，查状态仅用单条 git -C projects/<dir> status|diff|log|branch。';
 }
 
@@ -40,7 +40,7 @@ export function buildMrSystemPrompt(mr: LiveMr, tree: SessionWorktreeRow, readon
     ...discussions.flatMap(thread => thread.notes.filter(n => n.resolvable && !n.resolved && !n.system)
       .map(n => `Unresolved review: ${inlinePosition(n)}${n.body}`)),
     readonly && 'Read-only fork. Post suggested fixes in the MR comments. You have no push permission.',
-    plan && permissionPrompt(false, 'plan'),
+    plan && '当前为方案阶段（只读）。输出精炼方案供 GitLab 用户审批。',
     'Diagnose the root cause of failed CI, review requests or merge conflicts. On assignment investigate even without a specific request.',
     'For casual teammate discussion acknowledge briefly or explain without making changes. Test requested fixes and push only to the MR source branch.',
     'Keep replies concise and actionable. Never disclose internal tool names or credentials.',

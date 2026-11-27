@@ -11,7 +11,6 @@ import { createJumpServerTools, type DeliveryExecutionTracker } from './jumpserv
 import { matchMergeRequestWebhook } from './webhooks/merge-request.js';
 
 export { createDeliveryTurnProfileResolver, MySqlDeliveryAuditRepository, formatDeliveryExecutionsStatus };
-export type { AgentProfileName } from './agents/profiles.js';
 export type { DeliveryAuditRepository, DeliveryExecutionRow } from './db/audit.js';
 export { matchMergeRequestWebhook, loadDeliveryConfig, HttpJumpServerClient, createJumpServerTools };
 export { validateReadonlyInspectCommand, validatePlaybookPath } from './jumpserver/guards.js';

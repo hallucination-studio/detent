@@ -1,6 +1,6 @@
 import { expect, it, vi } from 'vitest';
 import { loadConfig, loadHubCapabilities, resolveSecretRef, resolveSecretTemplate, resolveHubMcpCapabilities,
-  parseHubAgentMarkdown, parseHubWorkflowMarkdown } from '../src/index.js';
+  parseHubAgentMarkdown } from '../src/index.js';
 import { configuredSecrets, redactGitUrl } from '../src/gitlab/redact.js';
 
 it('loads only named nonblank vault entries and redacts overlapping values longest first', () => {
@@ -48,13 +48,11 @@ it('resolves permitted MCP headers and policies and skips disabled or invalid en
   expect(packs[1].setupHint).toBe('服务端缺少密钥 DETENT_SECRET_X');
 });
 
-it('parses optional account and prefix lists for both generations of Hub workflow', () => {
+it('parses optional account and prefix lists for a Hub Agent', () => {
   const source = "---\nlabel: test\naccount: '  review  '\nallow_prefixes: ['read status', list]\n---\nRules";
-  for (const parse of [(text: string) => parseHubWorkflowMarkdown('test.md', text),
-    (text: string) => parseHubAgentMarkdown('test', 'agents/test/AGENT.md', text, 'agents')]) {
-    expect(parse(source)).toMatchObject({ account: 'review', allowPrefixes: ['read status', 'list'] });
-    expect(parse(source.replace("['read status', list]", "[invalid"))).toBeNull();
-  }
+  const parse = (text: string) => parseHubAgentMarkdown('test', 'agents/test/AGENT.md', text);
+  expect(parse(source)).toMatchObject({ account: 'review', allowPrefixes: ['read status', 'list'] });
+  expect(parse(source.replace("['read status', list]", "[invalid"))).toBeNull();
 });
 
 it.each(['same-origin', 'cross-origin'] as const)('closes legacy SSE streams after discovery and dispatch (%s endpoint)', async mode => {

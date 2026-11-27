@@ -164,5 +164,5 @@ it('creates a Hub Issue for a run action and enters the normal Issue turn path',
   const match = matchHubEvent(gitlab, config, { ...event, actor: { id: 12 } });
   await match.handle(orchestrator);
   expect(await repo.getSessionByIssue(1, 17)).toMatchObject({ permissionMode: 'plan', status: 'IDLE' });
-  expect(profile).toHaveBeenCalledWith(expect.objectContaining({ purpose: 'turn', prompt: expect.stringContaining(event.summary) }));
+  expect(profile).toHaveBeenCalledWith(expect.objectContaining({ purpose: 'turn', session: expect.objectContaining({ hubIssueIid: 17 }) }));
 });

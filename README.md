@@ -210,7 +210,7 @@ The offline suite covers self-service repository onboarding alongside installati
 
 Both targets run bootstrap twice to verify Hub files, labels, hooks, and preservation of credentials and a customized SOP. They exercise Hub workflows and independent MR workers, including a newly onboarded payment repository.
 
-1. A missing capability produces guidance with zero model calls. An unlabeled image request is clarified, routed to its Agent, approved, and completed.
+1. A missing capability produces guidance with zero model calls. An unlabeled Kafka investigation returns evidence. A follow-up in the same Issue produces a plan and, after approval, a configuration MR.
 2. Code delivery writes to two repositories. Closure is denied with two open MRs and again with one. The second merge triggers closure and archives both worktrees.
 3. A live edit to the release SOP publishes a pinned tag and Release after maintainer approval.
 4. A new hotfix SOP publishes only a tag and requires separate production-tier closure approval.
@@ -246,7 +246,6 @@ Four guards apply at request time and again at turn completion. A governed plan 
 | `/reject <reason>` | Reject the pending item and send the reason back to Claude |
 | `/plan [new request]` | Switch the session back to read-only `plan` mode to propose a revised plan |
 | `/help` | Show current Hub Agents and capability readiness, or the MR command guide, without starting a model turn |
-| `/use <agent>` | Select a Hub Agent and request a new plan |
 | `/status` | Display active worktrees, MRs, merge SHAs, delivery audit links, and pending approvals |
 | `/abort` | Immediately abort the currently running turn and release the lease lock |
 | `/reset` | Clear the Issue's Claude session history and start fresh |
@@ -256,7 +255,7 @@ Four guards apply at request time and again at turn completion. A governed plan 
 
 ## Governed Delivery Control Plane (`@detent/delivery`)
 
-Delivery reads `agents/<id>/AGENT.md` and compatible `workflows/*.md` from the Hub default branch on each turn and approval. Each SOP declares its Issue `label`, `mode`, required capability packs (`requires`), and `approver_tier`. Its Markdown body supplies the instructions. To adopt a tag prefix such as `rel-`, edit the body of `agents/release/AGENT.md` in the Hub. The next release Issue uses the merged change without application code changes or a pod restart. [Example release SOP](./examples/hub-workspace/agents/release/AGENT.md)
+Delivery reads `agents/<id>/AGENT.md` from the Hub default branch on each turn and approval. Each SOP declares its Issue `label`, `mode`, required capability packs (`requires`), and `approver_tier`. Its Markdown body supplies the instructions. To adopt a tag prefix such as `rel-`, edit the body of `agents/release/AGENT.md` in the Hub. The next release Issue uses the merged change without application code changes or a pod restart. [Example release SOP](./examples/hub-workspace/agents/release/AGENT.md)
 
 | Issue label | Workflow | Required capability |
 | --- | --- | --- |
@@ -266,7 +265,7 @@ Delivery reads `agents/<id>/AGENT.md` and compatible `workflows/*.md` from the H
 | `delivery::audit` | Inspect assets and report findings in read-only mode | `jumpserver` |
 | `delivery::env-change` | Inspect, approve a plan, merge the playbook MR, approve execution, and verify | `jumpserver` |
 
-Jev can route an unlabeled Issue or ask for clarification. If a selected SOP requires a disabled pack, the Issue lists the missing capability, setup instructions, and ready alternatives. The missing-capability check returns to `IDLE` before Claude runs. JumpServer is optional for release and code delivery. Set `DELIVERY_ENABLE_RELEASE_TOOLS=false` to disable the release pack.
+An unlabeled Issue has one engineering session with every ready capability pack. Claude reads the matching SOP and skills, answers diagnostics directly, and calls `detent_submit_plan` for changes. A 👍 on the plan card unlocks implementation. Read-only tools can run in either phase, coding tools require an approved plan, and production mutations also require individual approval. The parent proxy authenticates and redacts model requests and sets the configured `CLAUDE_MODEL` on messages and token counts. If a selected SOP requires a disabled pack, the Issue lists the missing capability, setup instructions, and ready alternatives. The missing-capability check returns to `IDLE` before Claude runs. JumpServer is optional for release and code delivery. Set `DELIVERY_ENABLE_RELEASE_TOOLS=false` to disable the release pack.
 
 <details>
 <summary><strong>Delivery & JumpServer Environment Variables</strong></summary>

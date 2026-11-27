@@ -18,7 +18,7 @@ export async function runIssueScenarios(h: Issues) {
   const beforeHelp = anthropic.getRequests();
   await post(revision, '/help');
   const help = await until('Hub help', async () => (await notes(revision)).find(n => n.body.includes('### 可用能力')));
-  for (const field of ['agent::onboarding', 'delivery::release', '✅ 已就绪', '/use <agent>', '/abort', '/plan']) assert.ok(help.body.includes(field));
+  for (const field of ['agent::onboarding', 'delivery::release', '✅ 已就绪', '/abort', '/plan']) assert.ok(help.body.includes(field));
   assert.equal(anthropic.getRequests(), beforeHelp);
   assert.deepEqual(await state(revision, 'WAITING_PLAN'), initial);
   await post(revision, '/reject Keep API signature unchanged');
@@ -56,20 +56,14 @@ export async function runIssueScenarios(h: Issues) {
   assert.equal((await approval(ask.id)).decision_comment, 'Use port 6380');
   await checkSession(h, clarified);
 
-  const switched = await open('Switch audit to coding', 'delivery::audit');
-  const old = await pendingCard(switched, 'AskUserQuestion', ['Which service port?']);
-  const [reporter] = await h.admin.json<{ id: number }[]>('/users?username=' + gitlab.reporterUsername);
-  await h.observeGet('/projects/' + hub + '/members/all/' + reporter.id,
-    () => gitlab.postNote(hub, switched, '/use delivery::code', 'reporter'));
-  assert.ok((await gitlab.getIssue(hub, switched)).labels.includes('delivery::audit'));
-  assert.equal((await approval(old.id)).status, 'PENDING');
-  await post(switched, '/use delivery::code Please open a fix MR');
-  await pendingCard(switched, 'Plan', ['Plan to open a fix MR']);
-  const rerouted = await state(switched, 'WAITING_PLAN');
-  assert.equal(rerouted.permission_mode, 'plan');
-  assert.equal((await approval(old.id)).status, 'EXPIRED');
-  assert.deepEqual((await gitlab.getIssue(hub, switched)).labels.filter(l => l.startsWith('delivery::')), ['delivery::code']);
-  await checkSession(h, rerouted);
+  const planning = await open('Check the service defaults', '');
+  const diagnostic = await state(planning, 'IDLE', 0);
+  assert.deepEqual(await records(diagnostic.id, 'approval_requests'), []);
+  await post(planning, '/plan Review a configuration change');
+  await pendingCard(planning, 'Plan', ['Review the configuration and test the change']);
+  const requested = await state(planning, 'WAITING_PLAN', diagnostic.last_message_seq);
+  assert.equal(requested.claude_session_id, diagnostic.claude_session_id);
+  await checkSession(h, requested);
 
   const natural = await open('Approve in context');
   const plan = await pendingCard(natural, 'Plan', ['Check the service defaults']);

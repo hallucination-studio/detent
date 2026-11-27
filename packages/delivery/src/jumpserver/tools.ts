@@ -123,7 +123,7 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
         });
         try {
           await tracker?.recordExecution({
-            sessionId: ctx.session.id, mrId: mr.id, approvalId, agentProfile: ctx.profileName ?? 'EnvChangeAgent',
+            sessionId: ctx.session.id, mrId: mr.id, approvalId, agentProfile: ctx.profileName ?? 'unified',
             jumpserverJobId: job.jobId, jumpserverJobUrl: job.jobUrl,
             playbookPath: input.playbook_path, commitSha: input.commit_sha, targetAssets: input.asset_ids, status: job.status,
           });

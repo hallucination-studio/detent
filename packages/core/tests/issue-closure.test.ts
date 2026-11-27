@@ -81,6 +81,7 @@ it('requires an approved plan, resolved approvals and merged MRs before scheduli
   const { repo, session, gitlab, run, pod, turn, status } = await setup({ closePolicy: 'auto' });
   run.mockImplementationOnce(async ({ gate }) => {
     await expect(gate.invokeExtension(tool, input)).rejects.toThrow('方案尚未批准');
+    await gate.invokeExtension('mcp__detent__detent_submit_plan', { plan: 'Finish and verify the work' });
     return 'plan';
   });
   await turn('plan');

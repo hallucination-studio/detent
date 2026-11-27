@@ -204,7 +204,7 @@ export class EphemeralSandbox {
       recursive: true,
       filter: async (file) => !(await fs.lstat(file)).isSymbolicLink(),
     });
-    const common = scope === undefined ? ['CLAUDE.md', '.claude', 'workflows'] : ['CLAUDE.md', '.claude'];
+    const common = !scope?.agentDir ? ['CLAUDE.md', '.claude', 'agents', 'skills'] : ['CLAUDE.md', '.claude'];
     for (const entry of entries) {
       if (common.includes(entry.name)) await copy(entry.name);
     }

@@ -144,7 +144,6 @@ export type ParsedIntentType =
   | 'RESET'
   | 'HELP'
   | 'STATUS'
-  | 'USE'
   | 'PROMPT';
 
 export interface ParsedUserIntent {

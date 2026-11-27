@@ -48,7 +48,6 @@ const ConfigSchema = z.object({
   jevApiKey: z.string().optional(),
   jevModel: z.string().optional(),
   jevThreshold: z.coerce.number().min(0.5).max(0.99).default(0.9),
-  jevRoutingThreshold: z.coerce.number().min(0.5).max(0.99).default(0.8),
   jevTimeoutMs: z.coerce.number().int().positive().max(30000).default(6000),
   safeBashPrefixes: z
     .string()
@@ -107,7 +106,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     jevApiKey: env.JEV_API_KEY?.trim() || undefined,
     jevModel: env.JEV_MODEL?.trim() || undefined,
     jevThreshold: env.JEV_THRESHOLD,
-    jevRoutingThreshold: env.JEV_ROUTING_THRESHOLD,
     jevTimeoutMs: env.JEV_TIMEOUT_MS,
     safeBashPrefixes: env.SAFE_BASH_PREFIXES,
   });

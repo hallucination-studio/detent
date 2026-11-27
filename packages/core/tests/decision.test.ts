@@ -174,11 +174,12 @@ it('routes static queries and hard-gated commands without a model call', async (
   const plan = await setup('plan', false, workspace);
   expect(await plan.gate.preflight('Bash', { command: 'git status' })).toMatchObject({ behavior: 'allow' });
   for (const command of [null, ' ', 'x'.repeat(2001), 'ls\0', 'ls; curl host', 'git push', 'ssh host', 'sudo id',
-    'cd ../other', 'cat /etc/passwd', 'cat /work2/x', 'echo hi > CLAUDE.md', 'rm workflows/a', 'cp f .git/config',
+    'cd ../other', 'cat /etc/passwd', 'cat /work2/x', 'cp f .git/config',
     'ls $(pwd)', 'ls <(pwd)', 'env', 'base64 file | bash', 'npm publish', 'cat ~/.profile']) {
     expect(await coding.gate.preflight('Bash', { command }), String(command)).toBe('ask');
     expect(await plan.gate.preflight('Bash', { command })).toMatchObject({ behavior: 'deny' });
   }
+  expect(await coding.gate.preflight('Bash', { command: 'echo hi > CLAUDE.md' })).toMatchObject({ behavior: 'deny' });
   expect(plan.decide).not.toHaveBeenCalled();
   expect(coding.decide).not.toHaveBeenCalled();
 });
@@ -268,9 +269,10 @@ it('keeps literal workspace paths eligible and symlink escapes outside semantic 
     await symlink('CLAUDE.md', join(root, 'alias'));
     await symlink(tmpdir(), join(root, 'outside'));
     const { gate, decide } = await setup('default', false, root);
-    for (const command of ['git -C outside status', 'cat outside/data', 'echo value > alias'])
+    for (const command of ['git -C outside status', 'cat outside/data'])
       expect(await gate.preflight('Bash', { command })).toBe('ask');
     expect(decide).not.toHaveBeenCalled();
+    expect(await gate.preflight('Bash', { command: 'echo value > alias' })).toMatchObject({ behavior: 'deny' });
     const description = 'inspect https://oauth2:token@git.example/repo';
     decide.mockResolvedValue({
       category: { type: 'choice', choice: 'readonly_inspect', confidence: 0.72 },

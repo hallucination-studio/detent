@@ -5,7 +5,7 @@ import { defineExtensionTool, type DetentCapabilityPack, type ToolGovernancePoli
 import { escapeTableCell } from '../gitlab/note-streamer.js';
 import { formatHttpError, logError, redactGitUrl, scrubJson } from '../gitlab/redact.js';
 import { normalizeHubValue } from '../workflows/hub-frontmatter.js';
-import type { WorkflowApproverTier } from '../workflows/hub-workflows.js';
+import type { WorkflowApproverTier } from '../workflows/hub-agents.js';
 import { isHubPathSegment } from '../workspace/hub-paths.js';
 
 export interface McpCapabilityConfig {

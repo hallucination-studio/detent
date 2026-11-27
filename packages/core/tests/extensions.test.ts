@@ -79,7 +79,7 @@ it.each([
       session: ctx.session, repo: ctx.repo, workspaceRoot: ctx.workspaceRoot, permissionMode: mode,
     });
   } else {
-    await expect(invoked).rejects.toThrow('只读');
+    await expect(invoked).rejects.toThrow('detent_submit_plan');
     expect(execute).not.toHaveBeenCalled();
   }
   expect(ctx.gitlab.createIssueNote).not.toHaveBeenCalled();

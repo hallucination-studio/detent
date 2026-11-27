@@ -9,7 +9,7 @@ export const kafkaCommands = [
   '/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list',
 ] as const;
 
-export async function runKafkaHandoff(h: Pick<Harness, 'gitlab' | 'hub' | 'openIssue' | 'state' | 'pendingCard' | 'records' | 'jev'>,
+export async function runKafkaSession(h: Pick<Harness, 'gitlab' | 'hub' | 'openIssue' | 'state' | 'pendingCard' | 'records' | 'jev'>,
   service: ReturnType<typeof offlineJumpServer>, project: number) {
   const { gitlab, hub } = h;
   const start = service.runAs.length, decisions = h.jev.requests.length;
@@ -18,8 +18,9 @@ export async function runKafkaHandoff(h: Pick<Harness, 'gitlab' | 'hub' | 'openI
   const audit = await h.state(iid, 'IDLE', 0);
   const notes = () => gitlab.listIssueNotes(hub, iid);
   const report = (await notes()).find(n => n.body.includes('🔍 工具调用轨迹'))?.body ?? '';
-  for (const field of ['Task', 'audit', 'jms_list_assets', 'jms_readonly_inspect', ...kafkaCommands])
+  for (const field of ['Read', 'agents/audit/AGENT.md', 'jms_list_assets', 'jms_readonly_inspect', ...kafkaCommands])
     assert.ok(report.includes(field), 'Missing audit trace field ' + field);
+  assert.doesNotMatch(report, /\bTask\b|实施方案审批/);
   assert.match(report.split('<details>')[0], /kafka\.Kafka.*9092.*dev-orders/s);
   assert.deepEqual(service.runAs.slice(start).map(r => r.command), kafkaCommands);
   assert.deepEqual(h.jev.requests.slice(decisions), [kafkaCommands[0], kafkaCommands[2]]);
@@ -27,7 +28,7 @@ export async function runKafkaHandoff(h: Pick<Harness, 'gitlab' | 'hub' | 'openI
   assert.deepEqual((await gitlab.getIssue(hub, iid)).labels, ['claude::idle']);
 
   await gitlab.postNote(hub, iid, '请修复 ' + gitlab.targetProjects.api + ' 中的 Kafka 配置并开 MR。');
-  const card = await h.pendingCard(iid, 'Plan', ['实施方案审批', 'Task', 'code-delivery', 'kafka.properties']);
+  const card = await h.pendingCard(iid, 'Plan', ['实施方案审批', 'Read', 'agents/code-delivery/AGENT.md', 'detent_submit_plan', 'kafka.properties']);
   assert.deepEqual(await h.records(audit.id, 'session_merge_requests'), []);
   assert.equal(await gitlab.getFile(project, 'kafka.properties'), previousConfig);
   await gitlab.awardThumbsUp(hub, iid, card.gitlab_note_id, 'dev');
@@ -40,5 +41,5 @@ export async function runKafkaHandoff(h: Pick<Harness, 'gitlab' | 'hub' | 'openI
   const mr = await gitlab.getMr(project, links[0].mr_iid);
   assert.equal(mr.state, 'opened');
   assert.equal(await gitlab.getFile(project, 'kafka.properties', mr.source_branch), 'bootstrap.servers=localhost:9092\n');
-  console.log('Single-Issue native Task handoff passed: audit evidence → IDLE → code-delivery Plan → approved config MR.');
+  console.log('Single-Issue unified session passed: audit evidence → IDLE → code-delivery Plan → approved config MR.');
 }

@@ -7,7 +7,7 @@ import type { DetentRepository } from './db/repository.js';
 import type { GitLabClient } from './gitlab/client.js';
 import type { SessionOrchestrator } from './orchestrator/session-orchestrator.js';
 import type { McpCapabilityConfig } from './extensions/mcp-bridge.js';
-import type { WorkflowApproverTier } from './workflows/hub-workflows.js';
+import type { WorkflowApproverTier } from './workflows/hub-agents.js';
 import type { ApprovalRequestRow, ApprovalType, IssueSessionRow, PermissionMode } from './types.js';
 
 export type ToolGovernancePolicy = 'readonly' | 'coding_auto' | 'always_approve';
@@ -60,27 +60,11 @@ export interface SandboxScope {
   sharedSkills?: readonly string[];
 }
 
-export interface SubagentDefinition {
-  id: string;
-  description: string;
-  prompt: string;
-  readonly?: boolean;
-  disableBash?: boolean;
-  enabledExtensionTools?: readonly string[];
-  account?: string;
-  allowPrefixes?: readonly string[];
-  approverTier?: WorkflowApproverTier;
-  closePolicy?: IssueClosePolicy;
-}
-
 export interface TurnProfile {
-  subagents?: readonly SubagentDefinition[];
-  coordinator?: boolean;
   workflow?: WorkflowToolConfig;
   closePolicy?: IssueClosePolicy;
   canCloseIssue?(ctx: { session: IssueSessionRow; repo: DetentRepository }): Promise<{ ok: true } | { ok: false; reason: string }>;
   blockedMessage?: string;
-  routingNotice?: string;
   name?: string;
   readonly?: boolean;
   extraSystemPrompt?: string;
@@ -100,14 +84,10 @@ export type TurnProfileResolver = (ctx: {
   session: IssueSessionRow;
   repo: DetentRepository;
   gitlab: Pick<GitLabClient, 'getIssue' | 'hasApprovalPermission'> &
-    Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile' | 'listIssueNotes' | 'updateIssueLabels' | 'isBotUser'>>;
+    Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile'>>;
   capabilities?: readonly DetentCapabilityPack[];
   purpose?: 'turn' | 'approval';
-  // Present when rechecking or resuming a card issued by the coordinator.
-  coordinatorAgents?: readonly string[];
   approval?: Pick<ApprovalRequestRow, 'approvalType' | 'toolName'>;
-  prompt?: string;
-  decision?: DecisionClient;
 }) => TurnProfile | Promise<TurnProfile>;
 
 export interface SessionLifecycleHooks {

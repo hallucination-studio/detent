@@ -280,7 +280,7 @@ it('honors first matching ignore, notify, run and semantic rules, including bran
   expect(gitlab.createIssue).toHaveBeenCalledWith(config.gitlabHubProjectId, expect.objectContaining({ labels: ['ci'] }));
   policy({ branch: 'main', action: 'run' });
   await send({ ...main, object_attributes: { ...main.object_attributes, id: 12 } });
-  expect(await repo.getSessionByIssue(config.gitlabHubProjectId, 12)).toMatchObject({ status: 'WAITING_PLAN' });
+  expect(await repo.getSessionByIssue(config.gitlabHubProjectId, 12)).toMatchObject({ status: 'IDLE' });
   expect(vi.mocked(gitlab.getRepositoryFile).mock.calls.filter(call => (call as unknown[])[1] === 'events.json')).toHaveLength(6);
 });
 

@@ -54,9 +54,7 @@ it('parses exact commands and only treats standalone consent as approval while w
   );
 });
 it.each([
-  ['/use image-sync', 'USE', 'image-sync'],
-  [' /USE Agent::Image-Sync  mirror app:v1\nto staging ', 'USE', 'Agent::Image-Sync  mirror app:v1\nto staging'],
-  ['/use  \n', 'PROMPT', '/use'],
+  ['/use image-sync', 'PROMPT', '/use image-sync'],
   ['/useful image-sync', 'PROMPT', '/useful image-sync'],
 ])('parses %j as %s', (noteBody, type, comment) => {
   expect(parseNoteIntent({ ...actor, noteBody, sessionStatus: 'WAITING_TOOL' })).toEqual({ ...actor, type, comment });

@@ -7,7 +7,6 @@ const commands = {
   abort: 'ABORT',
   reset: 'RESET',
   status: 'STATUS',
-  use: 'USE',
 } as const;
 const protectedMarkdown = /```[\s\S]*?```|```[\s\S]*|`[^`\n]*`|^[^\S\n]*>.*$/gm;
 function mentionPattern(username: string) {
@@ -40,11 +39,11 @@ export function parseNoteIntent({
   const body = prefix && stripBotMention(prefix, botUsername) === ''
     ? original.slice(prefix.length).trimStart() : original;
   if (/^\/help$/i.test(body) || (body !== original && /^(help|帮助)$/i.test(body))) return { ...actor, type: 'HELP' };
-  const match = /^\/(approve|reject|plan|abort|reset|status|use)(?:\s+([\s\S]+))?$/i.exec(body);
+  const match = /^\/(approve|reject|plan|abort|reset|status)(?:\s+([\s\S]+))?$/i.exec(body);
   if (match) {
     const type = commands[match[1].toLowerCase() as keyof typeof commands];
     const args = match[2];
-    if (args ? ['PLAN', 'APPROVE', 'REJECT', 'USE', 'RESET'].includes(type) : type !== 'USE')
+    if (!args || ['PLAN', 'APPROVE', 'REJECT', 'RESET'].includes(type))
       return { ...actor, type, comment: args };
   }
   if (

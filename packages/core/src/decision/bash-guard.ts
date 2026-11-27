@@ -13,7 +13,7 @@ const localPrograms = new Set((
   'mkdir rmdir touch cp mv rm tee sed awk perl jq date which whoami uname'
 ).split(/\s+/));
 const dangerous = /\b(?:sudo|su|doas|chmod|chown|mount|umount|mkfs|dd|kill|pkill|killall|shutdown|reboot|crontab|systemctl|service|launchctl|curl|wget|ssh|scp|sftp|rsync|nc|ncat|netcat|socat|telnet|ftp|nmap|twine|gh|glab|docker|podman|kubectl|helm|terraform|pulumi|eval|exec|printenv)\b/;
-const legacyProtectedPath = /(?:^|[^\w.-])(?:claude\.md|workflows|\.git|\.claude|\.mcp\.json)(?:$|[^\w.-])/i;
+const protectedMetadata = /(?:^|[^\w.-])(?:\.git|\.claude|\.mcp\.json)(?:$|[^\w.-])/i;
 export const bashWriteOperation = />|\b(?:tee|rm|mv|cp|ln|unlink|dd|sed|perl|python3?|node|chmod|chown|touch|mkdir|rmdir|truncate|install|patch|apply|checkout|restore|reset|clean|output|write|format|fmt)\b/;
 
 export function bashOperands(command: string) {
@@ -40,7 +40,7 @@ export function isHardGatedLocalBash(command: unknown, workspaceRoot: string) {
     if (target !== '/dev/null' && (relative === '..' || relative.startsWith('../') || path.isAbsolute(relative))) return true;
   }
   if (bashWriteOperation.test(literal)) {
-    if (legacyProtectedPath.test(literal)) return true;
+    if (protectedMetadata.test(literal)) return true;
     // Project paths may use the same names as protected Hub files and directories.
     if (bashOperands(command).some(operand => isHubScopePath(path.relative(workspaceRoot, path.resolve(workspaceRoot, operand))))) return true;
   }

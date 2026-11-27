@@ -5,7 +5,7 @@ import {
 } from '../src/index.js';
 
 const record: DeliveryExecutionRecord = {
-  sessionId: 'session', mrId: 'mr', approvalId: 'approval', agentProfile: 'EnvChangeAgent',
+  sessionId: 'session', mrId: 'mr', approvalId: 'approval', agentProfile: 'unified',
   jumpserverJobId: 'job', jumpserverJobUrl: 'https://jms.test/job', playbookPath: 'deploy/test.yml',
   commitSha: 'abcde123'.repeat(5), targetAssets: ['web01'], status: 'PENDING',
 };

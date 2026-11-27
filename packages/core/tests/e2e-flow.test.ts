@@ -95,6 +95,7 @@ it('resumes a cold Bash approval, answers a hot question and reports two MRs and
         if (t.session.permissionMode === 'plan') {
           expect(t.resume).toBe(false);
           await log('plan');
+          await t.gate.invokeExtension('mcp__detent__detent_submit_plan', { plan: '方案：修改两个服务。' });
           return '方案：修改两个服务。';
         }
         expect(t.resume).toBe(true);
@@ -238,6 +239,7 @@ it('revises plans, ignores superseded cards, resets transcript context and repor
         if (t.resume) expect((await readFile(transcript, 'utf8')).length).toBeGreaterThan(0);
         else await expect(readFile(transcript)).rejects.toMatchObject({ code: 'ENOENT' });
         await appendFile(transcript, JSON.stringify({ type: 'assistant', uuid: randomUUID() }) + '\n');
+        if (t.session.permissionMode === 'plan') await t.gate.invokeExtension('mcp__detent__detent_submit_plan', { plan: t.prompt });
         return t.prompt;
       }),
     };
@@ -429,6 +431,7 @@ it('applies turn profiles and approval hooks across pods and resumes under the e
       await mkdir(path.dirname(file), { recursive: true });
       await appendFile(file, JSON.stringify({ type: 'assistant', prompt: t.prompt }) + '\n');
       if (t.session.permissionMode === 'default') await t.gate.invokeExtension('mcp__detent__sample', {});
+      else await t.gate.invokeExtension('mcp__detent__detent_submit_plan', { plan: t.prompt });
       return t.prompt;
     }) };
     const podA = new SessionOrchestrator(config, repo, gitlab, runner, extensions);
@@ -534,7 +537,7 @@ it('renders live Hub help before session creation and preserves pending approval
   permit.mockResolvedValue(true);
   await dispatchWebhook(worker, note('/help'));
   const guide = reply.mock.calls[0][2];
-  for (const field of ['| 能力场景 | 触发方式 / 标签 | 状态 |', '| 示例任务 | `agent::code` | ✅ 已就绪 |', '| 示例任务 | `agent::setup` | ⚪ 未开通（待配置 missing） |', '/abort', '/use <agent>'])
+  for (const field of ['| 能力场景 | 触发方式 / 标签 | 状态 |', '| 示例任务 | `agent::code` | ✅ 已就绪 |', '| 示例任务 | `agent::setup` | ⚪ 未开通（待配置 missing） |', '/abort'])
     expect(guide).toContain(field);
   expect(await repo.getSessionByIssue(1, issue.iid)).toBeNull();
   const s = await repo.getOrCreateSession(1, issue.iid, 'pending');

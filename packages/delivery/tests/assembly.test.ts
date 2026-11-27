@@ -105,7 +105,7 @@ it.each(['default', 'audit tracker', 'tracker only'] as const)('composes /status
   const repo = new InMemoryDetentRepository();
   const session = await repo.getOrCreateSession(1, 88, 'check');
   const record = {
-    id: 'id', sessionId: session.id, agentProfile: 'EnvChangeAgent', mrId: 'mr', approvalId: 'approval',
+    id: 'id', sessionId: session.id, agentProfile: 'unified', mrId: 'mr', approvalId: 'approval',
     jumpserverJobId: 'job', jumpserverJobUrl: 'https://jms.test/job', commitSha: 'abcde123', playbookPath: 'deploy/run.yml',
     targetAssets: ['web01'], status: 'RUNNING' as const, outputSummary: null, finishedAt: null, createdAt: new Date(),
   };

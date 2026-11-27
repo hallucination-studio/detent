@@ -27,14 +27,14 @@ export async function runSecurity(h: Harness, cluster: Cluster, web: number, ans
   for (const token of [null, 'incorrect-token'])
     assert.equal(await cluster.post(JSON.stringify({ object_kind: 'build', build_status: 'failed' }), 'a', randomUUID(), token), 401);
   const [reporter] = await admin.json<{ id: number }[]>('/users?username=' + gitlab.reporterUsername);
-  for (const command of ['/abort', '/reset', '/use audit'])
+  for (const command of ['/abort', '/reset', '/status'])
     await h.observeGet('/projects/' + hub + '/members/all/' + reporter.id, () => gitlab.postNote(hub, gate, command, 'reporter'));
   for (const command of ['@' + bot.username + ' Please inspect this contribution', '/plan Refactor config loader'])
     await h.observeGet('/projects/' + api + '/members/all/' + reporter.id, () => gitlab.openDiscussion(api, mr.iid, command, undefined, 'reporter'));
   const outsider = { id: 99999, username: 'non-member' };
   assert.equal(await admin.lookup('/projects/' + hub + '/members/all/' + outsider.id), null);
   assert.equal(await admin.lookup('/projects/' + api + '/members/all/' + outsider.id), null);
-  for (const [i, note] of ['/abort', '/reset', '/use audit', '@' + bot.username + ' Please inspect this contribution', '/plan Refactor config loader'].entries()) {
+  for (const [i, note] of ['/abort', '/reset', '/status', '@' + bot.username + ' Please inspect this contribution', '/plan Refactor config loader'].entries()) {
     const isIssue = i < 3;
     const event = { object_kind: 'note', user: outsider, project: { id: isIssue ? hub : api },
       ...(isIssue ? { issue: { iid: gate } } : { merge_request: mr }), object_attributes: {

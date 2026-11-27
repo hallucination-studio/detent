@@ -38,40 +38,15 @@ it('posts only redacted preflight guidance and preserves the stored permission m
   }
 });
 
-it.each([['manual', 'IDLE'], ['auto', 'DONE']] as const)(
-  'puts the redacted routing notice first in the final %s note', async (closePolicy, status) => {
-    const root = await mkdtemp(path.join(tmpdir(), 'detent-routed-note-'));
-    onTestFinished(() => rm(root, { recursive: true, force: true }));
-    const config = loadConfig({ EPHEMERAL_ROOT: path.join(root, 'turns'), JEV_API_KEY: 'test-jev-key' });
-    const repo = new InMemoryDetentRepository();
-    const session = await repo.getOrCreateSession(1, 2, 'inspect');
-    const gitlab = {
-      ...await bareProjects(root), createIssueNote: vi.fn().mockResolvedValue({ id: 1 }), updateIssueNote: vi.fn(),
-      syncIssueStatusLabel: vi.fn(), hasApprovalPermission: vi.fn(), getIssue: vi.fn(), closeIssue: vi.fn(),
-    };
-    const run = vi.fn(async ({ gate }: TurnInput) => {
-      if (closePolicy === 'auto') await gate.invokeExtension('mcp__detent__detent_close_issue', { summary: 'Done' });
-      return 'Final result';
-    });
-    const orchestrator = new SessionOrchestrator(config, repo, gitlab, { run }, {
-      resolveTurnProfile: () => ({ readonly: true, closePolicy, routingNotice: '> Route https://oauth2:test-git-key@git/repo test-jev-key' }),
-    });
-    await orchestrator.resumeSession(session.id, 'inspect');
-    expect(gitlab.updateIssueNote).toHaveBeenLastCalledWith(1, 2, 1, '> Route https://oauth2:***@git/repo ***\n\nFinal result');
-    expect(await repo.getSession(session.id)).toMatchObject({ status, permissionMode: 'plan' });
-    expect(gitlab.closeIssue).toHaveBeenCalledTimes(closePolicy === 'auto' ? 1 : 0);
-  },
-);
-
-it('mounts Hub workflow files without symlinks and protects only root governance paths', async () => {
+it('mounts Hub playbooks without symlinks and protects only root governance paths', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'detent-workflow-'));
   try {
     const projects = await bareProjects(root);
     const seed = path.join(root, 'seed');
-    await mkdir(path.join(seed, 'workflows'));
-    await writeFile(path.join(seed, 'workflows/release.md'), '# Procedure');
-    await symlink('../CLAUDE.md', path.join(seed, 'workflows/linked.md'));
-    await git(['add', 'workflows'], seed, root);
+    await mkdir(path.join(seed, 'agents/release'), { recursive: true });
+    await writeFile(path.join(seed, 'agents/release/AGENT.md'), '# Procedure');
+    await symlink('../../CLAUDE.md', path.join(seed, 'agents/release/linked.md'));
+    await git(['add', 'agents'], seed, root);
     await git(['commit', '-m', 'Add workflow'], seed, root);
     await git(['push', path.join(root, '1.git'), 'main'], seed, root);
 
@@ -86,10 +61,10 @@ it('mounts Hub workflow files without symlinks and protects only root governance
     const runner = { async run({ gate, sandbox }: TurnInput) {
       expect([...gate.extensionTools.keys()]).toEqual(['mcp__detent__base', 'mcp__detent__inspect']);
       const workspace = sandbox.workspaceRoot;
-      expect(await readdir(path.join(workspace, 'workflows'))).toEqual(['release.md']);
-      expect(await readFile(path.join(workspace, 'workflows/release.md'), 'utf8')).toBe('# Procedure');
+      expect(await readdir(path.join(workspace, 'agents/release'))).toEqual(['AGENT.md']);
+      expect(await readFile(path.join(workspace, 'agents/release/AGENT.md'), 'utf8')).toBe('# Procedure');
       await symlink('.', path.join(workspace, 'alias'));
-      for (const file_path of ['CLAUDE.md', 'events.json', 'capabilities.json', 'alias/CapAbilities.json', 'workflows/release.md', 'WorkFlows/new.md', 'claude.MD', 'alias/WorkFlows/new.md']) {
+      for (const file_path of ['CLAUDE.md', 'events.json', 'capabilities.json', 'alias/CapAbilities.json', 'agents/release/AGENT.md', 'Agents/new.md', 'claude.MD', 'alias/Agents/new.md']) {
         for (const action of ['Edit', 'Write'])
           expect(await gate.preflight(action, { file_path }), file_path).toMatchObject({ behavior: 'deny' });
         expect(await gate.preflight('Read', { file_path }), file_path).toMatchObject({ behavior: 'allow' });
@@ -122,7 +97,7 @@ it('projects a turn’s selected Agent and shared skills and protects the root p
     const projects = await bareProjects(root);
     const seed = path.join(root, 'seed');
     const files = {
-      '.claude/settings.json': '{}', 'workflows/release.md': '# Legacy',
+      '.claude/settings.json': '{}',
       'agents/Deploy/AGENT.md': '# Deploy', 'agents/Deploy/skills/Local/SKILL.md': '# Local',
       'agents/Other/AGENT.md': '# Other', 'skills/Shared/SKILL.md': '# Shared', 'skills/Unused/SKILL.md': '# Unused',
     };
@@ -200,10 +175,10 @@ it('skips symlinked projection roots and unsafe paths when a scope is supplied',
   try {
     const gitlab = await bareProjects(root);
     const seed = path.join(root, 'seed');
-    await mkdir(path.join(seed, 'workflows/Example'), { recursive: true });
-    await writeFile(path.join(seed, 'workflows/Example/AGENT.md'), '# Hidden');
-    await symlink('workflows', path.join(seed, 'agents'));
-    await symlink('workflows', path.join(seed, 'skills'));
+    await mkdir(path.join(seed, 'hidden/Example'), { recursive: true });
+    await writeFile(path.join(seed, 'hidden/Example/AGENT.md'), '# Hidden');
+    await symlink('hidden', path.join(seed, 'agents'));
+    await symlink('hidden', path.join(seed, 'skills'));
     await git(['add', '.'], seed, root);
     await git(['commit', '-m', 'Add symlinked projection roots'], seed, root);
     await git(['push', path.join(root, '1.git'), 'main'], seed, root);
@@ -212,7 +187,7 @@ it('skips symlinked projection roots and unsafe paths when a scope is supplied',
     const repo = new InMemoryDetentRepository();
     const session = await repo.getOrCreateSession(1, 2, 'scoped');
     const host = new EphemeralSandbox(config, repo, gitlab);
-    for (const scope of [{}, { agentDir: 'Example', sharedSkills: ['example'] }, { agentDir: '../workflows/Example' }]) {
+    for (const scope of [{}, { agentDir: 'Example', sharedSkills: ['example'] }, { agentDir: '../hidden/Example' }]) {
       const sandbox = await host.prepareTurnSandbox(session, scope);
       try {
         expect((await readdir(sandbox.workspaceRoot)).sort()).toEqual(['CLAUDE.md', 'projects']);
@@ -223,4 +198,47 @@ it('skips symlinked projection roots and unsafe paths when a scope is supplied',
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+it('requires a submitted plan for a unified change and keeps ordinary diagnostic replies idle', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'detent-unified-'));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const repo = new InMemoryDetentRepository();
+  const config = loadConfig({ EPHEMERAL_ROOT: root, DETENT_SECRET_PRIVATE: 'server-only-value' });
+  const gitlab = { ...await bareProjects(root), createIssueNote: vi.fn(async () => ({ id: 7 })),
+    updateIssueNote: vi.fn(), syncIssueStatusLabel: vi.fn(), getIssue: vi.fn(), hasApprovalPermission: vi.fn(async () => true) };
+  const run = vi.fn<((turn: TurnInput) => Promise<string>)>();
+  const pod = new SessionOrchestrator(config, repo, gitlab, { run });
+  const session = await repo.getOrCreateSession(1, 2, 'Inspect service');
+  const actor = { username: 'dev', userId: 7 };
+  run.mockResolvedValueOnce('Service is healthy.');
+  await pod.resumeSession(session.id, 'inspect');
+  expect(await repo.getLatestPendingApproval(session.id)).toBeNull();
+  expect(await repo.getSession(session.id)).toMatchObject({ status: 'IDLE' });
+
+  run.mockImplementationOnce(async ({ gate }) => {
+    for (const name of ['Write', 'Edit', 'detent_commit_and_push', 'detent_create_mr', 'Bash'])
+      expect(await gate.preflight(name, { command: 'touch file', file_path: 'file' }))
+        .toMatchObject({ behavior: 'deny', message: expect.stringContaining('detent_submit_plan') });
+    const submit = 'mcp__detent__detent_submit_plan';
+    await expect(gate.invokeExtension(submit, { plan: 'server-only-value' })).rejects.toThrow('凭证');
+    expect(await gate.invokeExtension(submit, { plan: 'Change the config and run tests.' })).toMatchObject({ submitted: true });
+    return 'Waiting for review.';
+  });
+  await pod.handleUserIntent(1, 2, { ...actor, type: 'PROMPT', comment: 'Fix config' });
+  const card = await repo.getLatestPendingApproval(session.id);
+  expect(card).toMatchObject({ approvalType: 'PLAN', toolInput: {} });
+  expect(gitlab.updateIssueNote.mock.lastCall?.[3]).toContain('Change the config and run tests.');
+  expect(gitlab.updateIssueNote.mock.lastCall?.[3]).not.toContain('Waiting for review.');
+  run.mockImplementationOnce(async ({ gate }) => {
+    expect(gate.extensionTools.has('mcp__detent__detent_submit_plan')).toBe(false);
+    expect(await gate.preflight('Edit', { file_path: 'config' })).toMatchObject({ behavior: 'allow' });
+    return 'Implemented.';
+  });
+  await pod.handleUserIntent(1, 2, { ...actor, type: 'APPROVE', targetNoteId: card!.gitlabNoteId! });
+  expect(await repo.getSession(session.id)).toMatchObject({ status: 'IDLE', permissionMode: 'plan' });
+  run.mockResolvedValueOnce('A specifically requested plan.');
+  await pod.handleUserIntent(1, 2, { ...actor, type: 'PLAN' });
+  expect(await repo.getSession(session.id)).toMatchObject({ status: 'WAITING_PLAN' });
+  expect(gitlab.updateIssueNote.mock.lastCall?.[3]).toContain('A specifically requested plan.');
 });

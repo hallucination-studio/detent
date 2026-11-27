@@ -41,6 +41,7 @@ async function setup() {
     const file = transcriptPath(turn.sandbox.claudeHome, turn.sandbox.workspaceRoot, turn.session.claudeSessionId!);
     await mkdir(path.dirname(file), { recursive: true });
     await appendFile(file, JSON.stringify({ type: 'assistant', prompt: turn.prompt }) + '\n');
+    if (turn.session.permissionMode === 'plan') await turn.gate.invokeExtension('mcp__detent__detent_submit_plan', { plan: 'Prepare the MR.' });
     return 'done';
   }
   const run = vi.fn(recordTurn);
@@ -100,9 +101,10 @@ it('records a cross-project merge and resumes the approved Claude session once a
   expect(run).toHaveBeenCalledTimes(3);
   const [turn] = run.mock.calls[2];
   expect(turn).toMatchObject({
-    resume: true, session: { id: session.id, claudeSessionId: session.claudeSessionId, permissionMode: 'default' },
+    resume: true, session: { id: session.id, claudeSessionId: session.claudeSessionId },
     systemPrompt: expect.stringContaining('merged @ 1234abcd · Pipeline'),
   });
+  expect(turn.systemPrompt).toContain('已获方案审批');
   for (const value of ['org/project2!5', url, 'change-42', 'main', '@maintainer', sha])
     expect(turn.prompt).toContain(value);
 });

@@ -1,33 +1,15 @@
 import assert from 'node:assert/strict';
-import { kafkaCommands, kafkaTitle } from './suites/kafka.js';
-import { imageMirror } from './offline-mcp.js';
+import { kafkaCommands } from './suites/kafka.js';
 
 export function offlineJev() {
   const requests: string[] = [];
   const eventDecisions: string[] = [];
-  const routingRequests: { recentMessages: string[]; confidence: number; ambiguity: number }[] = [];
   async function handle(req: Request) {
     assert.equal(req.method, 'POST');
     assert.equal(new URL(req.url).pathname, '/compatible-mode/v1/systemone');
     assert.equal(req.headers.get('authorization'), 'Bearer offline-jev-key');
     const { model, state, questions } = await req.json();
     assert.equal(model, 'decision-model-preview');
-    if (state.surface === 'hub_agent_routing') {
-      assert.equal(questions.agent.type, 'choice');
-      assert.equal(questions.clear_match.type, 'noul');
-      assert.equal(questions.ambiguity.type, 'score');
-      assert.ok(Object.hasOwn(questions.agent.criteria, 'image-sync'));
-      const recentMessages: string[] = state.recent_user_messages;
-      assert.ok(Array.isArray(recentMessages) && recentMessages.every(message => typeof message === 'string'));
-      const clarified = Object.values(imageMirror).every(image => recentMessages.some(message => message.includes(image)));
-      const confidence = clarified ? 0.96 : 0.55;
-      const ambiguity = clarified ? 0.1 : 2;
-      routingRequests.push({ recentMessages, confidence, ambiguity });
-      return Response.json({ answers: {
-        agent: { type: 'choice', choice: state.issue_title === kafkaTitle ? '__none__' : 'image-sync' }, clear_match: { type: 'noul', noul: confidence },
-        ambiguity: { type: 'score', score: ambiguity },
-      } });
-    }
     if (questions.action) {
       assert.deepEqual(questions.action, { type: 'choice', criteria: { notify: 'notify', run: 'run' } });
       assert.equal(state.hint, 'Notify on infrastructure flakes and fix code errors.');
@@ -57,5 +39,5 @@ export function offlineJev() {
       [safety]: { type: 'noul', noul: manual ? 0.5 : remote ? 0.79 : 0.96 }, impact: { type: 'score', score: manual ? 2 : state.command === 'date -u' ? 1.4 : remote ? 0.76 : 0 },
     } });
   }
-  return { requests, routingRequests, eventDecisions, handle };
+  return { requests, eventDecisions, handle };
 }

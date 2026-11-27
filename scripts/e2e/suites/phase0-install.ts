@@ -41,6 +41,46 @@ export async function checkStartupFailures(h: Install, local: NodeJS.ProcessEnv,
   }
 }
 
+export async function protectedHubInstall(h: Install, local: NodeJS.ProcessEnv, tmp: string, publicUrl: string) {
+  const { admin, gitlab } = h;
+  const namespace = 'devops';
+  const group = await admin.json<{ id: number }>('/groups', 'POST', { name: namespace, path: namespace });
+  const root = await admin.json<{ id: number }>('/user');
+  await admin.request('/groups/' + group.id + '/members/' + root.id, 'PUT', { access_level: 30 });
+  const out = join(tmp, 'protected-hub.env');
+  const hubPath = namespace + '/workspace-hub';
+  const provision = (credential: NodeJS.ProcessEnv) => run(join(process.cwd(), 'node_modules/.bin/tsx'),
+    ['scripts/bootstrap.ts', '--env-out', out], { env: { ...local, GITLAB_BASE_URL: gitlab.baseUrl,
+      DETENT_PUBLIC_URL: publicUrl, DETENT_HUB_PROJECT: hubPath, DETENT_TARGET_PROJECTS: namespace + '/business', ...credential } });
+  await provision({ GITLAB_ADMIN_TOKEN: gitlab.adminToken });
+  const config = parseEnv(await readFile(out, 'utf8'));
+  const bot = await admin.json<{ id: number; username: string }>('/user', 'GET', undefined, config.GITLAB_TOKEN);
+  const hub = '/projects/' + config.GITLAB_HUB_PROJECT_ID;
+  const role = async (project: string, user: number) =>
+    (await admin.json<{ access_level: number }>(project + '/members/all/' + user)).access_level;
+  assert.equal(await role(hub, root.id), 30);
+  assert.equal(await role(hub, bot.id), 50);
+  assert.equal(await role('/projects/devops%2Fbusiness', bot.id), 30);
+  assert.equal(await admin.lookup('/groups/' + group.id + '/members/all/' + bot.id), null);
+  const denied = await admin.request(hub + '/repository/files/README.md', 'PUT', {
+    branch: 'main', content: 'unauthorized', commit_message: 'Attempt protected branch write',
+  }, gitlab.adminToken, [403]);
+  assert.equal(denied.status, 403);
+
+  const templates = 'examples/hub-workspace';
+  const log = await run('git', ['log', '--format=%an', 'main'], { cwd: join(tmp, hubPath + '.git') });
+  assert.deepEqual([...new Set(log.stdout.trimEnd().split('\n'))], [bot.username], 'All Hub commits must be bot-authored');
+  for (const path of await readdir(templates, { recursive: true })) {
+    if (path.endsWith('.DS_Store') || !(await stat(join(templates, path))).isFile()) continue;
+    assert.equal(await gitlab.getFile(Number(config.GITLAB_HUB_PROJECT_ID), path), await readFile(join(templates, path), 'utf8'), path);
+  }
+
+  await admin.request(hub + '/members/' + bot.id, 'PUT', { access_level: 30 });
+  await assert.rejects(provision({ GITLAB_TOKEN: config.GITLAB_TOKEN }), /Grant @detent-bot Maintainer \(40\) or Owner \(50\) on the Hub project devops\/workspace-hub/);
+  await provision({ GITLAB_ADMIN_TOKEN: gitlab.adminToken });
+  assert.equal(await role(hub, bot.id), 50, 'Admin rerun must upgrade an existing Hub membership');
+}
+
 export async function brownfieldOnboarding(h: Install, local: NodeJS.ProcessEnv, tmp: string, publicUrl: string) {
   const { admin, gitlab } = h;
   const group = await admin.json<{ id: number }>('/namespaces/apps');
@@ -66,7 +106,9 @@ export async function brownfieldOnboarding(h: Install, local: NodeJS.ProcessEnv,
     const project = await admin.json<{ id: number }>('/projects/' + encodeURIComponent(ref));
     await admin.request('/projects/' + project.id + '/members', 'POST', { user_id: bot.id, access_level: 40 });
   }
-  assert.equal((await admin.json<{ empty_repo: boolean }>('/projects/' + empty.id)).empty_repo, true);
+  const uninitialized = await admin.json<{ empty_repo: boolean; default_branch: string | null }>('/projects/' + empty.id);
+  assert.equal(uninitialized.empty_repo, true);
+  assert.equal(uninitialized.default_branch, null);
   const out = join(tmp, 'brownfield.env');
   const provision = async () => {
     const result = await run(join(process.cwd(), 'node_modules/.bin/tsx'), ['scripts/bootstrap.ts', '--env-out', out], {
@@ -81,8 +123,9 @@ export async function brownfieldOnboarding(h: Install, local: NodeJS.ProcessEnv,
     assert.ok([token, config.GITLAB_WEBHOOK_SECRET].every(s => !(result.stdout + result.stderr).includes(s)));
     return config;
   };
+  await gitlab.upsertFile(hub.id, 'README.md', 'Team handbook\n', 'Customize Hub home page');
   const config = await provision();
-  assert.equal(await gitlab.getFile(hub.id, 'README.md'), '# existing-hub\n');
+  assert.equal(await gitlab.getFile(hub.id, 'README.md'), 'Team handbook\n');
   assert.equal(await gitlab.getFile(empty.id, 'README.md', 'main'), '# apps/uninitialized\n');
   const template = '.gitlab/issue_templates/code-delivery.md';
   assert.equal(await gitlab.getFile(hub.id, template), await readFile(join('examples/hub-workspace', template), 'utf8'));

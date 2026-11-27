@@ -75,6 +75,18 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
     mrs.set(p.id, []);
     members.set(p.id + '/' + users[3].id, 20);
   }
+  function accessLevel(p: Project, userId: number) {
+    let level = members.get(p.id + '/' + userId) ?? 0;
+    for (const group of groups) {
+      if (p.path_with_namespace.startsWith(group.full_path + '/'))
+        level = Math.max(level, groupMembers.get(group.id + '/' + userId) ?? 0);
+    }
+    return level;
+  }
+  function projectResource(p: Project) {
+    const empty = !commitSha(p, p.default_branch);
+    return { ...p, empty_repo: empty, default_branch: empty ? null : p.default_branch };
+  }
   function commitSha(p: Project, ref: string) {
     try { return git(repo(p), 'rev-parse', '--verify', '--quiet', '--end-of-options', ref + '^{commit}').toString().trim(); }
     catch { return null; }
@@ -88,7 +100,7 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
     const message = annotated ? git(repo(p), 'tag', '--list', '--format=%(contents)', '--', name).toString().trimEnd() : null;
     return { name, message, commit: { id } };
   }
-  async function commitFile(p: Project, file: string, content: string | Buffer, message: string, branch = p.default_branch, start = branch) {
+  async function commitFile(p: Project, file: string, content: string | Buffer, message: string, branch = p.default_branch, start = branch, author?: User) {
     assert.ok(safePath(file), 'Expected a relative repository file path');
     const work = await mkdtemp(join(root, 'seed-'));
     try {
@@ -98,7 +110,7 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
       await mkdir(dirname(join(work, file)), { recursive: true });
       await writeFile(join(work, file), content);
       git(work, '--literal-pathspecs', 'add', '--', file);
-      git(work, 'commit', '-m', message);
+      git(work, 'commit', ...(author ? ['--author', author.username + ' <' + author.username + '@localhost>'] : []), '-m', message);
       git(work, 'push', 'origin', 'HEAD:refs/heads/' + branch);
     } finally { await rm(work, { recursive: true, force: true }); }
   }
@@ -149,7 +161,7 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
     const [login, pat] = Buffer.from(basic?.[1] ?? '', 'base64').toString().split(':');
     if (login !== 'oauth2' || !tokens.has(pat) || pat === admin)
       return new Response(null, { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="GitLab"' } });
-    if ((members.get(p.id + '/' + tokens.get(pat)!.id) ?? 0) < (push ? 30 : 20)) return forbidden();
+    if (accessLevel(p, tokens.get(pat)!.id) < (push ? 30 : 20)) return forbidden();
     const input = Buffer.from(await req.arrayBuffer());
     const bytes = execFileSync(backend, [], { input, env: { ...gitEnv, GIT_PROJECT_ROOT: root,
       GIT_HTTP_EXPORT_ALL: '1', REMOTE_USER: login, PATH_INFO: url.pathname, REQUEST_METHOD: req.method,
@@ -228,6 +240,7 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
         const parent = groups.find(g => g.id === body.parent_id);
         const group = { id: groups.length + 1, full_path: (parent ? parent.full_path + '/' : '') + body.path };
         groups.push(group);
+        groupMembers.set(group.id + '/' + actor.id, 50);
         return reply(group);
       }
     }
@@ -246,18 +259,19 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
       git(repo(p), 'config', 'http.receivepack', 'true');
       if (body.initialize_with_readme) await commitFile(p, 'README.md', '# ' + body.name + '\n', 'Initialize repository');
       register(p);
-      members.set(p.id + '/' + actor.id, 40);
-      return reply(p);
+      return reply(projectResource(p));
     }
     const p = find(ref);
     if (!p) return absent();
-    if (!section && get) return reply({ ...p, empty_repo: !commitSha(p, p.default_branch) });
+    if (!section && get) return reply(projectResource(p));
     if (section === 'members') {
-      const key = p.id + '/' + (sub ?? item ?? body.user_id);
+      const id = Number(sub ?? item ?? body.user_id);
+      const key = p.id + '/' + id;
       if (post || put) members.set(key, body.access_level);
-      const member = (id: number) => ({ id, access_level: members.get(p.id + '/' + id) });
-      if (get && !item) return reply(users.map(u => member(u.id)).filter(u => u.access_level));
-      return members.has(key) ? reply(member(Number(key.split('/')[1]))) : absent();
+      if (get && !item) return reply(users.map(u => ({ id: u.id, access_level: members.get(p.id + '/' + u.id) }))
+        .filter(u => u.access_level));
+      const level = item === 'all' ? accessLevel(p, id) : members.get(key);
+      return level ? reply({ id, access_level: level }) : absent();
     }
     if (section === 'labels') {
       const rows = labels.get(p.id)!;
@@ -265,7 +279,7 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
       return reply(get ? rows : body);
     }
     if (section === 'hooks') {
-      if (credential !== admin && (members.get(p.id + '/' + actor.id) ?? 0) < 40) return forbidden();
+      if (credential !== admin && accessLevel(p, actor.id) < 40) return forbidden();
       const rows = hooks.get(p.id)!;
       if (get) return reply(rows.map(({ token, ...hook }) => hook));
       if (post) rows.push({ ...body, id: rows.length + 1 });
@@ -298,11 +312,12 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
         }));
       }
       if ((post || put) && item === 'files') {
+        if (body.branch === 'main' && accessLevel(p, actor.id) < 40) return forbidden();
         const start = body.start_branch ?? body.branch;
         const exists = !!commitSha(p, start) && git(repo(p), 'ls-tree', '--name-only', 'refs/heads/' + start, '--', sub).length > 0;
         if (exists !== put) return new Response(null, { status: exists ? 400 : 404 });
         const content = body.encoding === 'base64' ? Buffer.from(body.content, 'base64') : body.content;
-        await commitFile(p, sub, content, body.commit_message, body.branch, start);
+        await commitFile(p, sub, content, body.commit_message, body.branch, start, actor);
         return reply({ file_path: sub, branch: body.branch });
       }
     }

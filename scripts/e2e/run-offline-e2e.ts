@@ -11,7 +11,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { isDeepStrictEqual, parseEnv, promisify } from 'node:util';
 import mysql, { type RowDataPacket } from 'mysql2/promise';
 import { createOfflineAnthropic } from './offline-anthropic.js';
-import { checkStartupFailures, brownfieldOnboarding, standaloneAndUpgrade } from './suites/phase0-install.js';
+import { checkStartupFailures, brownfieldOnboarding, protectedHubInstall, standaloneAndUpgrade } from './suites/phase0-install.js';
 import { onboardPayment, runIssueScenarios } from './suites/phase1-issues.js';
 import { checkSession } from './suites/harness.js';
 import { runConcurrency } from './suites/phase3-concurrency.js';
@@ -358,7 +358,10 @@ async function main() {
     }, sql: { host, port, user, password, database },
       adminSql: { host, port, user: external ? user : 'root', password: rootPassword } });
     await checkStartupFailures(shared, localEnv, isolationIssue);
-    if (gitlab.synthetic) await brownfieldOnboarding(shared, localEnv, tmp, publicUrl);
+    if (gitlab.synthetic) {
+      await protectedHubInstall(shared, localEnv, tmp, publicUrl);
+      await brownfieldOnboarding(shared, localEnv, tmp, publicUrl);
+    }
     await startPod('detent-issue-lifecycles', {}, 'delivery', envFile);
     await runIssueScenarios({ ...shared, observeWebhook: act => observe('webhook-accepted', act), startPod: id => startPod(id, {}, 'delivery', envFile) });
     await stopPod(true);

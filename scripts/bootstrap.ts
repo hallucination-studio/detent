@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs, parseEnv } from 'node:util';
 
 interface User { id: number; username: string }
-interface Project { id: number; path_with_namespace: string; default_branch: string; web_url: string }
+interface Project { id: number; path_with_namespace: string; default_branch: string | null; web_url: string }
 const list = (s = '') => s.split(',').map(v => v.trim()).filter(Boolean);
 
 async function templateFiles(root: string, dir = ''): Promise<string[]> {
@@ -57,22 +57,22 @@ async function main() {
   function check(res: Response, path: string) {
     if (!res.ok) throw Error('GitLab HTTP ' + res.status + ' at ' + path.split('?')[0]);
   }
-  async function json<T>(path: string, method = 'GET', body?: object): Promise<T> {
-    const res = await request(path, method, body);
+  async function json<T>(path: string, method = 'GET', body?: object, credential?: string): Promise<T> {
+    const res = await request(path, method, body, credential);
     check(res, path);
     return res.json();
   }
-  async function lookup<T>(path: string): Promise<T | undefined> {
-    const res = await request(path);
+  async function lookup<T>(path: string, credential?: string): Promise<T | undefined> {
+    const res = await request(path, 'GET', undefined, credential);
     if (res.status === 404) return;
     check(res, path);
     return res.json();
   }
-  async function all<T>(path: string) {
+  async function all<T>(path: string, credential?: string) {
     const items: T[] = [];
     let page = '1';
     while (page) {
-      const res = await request(path + (path.includes('?') ? '&' : '?') + 'per_page=100&page=' + page);
+      const res = await request(path + (path.includes('?') ? '&' : '?') + 'per_page=100&page=' + page, 'GET', undefined, credential);
       check(res, path);
       items.push(...await res.json() as T[]);
       page = res.headers.get('x-next-page') ?? '';
@@ -95,17 +95,21 @@ async function main() {
     } else if (res.status !== 401 || !admin || env.GITLAB_TOKEN) check(res, '/user');
   }
   if (!bot) {
-    token = undefined;
     bot = await user(username) ?? await json<User>('/users', 'POST', {
       username, name: env.DETENT_BOT_NAME ?? 'Detent Bot', email: env.DETENT_BOT_EMAIL ?? 'detent-bot@detent.local',
       force_random_password: true, skip_confirmation: true,
     });
+    const expiresAt = env.DETENT_BOT_TOKEN_EXPIRES_AT ?? new Date(Date.now() + 364 * 86_400_000).toISOString().slice(0, 10);
+    const pat = await json<{ token: string }>('/users/' + bot.id + '/personal_access_tokens', 'POST', {
+      name: 'Detent', scopes: ['api', 'read_repository', 'write_repository'], expires_at: expiresAt,
+    });
+    token = pat.token;
   }
 
-  async function project(ref: string): Promise<{ project: Project; created: boolean }> {
+  async function project(ref: string, initializeWithReadme: boolean): Promise<{ project: Project; created: boolean }> {
     const found = await lookup<Project & { empty_repo?: boolean }>('/projects/' + encodeURIComponent(ref));
     if (found) {
-      if (found.empty_repo || !found.default_branch) {
+      if (initializeWithReadme && (found.empty_repo || !found.default_branch)) {
         found.default_branch = 'main';
         await json('/projects/' + found.id + '/repository/files/README.md', 'POST', {
           branch: 'main', content: '# ' + found.path_with_namespace + '\n', commit_message: 'Initialize repository',
@@ -127,7 +131,7 @@ async function main() {
       parent = namespace.id;
     }
     const created = await json<Project>('/projects', 'POST', {
-      name, path: name, namespace_id: parent, initialize_with_readme: true, default_branch: 'main',
+      name, path: name, namespace_id: parent, initialize_with_readme: initializeWithReadme, ...(initializeWithReadme && { default_branch: 'main' }),
     });
     return { project: created, created: true };
   }
@@ -139,23 +143,31 @@ async function main() {
     await json(direct ? path + '/' + u.id : path, direct ? 'PUT' : 'POST', { user_id: u.id, access_level: level });
   }
 
-  const { project: hub, created } = await project(env.GITLAB_HUB_PROJECT_ID || env.DETENT_HUB_PROJECT || 'ai/workspace-hub');
+  const { project: hub, created } = await project(env.GITLAB_HUB_PROJECT_ID || env.DETENT_HUB_PROJECT || 'ai/workspace-hub', false);
   const root = '/projects/' + hub.id;
+  hub.default_branch ||= 'main';
+  if (admin) {
+    await member(root, bot, 50);
+  } else {
+    const access = await lookup<{ access_level: number }>(root + '/members/all/' + bot.id, token);
+    if (!access || access.access_level < 40)
+      throw Error('Grant @' + bot.username + ' Maintainer (40) or Owner (50) on the Hub project ' + hub.path_with_namespace + ' first');
+  }
   const templateDir = env.DETENT_HUB_TEMPLATE_DIR ?? fileURLToPath(new URL('../examples/hub-workspace', import.meta.url));
   const files = new Set(await templateFiles(templateDir));
   if (env.DETENT_CLAUDE_MD_FILE) files.add('CLAUDE.md');
   for (const path of [...files].sort()) {
     const file = root + '/repository/files/' + encodeURIComponent(path);
-    const exists = await lookup(file + '?ref=' + encodeURIComponent(hub.default_branch));
+    const exists = await lookup(file + '?ref=' + encodeURIComponent(hub.default_branch), token);
     if (exists && !(created && path === 'README.md')) continue;
     const source = path === 'CLAUDE.md' && env.DETENT_CLAUDE_MD_FILE ? env.DETENT_CLAUDE_MD_FILE : resolve(templateDir, path);
     const content = await readFile(source, 'base64');
-    await json(file, exists ? 'PUT' : 'POST', { branch: hub.default_branch, content, encoding: 'base64', commit_message: 'Seed ' + path });
+    await json(file, exists ? 'PUT' : 'POST', { branch: hub.default_branch, content, encoding: 'base64', commit_message: 'Seed ' + path }, token);
   }
-  const labels = await all<{ name: string }>(root + '/labels');
+  const labels = await all<{ name: string }>(root + '/labels', token);
   for (const name of ['claude::planning', 'claude::waiting-approval', 'claude::coding', 'claude::idle',
     'claude::failed', 'claude::done', 'delivery::audit', 'delivery::env-change', 'delivery::code', 'delivery::release', 'agent::image-sync', 'agent::onboarding']) {
-    if (!labels.some(l => l.name === name)) await json(root + '/labels', 'POST', { name, color: '#356288' });
+    if (!labels.some(l => l.name === name)) await json(root + '/labels', 'POST', { name, color: '#356288' }, token);
   }
   for (const entry of list(env.DETENT_HUB_MEMBERS)) {
     const match = /^([^:]+):(10|15|20|30|40|50)$/.exec(entry);
@@ -171,7 +183,7 @@ async function main() {
     projects.set(p.id, p);
     targets.add(p.id);
   }
-  for (const ref of list(env.DETENT_TARGET_PROJECTS)) addTarget((await project(ref)).project);
+  for (const ref of list(env.DETENT_TARGET_PROJECTS)) addTarget((await project(ref, true)).project);
   for (const id of groupIds) {
     const path = '/groups/' + id;
     await member(path, bot, 30);
@@ -179,14 +191,16 @@ async function main() {
       addTarget(p);
   }
   for (const p of projects.values()) {
-    await member('/projects/' + p.id, bot, 30);
+    const isHub = p.id === hub.id;
+    if (!isHub) await member('/projects/' + p.id, bot, 30);
+    const credential = isHub ? token : admin || token;
     const path = '/projects/' + p.id + '/hooks';
-    const hook = (await all<{ id: number; url: string }>(path)).find(h => h.url === hookUrl);
+    const hook = (await all<{ id: number; url: string }>(path, credential)).find(h => h.url === hookUrl);
     await json(hook ? path + '/' + hook.id : path, hook ? 'PUT' : 'POST', {
       url: hookUrl, token: secret, enable_ssl_verification: ssl === 'true', push_events: false,
-      issues_events: p.id === hub.id, note_events: true, emoji_events: true,
+      issues_events: isHub, note_events: true, emoji_events: true,
       merge_requests_events: targets.has(p.id), pipeline_events: targets.has(p.id), deployment_events: targets.has(p.id),
-    });
+    }, credential);
   }
 
   const template = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
@@ -195,13 +209,6 @@ async function main() {
   for (const [, key] of template.matchAll(/^(?:# )?([A-Z][A-Z_0-9]*)=/gm)) {
     const value = key === 'DETENT_PUBLIC_URL' ? publicUrl : env[key] ?? previous[key] ?? defaults[key];
     if (value !== undefined) output[key] = value;
-  }
-  if (!token) {
-    const expiresAt = env.DETENT_BOT_TOKEN_EXPIRES_AT ?? new Date(Date.now() + 364 * 86_400_000).toISOString().slice(0, 10);
-    const pat = await json<{ token: string }>('/users/' + bot.id + '/personal_access_tokens', 'POST', {
-      name: 'Detent', scopes: ['api', 'read_repository', 'write_repository'], expires_at: expiresAt,
-    });
-    token = pat.token;
   }
   Object.assign(output, { GITLAB_BASE_URL: base, GITLAB_TOKEN: token, GITLAB_WEBHOOK_SECRET: secret,
     GITLAB_HUB_PROJECT_ID: String(hub.id), GITLAB_HUB_DEFAULT_BRANCH: hub.default_branch });
@@ -224,7 +231,7 @@ async function main() {
   }
   if (values['welcome-issue'] || env.DETENT_WELCOME_ISSUE === 'true') {
     const path = root + '/issues';
-    if ((await json<unknown[]>(path + '?per_page=1')).length === 0) {
+    if ((await json<unknown[]>(path + '?per_page=1', 'GET', undefined, token)).length === 0) {
       const names = [...projects.values()].filter(p => targets.has(p.id)).map(p => '- `' + p.path_with_namespace + '`');
       const description = [
         '你好，我是 @' + bot.username + '！在 [Hub 工单入口](' + hub.web_url + '/-/issues/new) 新建 Issue，选择模板，写下目标仓库和任务。',

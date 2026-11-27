@@ -578,7 +578,7 @@ Issue 和 MR 的工具调用均通过 NoteStreamer 写入折叠轨迹。双目�
 
 ## Stage 13–14 · 安装、帮助与仓库接入
 
-`Dockerfile` 构建双包服务，`docker-compose.yml` 运行 MySQL 与 Delivery。按 `INSTALL.md` 运行 bootstrap，可按群组（含子群组）发现目标，或通过 `--welcome-issue` 在空 Hub 发布 Bot 自己的欢迎工单。新建 Hub 的初始 README 替换为 `examples/hub-workspace/README.md`。后续执行仅补齐缺失文件与标签。
+`Dockerfile` 构建双包服务，`docker-compose.yml` 运行 MySQL 与 Delivery。按 `INSTALL.md` 运行 bootstrap，可按群组（含子群组）发现目标，或通过 `--welcome-issue` 在空 Hub 发布 Bot 自己的欢迎工单。管理员模式先准备 Bot PAT，再创建或打开 Hub，并在该项目授予 `@detent-bot` Owner（50）。仅用 Bot PAT 时校验 Hub 有效成员权限至少为 Maintainer（40）。Hub 文件、标签、Webhook 和可选欢迎工单均由 Bot PAT 写入。新 Hub 直接采用模板 README，已有文件在重跑时保留。目标业务项目和群组授予 Developer（30），保留已有的更高权限。
 
 Hub Issue 的 `/help` 在成员检查后从默认分支加载 Agent，按当前能力包显示就绪状态。MR 的帮助接受 Bot 指派或显式提及，沿原讨论串回复。两者均无模型调用、租约或会话写入。首条 MR 工作评论用持久化的 active_note_id 区分首次接管与后续轮次。
 

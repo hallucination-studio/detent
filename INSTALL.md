@@ -76,6 +76,8 @@ docker compose run --rm --no-deps -T \
   -e MYSQL_HOST=mysql detent node /app/scripts/bootstrap.ts --welcome-issue --env-out .env
 ```
 
+With an admin token, bootstrap creates or opens the Hub and grants `@detent-bot` Owner (50) on that project. With only the bot PAT, grant the bot effective Maintainer (40) or Owner (50) access to the Hub first. Bootstrap uses the bot PAT to seed Hub files, create labels, configure the Hub webhook, and post the optional welcome Issue. It grants Developer (30) on target business projects and groups, preserving any higher existing access.
+
 Bootstrap prints the bot username and each configured project. Repeat this step with the same file and selectors to pick up new group projects. The welcome option creates a bot-authored Issue only in an empty Hub, counting both open and closed Issues. Ordinary bootstrap runs leave Issues alone unless `--welcome-issue` or `DETENT_WELCOME_ISSUE=true` is supplied.
 
 ## 5. Start Detent and verify the handoff

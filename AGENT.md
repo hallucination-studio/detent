@@ -87,7 +87,7 @@ Issue 与 MR 复用 NoteStreamer 折叠工具轨迹。双目标共用真实 Clau
 
 ### Stage 13–14 安装与 GitLab 内自助接入
 
-依照 `INSTALL.md` 使用 `Dockerfile` 和 `docker-compose.yml` 安装。bootstrap 支持 `DETENT_TARGET_GROUPS` 与 Bot 欢迎工单。新建 Hub 时用 `examples/hub-workspace/README.md` 替换 GitLab 自动生成的首页，已有 Hub 保留自己的首页。
+依照 `INSTALL.md` 使用 `Dockerfile` 和 `docker-compose.yml` 安装。bootstrap 支持 `DETENT_TARGET_GROUPS` 与 Bot 欢迎工单。管理员模式先准备 Bot PAT，再在 Hub 项目授予 `@detent-bot` Owner（50）；仅用 Bot PAT 时先校验 Hub 有效权限至少为 Maintainer（40）。Hub 模板、标签、Webhook 和可选欢迎工单均用 Bot PAT 写入。新建 Hub 直接写入模板首页，已有 Hub 保留自己的首页。目标业务项目与群组授予 Developer（30），保留已有的更高权限。
 
 Hub 和 MR 的 `/help` 在检查成员权限后直接发评论，禁止创建会话或调用模型。MR 还须验证实时分配或显式提及，首次接管提示只出现在首条工作评论。`agents/onboarding/AGENT.md` 使用 Core 通用 `gitlab-onboarding` 能力包。回调地址来自 `DETENT_PUBLIC_URL`。服务端检查所有目标的有效 Maintainer 权限，Delivery 对写 Webhook 工具强制生产审批。Webhook 密钥只进入 GitLab 管理请求；模型 API 凭证由父进程为上游请求注入。
 

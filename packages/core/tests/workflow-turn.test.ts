@@ -24,7 +24,7 @@ it('posts only redacted preflight guidance and preserves the stored permission m
       resolveTurnProfile: () => ({ blockedMessage: '请配置 https://oauth2:secret@git/group/app' }),
     });
     await orchestrator.resumeSession(session.id, 'continue', { permissionMode: 'default' });
-    expect(note.mock.calls).toEqual([[1, 2, '请配置 https://oauth2:***@git/group/app']]);
+    expect(note.mock.calls).toEqual([[1, 2, '请配置 https://oauth2:***@git/group/app\n\n> 💡 发送 `/help` 可随时查看当前工作区全部可用 Agent 与指令。']]);
     expect(sync.mock.calls).toEqual([[1, 2, 'IDLE']]);
     expect(update.mock.calls).toEqual([[session.id, { status: 'IDLE' }]]);
     expect(await repo.getSession(session.id)).toMatchObject({

@@ -58,7 +58,7 @@ it('dispatches an authenticated extension event with access to the core orchestr
 });
 
 it.each(['injected', 'http', 'disabled'] as const)('assembles %s tools alongside caller extensions', async mode => {
-  const config = loadConfig({ GITLAB_WEBHOOK_SECRET: 'test' });
+  const config = loadConfig({ GITLAB_WEBHOOK_SECRET: 'test', DETENT_PUBLIC_URL: 'https://hub.example' });
   const deliveryConfig = loadDeliveryConfig(mode === 'http' ? { JUMPSERVER_BASE_URL: 'https://jms.test' } : {});
   const client: JumpServerClient = {
     listAssets: vi.fn(), runReadonlyInspect: vi.fn(), runAnsibleJob: vi.fn(), getJobResult: vi.fn(),
@@ -71,8 +71,9 @@ it.each(['injected', 'http', 'disabled'] as const)('assembles %s tools alongside
   try {
     const extensions = vi.mocked(createDetentApp).mock.lastCall![1]!;
     expect(extensions.tools).toBe(tools);
-    const [release, jumpserver, deploy] = extensions.capabilities!;
+    const [release, jumpserver, onboarding, deploy] = extensions.capabilities!;
     expect(deploy).toBe(customPack);
+    expect(onboarding).toMatchObject({ name: 'gitlab-onboarding', enabled: true, approverTier: 'prod' });
     expect(release).toMatchObject({ name: 'gitlab-release', enabled: true });
     expect(release.tools.map(tool => tool.name)).toEqual(['detent_list_tags', 'detent_create_release']);
     expect(jumpserver).toMatchObject({ name: 'jumpserver', enabled: mode !== 'disabled', setupHint: expect.stringContaining('JUMPSERVER_BASE_URL') });
@@ -93,6 +94,7 @@ it.each(['false', ' 0 '])('disables release tools with %s and lets a caller repl
     expect(capabilities).toEqual([
       { name: 'gitlab-release', enabled: false, tools: [], setupHint: expect.stringContaining('DELIVERY_ENABLE_RELEASE_TOOLS=false') },
       replacement,
+      expect.objectContaining({ name: 'gitlab-onboarding', enabled: false }),
     ]);
   } finally {
     await app.close();

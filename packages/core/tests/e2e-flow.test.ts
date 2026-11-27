@@ -508,3 +508,33 @@ it('publishes readonly results directly and includes extension status before app
     await rm(root, { recursive: true, force: true });
   }
 });
+
+it('renders live Hub help before session creation and preserves pending approvals', async () => {
+  const config = loadConfig({});
+  const client = new GitLabClient(config);
+  const repo = new InMemoryDetentRepository();
+  const run = vi.fn();
+  const permit = vi.spyOn(client, 'hasApprovalPermission').mockResolvedValue(false);
+  const reply = vi.spyOn(client, 'createIssueNote').mockResolvedValue({ id: 99 });
+  const agent = (id: string) => ({ id, path: 'agents/' + id + '/AGENT.md', name: 'AGENT.md', type: 'blob' as const });
+  vi.spyOn(client, 'listRepositoryTree').mockImplementation(async (_, dir) => dir === 'agents' ? [agent('code'), agent('setup')] : []);
+  vi.spyOn(client, 'getRepositoryFile').mockImplementation(async (_, file) =>
+    '---\nrequires: [' + (file.includes('/setup/') ? 'missing' : 'gitlab-onboarding') + ']\ndescription: 示例任务\n---\n操作步骤');
+  const worker = new SessionOrchestrator(config, repo, client, { run }, {
+    capabilities: [{ name: 'gitlab-onboarding', enabled: true, tools: [] }],
+  });
+  await dispatchWebhook(worker, note('/help'));
+  expect(reply).not.toHaveBeenCalled();
+  permit.mockResolvedValue(true);
+  await dispatchWebhook(worker, note('/help'));
+  const guide = reply.mock.calls[0][2];
+  for (const field of ['agent::code', '示例任务', '✅ 就绪', 'agent::setup', '⚠️ 缺少能力包: missing', '/approve', '/use <agent>'])
+    expect(guide).toContain(field);
+  expect(await repo.getSessionByIssue(1, issue.iid)).toBeNull();
+  const s = await repo.getOrCreateSession(1, issue.iid, 'pending');
+  const pending = await repo.createApprovalRequest(s.id, 'PLAN', 'Plan', {});
+  await dispatchWebhook(worker, note('/help'));
+  expect(await repo.getSession(s.id)).toEqual(s);
+  expect(await repo.getLatestPendingApproval(s.id)).toEqual(pending);
+  expect(run).not.toHaveBeenCalled();
+});

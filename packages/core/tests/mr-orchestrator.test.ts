@@ -221,7 +221,7 @@ it('batches inline review and delivers hot steering to PostToolUse, replying in 
   expect(run).toHaveBeenCalledOnce();
   const body = gitlab.updateMergeRequestDiscussionNote.mock.lastCall?.at(-1);
   expect(body).toMatch(/review addressed[\s\S]*<details>[\s\S]*read review diff[\s\S]*<\/details>/);
-  for (const index of [2, 3, 4]) expect(gitlab.createMergeRequestDiscussionNote).toHaveBeenCalledWith(2, 1, 'review-' + index, body);
+  for (const index of [2, 3, 4]) expect(gitlab.createMergeRequestDiscussionNote).toHaveBeenCalledWith(2, 1, 'review-' + index, String(body).split('\n\n> 💡')[0]);
 });
 
 it('deduplicates bot CI, checks live SHA and ownership, escalates to both resources, and resets the budget', async () => {
@@ -300,7 +300,7 @@ it('checks fork write permission and uses read-only suggestions while retaining 
   await send(opened);
   expect((await session()).status).toBe('IDLE');
   expect(gitlab.hasApprovalPermission).toHaveBeenCalledWith(3, bot.id, 30);
-  expect(gitlab.updateMergeRequestNote).toHaveBeenCalledWith(2, 1, expect.any(Number), 'Suggested patch');
+  expect(gitlab.updateMergeRequestNote).toHaveBeenCalledWith(2, 1, expect.any(Number), expect.stringMatching(/^Suggested patch\n\n> 💡/));
 });
 
 it.each([0, 10000])('binds MR emoji decisions to the approval note and handles tool approval with hot hold %i', async timeout => {
@@ -440,4 +440,25 @@ it('keeps pending plan approval during CI and revises it on human feedback in th
   expect(run.mock.lastCall![0].prompt).toContain('Check the parser too');
   expect(run.mock.lastCall![0].session.permissionMode).toBe('plan');
   expect(gitlab.updateMergeRequestDiscussionNote).toHaveBeenCalledWith(2, 1, 'feedback', expect.any(Number), expect.stringContaining('方案审批'));
+});
+
+it('answers targeted help in place before takeover and keeps the takeover footer on the first note only', async () => {
+  const { mr, gitlab, run, send, session } = await setup();
+  mr.assignees = [];
+  await send(note('/help'));
+  await send({ ...note('@bot /help'), user: { id: 1, username: 'guest' } });
+  expect(gitlab.createMergeRequestNote).not.toHaveBeenCalled();
+  for (const command of ['@bot 帮助', '@bot help', '@bot /help']) {
+    await send(note(command, { discussion_id: 'thread' }));
+    expect(gitlab.createMergeRequestDiscussionNote).toHaveBeenLastCalledWith(2, 1, 'thread', expect.stringContaining('/reset'));
+  }
+  mr.assignees = [bot];
+  await send(note('/help'));
+  expect(gitlab.createMergeRequestNote).toHaveBeenCalledWith(2, 1, expect.stringContaining('移出 Assignee'));
+  expect(await session()).toBeNull();
+  expect(run).not.toHaveBeenCalled();
+  await send(opened);
+  expect(gitlab.updateMergeRequestNote).toHaveBeenLastCalledWith(2, 1, expect.any(Number), expect.stringContaining('已接管此 MR'));
+  await send(note('/reset'));
+  expect(gitlab.updateMergeRequestNote).toHaveBeenLastCalledWith(2, 1, expect.any(Number), 'fixed');
 });

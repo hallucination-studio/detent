@@ -262,8 +262,8 @@ export async function dispatchWebhook(
     if (intent) await orchestrator.handleUserIntent(event.project_id, iid, intent);
   } else {
     const s = await orchestrator.repo.getSessionByIssue(event.project.id, iid);
-    if (!s) return;
-    const intent = parseNoteIntent({ ...actor, botUsername: orchestrator.gitlab.getBotIdentity?.()?.username, sessionStatus: s.status, noteBody: event.object_attributes.note });
+    const intent = parseNoteIntent({ ...actor, botUsername: orchestrator.gitlab.getBotIdentity?.()?.username, sessionStatus: s?.status ?? 'IDLE', noteBody: event.object_attributes.note });
+    if (!s && intent.type !== 'HELP') return;
     await orchestrator.handleUserIntent(event.project.id, iid, intent, eventId ?? `note/${event.object_attributes.id}`);
   }
 }

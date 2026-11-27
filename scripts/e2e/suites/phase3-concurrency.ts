@@ -134,7 +134,8 @@ export async function runConcurrency(h: Harness, cluster: Cluster, web: number) 
   assert.equal(review.notes[0].type, 'DiffNote');
   assert.ok((await replies(api, inline.iid, review.id))[0].body.includes('Added the requested greeting regression test.'));
   assert.equal((await gitlab.getMr(api, external.iid)).sha, external.sha);
-  assert.deepEqual((await replies(api, external.iid, question.id)).map(n => n.body.trim()), ['Inspected the external contribution.']);
+  assert.deepEqual((await replies(api, external.iid, question.id)).map(n => n.body.trim()), ['Inspected the external contribution.\n\n' +
+    '> 💡 已接管此 MR · 发 `/plan` 可先审方案 · 发 `/help` 查看指令 · 移出 Assignee 即可交回人工']);
   for (const dir of cluster.sandboxes) assert.deepEqual(await readdir(dir), []);
   console.log('C-2 passed: five overlapping SDK turns, five isolated transcripts, two empty sandbox roots.');
 

@@ -8,6 +8,7 @@ import type { AppConfig } from '../config.js';
 import type { DetentRepository } from '../db/repository.js';
 import type { AnyDetentExtensionTool, DetentCapabilityPack, ExtensionToolContext, SessionLifecycleHooks, TurnProfile } from '../extensions.js';
 import type { GitLabClient } from '../gitlab/client.js';
+import { configuredSecrets } from '../gitlab/redact.js';
 import { renderNote, renderToolApprovalCard } from '../gitlab/note-streamer.js';
 import type { ApprovalRequestRow, IssueSessionRow } from '../types.js';
 import { isHubScopePath } from '../workspace/hub-paths.js';
@@ -149,10 +150,12 @@ export class PermissionGate {
   readonly extensionTools = new Map<string, AnyDetentExtensionTool>();
   readonly readonly: boolean;
   readonly disableBash: boolean;
+  private readonly secrets: string[];
   private channel: GateChannel;
   private extensionContext: ExtensionToolContext;
   constructor(private ctx: GateContext) {
     const { session, repo, workspaceRoot, profile } = ctx;
+    this.secrets = configuredSecrets(ctx.config);
     this.channel = 'channel' in ctx ? ctx.channel : {
       createNote: body => ctx.gitlab.createIssueNote(session.hubProjectId, session.hubIssueIid, body),
       syncStatusLabel: status => ctx.gitlab.syncIssueStatusLabel(session.hubProjectId, session.hubIssueIid, status),
@@ -218,6 +221,10 @@ export class PermissionGate {
   async preflight(name: string, input: Input): Promise<GateResult | 'ask' | { riskNote: string }> {
     const { session: s, config, workspaceRoot, controller } = this.ctx;
     controller.signal.throwIfAborted();
+    // Prevent credential-bearing tool arguments from reaching an extension or an approval record.
+    const argumentsJson = JSON.stringify(input);
+    if (this.secrets.some(secret => argumentsJson.includes(JSON.stringify(secret).slice(1, -1))))
+      return deny('工具参数中含有服务端凭证，请移除后再试。');
     const effectiveReadOnly = s.permissionMode === 'plan' || this.readonly;
     const allow: PermissionResult = { behavior: 'allow', updatedInput: input };
     const extension = this.extensionTools.get(name);
@@ -314,7 +321,7 @@ export class PermissionGate {
     try {
       const card = await extension?.renderApprovalCard?.(a.id, input, this.extensionContext)
         ?? renderToolApprovalCard(a, this.ctx.workspaceRoot, policy === 'ask' ? undefined : policy.riskNote);
-      const note = await this.channel.createNote(renderNote(card, config.jevApiKey));
+      const note = await this.channel.createNote(renderNote(card, this.secrets));
       await repo.updateApprovalNoteId(a.id, note.id);
     } catch (error) {
       await resolveApproval(repo, s, a.id, 'EXPIRED', 'detent', '审批卡片发布失败', this.ctx.onApprovalResolved, config.jevApiKey);

@@ -99,7 +99,7 @@ it('completes inspections without Plan approval and enforces readonly on a defau
   expect(notes.at(-1)).toContain('Diagnostic report');
 });
 
-const agentTemplates = Object.fromEntries(['release', 'audit', 'env-change', 'code-delivery', 'image-sync'].map(name => {
+const agentTemplates = Object.fromEntries(['release', 'audit', 'env-change', 'code-delivery', 'image-sync', 'onboarding'].map(name => {
   const file = 'agents/' + name + '/AGENT.md';
   return [file, readFileSync(new URL('../../../examples/hub-workspace/' + file, import.meta.url), 'utf8')];
 }));
@@ -348,7 +348,7 @@ it('clarifies a vague Issue, routes the follow-up into a scoped Agent plan and f
   expect(resolveTurnProfile.mock.calls[0][0]).toMatchObject({ purpose: 'turn', prompt: request.title + '\n' + request.description, decision });
   expect(decision.decide.mock.calls[0][0]).toMatchObject({ recent_user_messages: [] });
   expect(gitlab.updateIssueLabels).not.toHaveBeenCalled();
-  expect(notes.at(-1)).toBe('请提供源镜像的 Tag 和目标镜像仓库。');
+  expect(notes.at(-1)).toBe('请提供源镜像的 Tag 和目标镜像仓库。\n\n> 💡 发送 `/help` 可随时查看当前工作区全部可用 Agent 与指令。');
 
   const details = '同步 app:v2 到 staging.example。';
   issueNotes.push(
@@ -522,11 +522,11 @@ it('fits workflow display names into the execution audit column and retains the 
 });
 
 it.each([
-  ['delivery::release', 'detent_create_release'], ['delivery::env-change', 'jms_run_ansible_job'],
+  ['agent::onboarding', 'detent_onboard_project'], ['delivery::release', 'detent_create_release'], ['delivery::env-change', 'jms_run_ansible_job'],
 ])('enforces the production gate and rechecks pending cards after a label switch for %s', async (label, toolName) => {
   const labels = [label];
   const files = Object.fromEntries(Object.entries(agentTemplates).map(([name, content]) => [name, content.replace('approver_tier: prod', 'approver_tier: standard')]));
-  const capabilities = [jumpserver, release];
+  const capabilities = [jumpserver, release, { name: 'gitlab-onboarding', enabled: true, tools: [tool('detent_onboard_project', 'always_approve')] }];
   const { profile } = await resolve(labels, { DELIVERY_PROD_APPROVERS: 'SRE' }, capabilities, files);
   expect(await profile.canApprove!({ ...approve, toolName, userId: 50 })).toBe(false);
   expect(await profile.canApprove!({ ...approve, toolName, username: 'Sre', userId: 20 })).toBe(false);

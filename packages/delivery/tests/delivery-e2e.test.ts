@@ -90,7 +90,7 @@ it('governs Issue #88 through inspection, Plan, MR !205, production approval, ex
   const app = createWebhookApp(config, gitlab, (id, event) => queue.submit(id, event), matchMergeRequestWebhook);
   const post = async (payload: object) => {
     const response = await app.inject({ method: 'POST', url: '/webhooks/gitlab', payload,
-      headers: { 'x-gitlab-token': 'test', 'x-gitlab-event-uuid': randomUUID() } });
+      headers: { 'x-gitlab-token': config.gitlabWebhookSecret, 'x-gitlab-event-uuid': randomUUID() } });
     expect(response.statusCode).toBe(202);
   };
   const approve = (noteId: number, user: typeof developer) => post({

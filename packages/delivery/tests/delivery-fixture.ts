@@ -15,7 +15,7 @@ export const opened = { object_kind: 'issue' as const, project: hub, user: devel
 export async function deliveryFixture(labels: string[]) {
   const root = await mkdtemp('/tmp/detent-stage4-');
   onTestFinished(() => rm(root, { recursive: true, force: true }));
-  const config = loadConfig({ GITLAB_WEBHOOK_SECRET: 'test', EPHEMERAL_ROOT: path.join(root, 'turns'), HOT_HOLD_TIMEOUT_MS: '3000' });
+  const config = loadConfig({ GITLAB_WEBHOOK_SECRET: 'fixture-webhook-key', EPHEMERAL_ROOT: path.join(root, 'turns'), HOT_HOLD_TIMEOUT_MS: '3000' });
   const repo = new InMemoryDetentRepository();
   const notes: string[] = [];
   const gitlab = {

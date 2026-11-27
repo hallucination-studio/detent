@@ -39,6 +39,7 @@ export function parseNoteIntent({
   const prefix = original.match(/^@[^\s]+(?=\s)/)?.[0];
   const body = prefix && stripBotMention(prefix, botUsername) === ''
     ? original.slice(prefix.length).trimStart() : original;
+  if (/^\/help$/i.test(body) || (body !== original && /^(help|帮助)$/i.test(body))) return { ...actor, type: 'HELP' };
   const match = /^\/(approve|reject|plan|abort|reset|status|use)(?:\s+([\s\S]+))?$/i.exec(body);
   if (match) {
     const type = commands[match[1].toLowerCase() as keyof typeof commands];

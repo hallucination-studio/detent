@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs, parseEnv } from 'node:util';
 
 interface User { id: number; username: string }
-interface Project { id: number; path_with_namespace: string; default_branch: string }
+interface Project { id: number; path_with_namespace: string; default_branch: string; web_url: string }
 const list = (s = '') => s.split(',').map(v => v.trim()).filter(Boolean);
 
 async function templateFiles(root: string, dir = ''): Promise<string[]> {
@@ -20,7 +20,7 @@ async function templateFiles(root: string, dir = ''): Promise<string[]> {
 }
 
 async function main() {
-  const { values } = parseArgs({ options: { 'env-out': { type: 'string' } } });
+  const { values } = parseArgs({ options: { 'env-out': { type: 'string' }, 'welcome-issue': { type: 'boolean' } } });
   const env = process.env;
   const out = resolve(values['env-out'] ?? env.DETENT_ENV_OUT ?? '.env');
   await mkdir(dirname(out), { recursive: true });
@@ -37,7 +37,9 @@ async function main() {
   }
   const base = serviceUrl(env.GITLAB_BASE_URL, 'GITLAB_BASE_URL');
   const saved = previous.GITLAB_BASE_URL === base ? previous : {};
-  const hookUrl = serviceUrl(env.DETENT_PUBLIC_URL ?? 'http://127.0.0.1:3000', 'DETENT_PUBLIC_URL') + '/webhooks/gitlab';
+  const publicUrl = serviceUrl(env.DETENT_PUBLIC_URL ?? saved.DETENT_PUBLIC_URL ?? 'http://127.0.0.1:3000', 'DETENT_PUBLIC_URL')
+    .replace(/\/webhooks\/gitlab$/, '');
+  const hookUrl = publicUrl + '/webhooks/gitlab';
   const ssl = env.DETENT_WEBHOOK_SSL_VERIFY ?? String(hookUrl.startsWith('https:'));
   if (!['true', 'false'].includes(ssl)) throw Error('DETENT_WEBHOOK_SSL_VERIFY must be true or false');
   const secret = env.GITLAB_WEBHOOK_SECRET || saved.GITLAB_WEBHOOK_SECRET || randomBytes(32).toString('hex');
@@ -70,7 +72,7 @@ async function main() {
     const items: T[] = [];
     let page = '1';
     while (page) {
-      const res = await request(path + '?per_page=100&page=' + page);
+      const res = await request(path + (path.includes('?') ? '&' : '?') + 'per_page=100&page=' + page);
       check(res, path);
       items.push(...await res.json() as T[]);
       page = res.headers.get('x-next-page') ?? '';
@@ -78,6 +80,11 @@ async function main() {
     return items;
   }
   const user = async (name: string) => (await json<User[]>('/users?username=' + encodeURIComponent(name)))[0];
+  const groupIds = new Set<number>();
+  for (const ref of list(env.DETENT_TARGET_GROUPS)) {
+    const group = await json<{ id: number }>('/groups/' + encodeURIComponent(ref));
+    groupIds.add(group.id);
+  }
   let bot: User | undefined;
   if (token) {
     const res = await request('/user', 'GET', undefined, token);
@@ -95,7 +102,7 @@ async function main() {
     });
   }
 
-  async function project(ref: string): Promise<Project> {
+  async function project(ref: string): Promise<{ project: Project; created: boolean }> {
     const found = await lookup<Project & { empty_repo?: boolean }>('/projects/' + encodeURIComponent(ref));
     if (found) {
       if (found.empty_repo || !found.default_branch) {
@@ -104,7 +111,7 @@ async function main() {
           branch: 'main', content: '# ' + found.path_with_namespace + '\n', commit_message: 'Initialize repository',
         });
       }
-      return found;
+      return { project: found, created: false };
     }
     const parts = ref.split('/');
     if (parts.length < 2 || parts.some(p => !/^[\w-][\w.-]*$/.test(p)))
@@ -119,33 +126,35 @@ async function main() {
         await json<{ id: number }>('/groups', 'POST', { name: path, path, parent_id: parent });
       parent = namespace.id;
     }
-    return json<Project>('/projects', 'POST', {
+    const created = await json<Project>('/projects', 'POST', {
       name, path: name, namespace_id: parent, initialize_with_readme: true, default_branch: 'main',
     });
+    return { project: created, created: true };
   }
-  async function member(p: Project, u: User, level: number) {
-    const path = '/projects/' + p.id + '/members';
+  async function member(resource: string, u: User, level: number) {
+    const path = resource + '/members';
     const effective = await lookup<{ access_level: number }>(path + '/all/' + u.id);
     if (effective && effective.access_level >= level) return;
     const direct = effective && await lookup(path + '/' + u.id);
     await json(direct ? path + '/' + u.id : path, direct ? 'PUT' : 'POST', { user_id: u.id, access_level: level });
   }
 
-  const hub = await project(env.GITLAB_HUB_PROJECT_ID || env.DETENT_HUB_PROJECT || 'ai/workspace-hub');
+  const { project: hub, created } = await project(env.GITLAB_HUB_PROJECT_ID || env.DETENT_HUB_PROJECT || 'ai/workspace-hub');
   const root = '/projects/' + hub.id;
   const templateDir = env.DETENT_HUB_TEMPLATE_DIR ?? fileURLToPath(new URL('../examples/hub-workspace', import.meta.url));
   const files = new Set(await templateFiles(templateDir));
   if (env.DETENT_CLAUDE_MD_FILE) files.add('CLAUDE.md');
   for (const path of [...files].sort()) {
     const file = root + '/repository/files/' + encodeURIComponent(path);
-    if (await lookup(file + '?ref=' + encodeURIComponent(hub.default_branch))) continue;
+    const exists = await lookup(file + '?ref=' + encodeURIComponent(hub.default_branch));
+    if (exists && !(created && path === 'README.md')) continue;
     const source = path === 'CLAUDE.md' && env.DETENT_CLAUDE_MD_FILE ? env.DETENT_CLAUDE_MD_FILE : resolve(templateDir, path);
     const content = await readFile(source, 'base64');
-    await json(file, 'POST', { branch: hub.default_branch, content, encoding: 'base64', commit_message: 'Seed ' + path });
+    await json(file, exists ? 'PUT' : 'POST', { branch: hub.default_branch, content, encoding: 'base64', commit_message: 'Seed ' + path });
   }
   const labels = await all<{ name: string }>(root + '/labels');
   for (const name of ['claude::planning', 'claude::waiting-approval', 'claude::coding', 'claude::idle',
-    'claude::failed', 'claude::done', 'delivery::audit', 'delivery::env-change', 'delivery::code', 'delivery::release', 'agent::image-sync']) {
+    'claude::failed', 'claude::done', 'delivery::audit', 'delivery::env-change', 'delivery::code', 'delivery::release', 'agent::image-sync', 'agent::onboarding']) {
     if (!labels.some(l => l.name === name)) await json(root + '/labels', 'POST', { name, color: '#356288' });
   }
   for (const entry of list(env.DETENT_HUB_MEMBERS)) {
@@ -153,18 +162,24 @@ async function main() {
     if (!match) throw Error('Expected username:access_level in DETENT_HUB_MEMBERS');
     const u = await user(match[1]);
     if (!u) throw Error('Unknown GitLab member ' + match[1]);
-    await member(hub, u, Number(match[2]));
+    await member(root, u, Number(match[2]));
   }
 
   const projects = new Map([[hub.id, hub]]);
   const targets = new Set<number>();
-  for (const ref of list(env.DETENT_TARGET_PROJECTS)) {
-    const p = await project(ref);
+  function addTarget(p: Project) {
     projects.set(p.id, p);
     targets.add(p.id);
   }
+  for (const ref of list(env.DETENT_TARGET_PROJECTS)) addTarget((await project(ref)).project);
+  for (const id of groupIds) {
+    const path = '/groups/' + id;
+    await member(path, bot, 30);
+    for (const p of await all<Project>(path + '/projects?include_subgroups=true&archived=false'))
+      addTarget(p);
+  }
   for (const p of projects.values()) {
-    await member(p, bot, 30);
+    await member('/projects/' + p.id, bot, 30);
     const path = '/projects/' + p.id + '/hooks';
     const hook = (await all<{ id: number; url: string }>(path)).find(h => h.url === hookUrl);
     await json(hook ? path + '/' + hook.id : path, hook ? 'PUT' : 'POST', {
@@ -178,7 +193,7 @@ async function main() {
   const defaults = parseEnv(template);
   const output: Record<string, string> = {};
   for (const [, key] of template.matchAll(/^(?:# )?([A-Z][A-Z_0-9]*)=/gm)) {
-    const value = env[key] ?? previous[key] ?? defaults[key];
+    const value = key === 'DETENT_PUBLIC_URL' ? publicUrl : env[key] ?? previous[key] ?? defaults[key];
     if (value !== undefined) output[key] = value;
   }
   if (!token) {
@@ -206,6 +221,19 @@ async function main() {
     await rename(tmp, out);
   } finally {
     await rm(tmp, { force: true });
+  }
+  if (values['welcome-issue'] || env.DETENT_WELCOME_ISSUE === 'true') {
+    const path = root + '/issues';
+    if ((await json<unknown[]>(path + '?per_page=1')).length === 0) {
+      const names = [...projects.values()].filter(p => targets.has(p.id)).map(p => '- `' + p.path_with_namespace + '`');
+      const description = [
+        '你好，我是 @' + bot.username + '！在 [Hub 工单入口](' + hub.web_url + '/-/issues/new) 新建 Issue，选择模板，写下目标仓库和任务。',
+        '在任务工单中发送 `/help` 请求帮助，使用 `/status` 查看进度。在审批卡上点 👍 同意或 👎 拒绝。',
+        '需要评审代码时，把目标项目的 MR 分配给 @' + bot.username + '。',
+        '**已接入的目标项目**\n' + (names.join('\n') || '尚未配置目标项目。'),
+      ].join('\n\n');
+      check(await request(path, 'POST', { title: '🎉 Detent 已就绪 — 1 分钟上手与接入自检', description }, token), path);
+    }
   }
   console.log('Bot @' + bot.username);
   for (const p of projects.values()) console.log(p.path_with_namespace + ' (#' + p.id + ') → ' + hookUrl);

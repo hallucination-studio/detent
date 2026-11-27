@@ -76,6 +76,35 @@ flowchart LR
 
 ## GitLab CE v18.3.0 接入配置指南
 
+### 1 分钟让你的 AI Agent 帮你安装
+
+先准备以下四项。密钥通过本机环境变量或密钥管理器提供。
+
+| 必填项 | 需要准备的参数 |
+| --- | --- |
+| GitLab 访问 | `GITLAB_BASE_URL` 和用于创建 Bot 的 `GITLAB_ADMIN_TOKEN`，或已有 Bot 的 `GITLAB_TOKEN`（须具备接入权限） |
+| Webhook 回调 | `DETENT_PUBLIC_URL`，填写 GitLab 能访问的 Detent 服务根地址 |
+| 目标仓库 | `DETENT_TARGET_GROUPS`（群组路径或 ID，包含子群组）或 `DETENT_TARGET_PROJECTS`（项目路径或 ID），多项以逗号分隔 |
+| 模型访问 | `ANTHROPIC_API_KEY`，使用网关时可指定 `ANTHROPIC_BASE_URL`，用 `CLAUDE_MODEL` 选择模型 |
+
+| 可选项 | 需要准备的参数 |
+| --- | --- |
+| Jev | `JEV_PROVIDER`（`bailian` 或 `typesafe`）和 `JEV_API_KEY`。百炼还需提供 `JEV_BASE_URL`。 |
+| JumpServer | `JUMPSERVER_BASE_URL`、独立的 `JUMPSERVER_READONLY_TOKEN` 与 `JUMPSERVER_JOB_TOKEN`，也可为两个角色分别配置访问密钥对 |
+
+在仓库目录打开 AI 编程助手，复制以下提示词。
+
+```text
+请按当前仓库的 INSTALL.md 安装 Detent，使用我在本机提供的参数。完成预检，
+启动 MySQL，运行 bootstrap 接入指定的 GitLab 仓库并启用欢迎工单，再启动并验证
+Detent。向我报告 Hub 链接、Bot 用户名和三行使用说明。全程隐藏所有密钥。
+```
+
+[安装 SOP](./INSTALL.md) · [Dockerfile](./Dockerfile) · [Compose 服务配置](./docker-compose.yml)
+
+安装后可直接在 Hub 新建 Issue，选择 `onboarding` 模板或添加 `agent::onboarding` 标签，填写项目或群组路径。Bot 需要在每个目标项目拥有 Maintainer 权限。服务端配置 `DETENT_PUBLIC_URL` 和 Webhook 密钥后启用 `gitlab-onboarding`，生产审批人确认后写入 Webhook。在工单或 Bot 受理的 MR 中发送 `/help` 可查看指令。[Hub 使用指南](./examples/hub-workspace/README.md) · [接入 Agent](./examples/hub-workspace/agents/onboarding/AGENT.md)
+
+
 ### 自动配置
 
 使用 Node.js 20.12+ 运行 `npm run bootstrap` 可创建 Bot、初始化 Hub 的 `CLAUDE.md` 与标签，并配置成员和 Webhook。先导出 `GITLAB_ADMIN_TOKEN` 以创建 Bot 及其 PAT，或导出已有的 `GITLAB_TOKEN`，该账号需有管理相关项目、成员和 Webhook 的权限。
@@ -122,7 +151,7 @@ npm run e2e:offline
 E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab
 ```
 
-离线套件分五个阶段验证 36 个场景，覆盖安装升级、Issue 工作流、MR Worker、双 Pod 并发以及安全与事件处理。两个 Pod 共用 MySQL，通过回环代理接收 Webhook，验证并行 SDK 轮次、审批与恢复竞争、凭证脱敏和生产变更硬拦截。
+离线套件验证仓库自助接入、安装升级、Issue 工作流、MR Worker、双 Pod 并发以及安全与事件处理。两个 Pod 共用 MySQL，通过回环代理接收 Webhook，验证并行 SDK 轮次、审批与恢复竞争、凭证脱敏和生产变更硬拦截。
 
 真实模式下，GitLab 公布的 HTTP 克隆地址应与 `E2E_GITLAB_URL` 同源。允许 GitLab 容器向 `host.docker.internal` 投递项目 Webhook。使用其他路由时，以 `E2E_DETENT_PUBLIC_URL` 指定 GitLab 可访问的地址，以 `E2E_POD_PORT` 指定对应的宿主监听端口。每次运行保留独立的 `e2e-*/workspace-hub` 和三个目标项目供复核，并撤销临时令牌。
 
@@ -171,6 +200,8 @@ Hub SOP 通过 `close_policy: manual | auto | approve` 选择关单策略。默�
 | `/approve [附加说明]` | 批准当前待审项，并可附带补充要求一同传给 Claude |
 | `/reject <拒绝原因>` | 拒绝当前待审项，并将拒绝原因传给 Claude 重新规划 |
 | `/plan [新需求说明]` | 将当前 Session 切换回只读 `plan` 模式重新输出技术方案 |
+| `/help` | 显示 Hub Agent、能力就绪状态，或当前 MR 的指令；无需调用模型 |
+| `/use <agent>` | 切换 Hub Agent 并重新规划 |
 | `/status` | 查看当前 Session 绑定的活跃 Worktree、所有 MR、合并 SHA、交付执行审计链接及待审批状态 |
 | `/abort` | 立即中止当前正在运行的一轮任务并释放租约锁 |
 | `/reset` | 清空当前 Issue 的 Claude Session 历史，重新初始化会话 |
@@ -227,9 +258,9 @@ Webhook 返回 `202` 表示事件已进入当前进程的内存队列。正常�
 | `DELIVERY_PROD_APPROVERS` | 逗号分隔的 GitLab 用户名，忽略大小写。配置名单时，生产审批人还须达到 Hub 项目的 `GITLAB_MIN_ACCESS_LEVEL`。 |
 | `DELIVERY_PROD_MIN_ACCESS_LEVEL` | 名单为空时的生产审批门槛，默认 40（Maintainer）；方案审批沿用普通门槛，默认 30（Developer）。 |
 
-交付服务在每轮及每次审批时重读 Hub 默认分支上的 `workflows/*.md`。在文件头声明 Issue 标签（`label`）、模式（`mode`）、所需能力包（`requires`）和审批档位（`approver_tier`），正文编写操作步骤。例如在 `workflows/release.md` 中约定使用 `rel-` 前缀，合并后下一张发版单即可采用新规范，无需改代码或重启 Pod。[发版 SOP 示例](./examples/hub-workspace/workflows/release.md)
+交付服务在每轮及每次审批时重读 Hub 默认分支上的 `agents/<id>/AGENT.md` 及兼容的 `workflows/*.md`。在文件头声明 Issue 标签（`label`）、模式（`mode`）、所需能力包（`requires`）和审批档位（`approver_tier`），正文编写操作步骤。例如在 `agents/release/AGENT.md` 中约定使用 `rel-` 前缀，合并后下一张发版单即可采用新规范，无需改代码或重启 Pod。[发版 SOP 示例](./examples/hub-workspace/agents/release/AGENT.md)
 
-预置的 `delivery::release` 使用默认启用的 `gitlab-release` 能力包，发版审批锁定目标项目、Tag 和完整 SHA。可通过 `DELIVERY_ENABLE_RELEASE_TOOLS=false` 关闭此包。`delivery::code` 使用基础工作区工具。可选的 `jumpserver` 能力包提供 `delivery::audit` 只读巡检和 `delivery::env-change` 环境变更所需的工具。按预置 SOP 开单时，无标签的 Issue 会收到标明就绪状态的流程菜单；选定流程缺少能力时，评论会给出配置提示和可用的替代标签。这两种情况都会在调用 Claude 前回到 `IDLE`。
+预置的 `delivery::release` 使用默认启用的 `gitlab-release` 能力包，发版审批锁定目标项目、Tag 和完整 SHA。可通过 `DELIVERY_ENABLE_RELEASE_TOOLS=false` 关闭此包。`delivery::code` 使用基础工作区工具。可选的 `jumpserver` 能力包提供 `delivery::audit` 只读巡检和 `delivery::env-change` 环境变更所需的工具。无标签 Issue 可由 Jev 路由或进入澄清。选定流程缺少能力时，编排器会发出配置提示，并在调用 Claude 前回到 `IDLE`。
 
 ### 项目结构
 ```text

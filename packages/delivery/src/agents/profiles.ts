@@ -7,7 +7,7 @@ import type { DeliveryConfig } from '../config.js';
 
 export type AgentProfileName = string;
 
-const prodTools = new Set(['jms_run_ansible_job', 'detent_create_release']);
+const prodTools = new Set(['jms_run_ansible_job', 'detent_create_release', 'detent_onboard_project']);
 const inspectTools = ['jms_list_assets', 'jms_readonly_inspect'];
 
 type WorkflowProfile = TurnProfile & { approverTier?: WorkflowApproverTier };

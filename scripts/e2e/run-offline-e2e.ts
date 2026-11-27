@@ -12,12 +12,12 @@ import { isDeepStrictEqual, parseEnv, promisify } from 'node:util';
 import mysql, { type RowDataPacket } from 'mysql2/promise';
 import { createOfflineAnthropic } from './offline-anthropic.js';
 import { checkStartupFailures, brownfieldOnboarding, standaloneAndUpgrade } from './suites/phase0-install.js';
-import { runIssueScenarios } from './suites/phase1-issues.js';
+import { onboardPayment, runIssueScenarios } from './suites/phase1-issues.js';
 import { checkSession } from './suites/harness.js';
 import { runConcurrency } from './suites/phase3-concurrency.js';
 import { runSecurity } from './suites/phase4-security.js';
 import { webhookProxy } from './suites/cluster.js';
-import { runMrScenarios } from './suites/phase2-mrs.js';
+import { runMrScenarios, verifyOnboardedMr } from './suites/phase2-mrs.js';
 import { gitlabApi } from './gitlab-driver.js';
 import { liveGitLab } from './live-gitlab.js';
 import { offlineGitLab } from './offline-gitlab.js';
@@ -162,7 +162,7 @@ async function main() {
     const sandbox = join(tmp, 'sandboxes'), envFile = join(tmp, '.env');
     await mkdir(sandbox);
     const localEnv = { PATH: env.PATH, HOME: tmp, TMPDIR: tmp };
-    const provision = (extra: Record<string, string> = {}) => run(join(process.cwd(), 'node_modules/.bin/tsx'), ['scripts/bootstrap.ts', '--env-out', envFile], {
+    const provision = (extra: Record<string, string> = {}, welcome = false) => run(join(process.cwd(), 'node_modules/.bin/tsx'), ['scripts/bootstrap.ts', '--env-out', envFile, ...(welcome ? ['--welcome-issue'] : [])], {
       env: { ...localEnv, GITLAB_BASE_URL: gitlab.baseUrl, GITLAB_ADMIN_TOKEN: gitlab.adminToken, DETENT_PUBLIC_URL: publicUrl,
         DETENT_HUB_PROJECT: gitlab.hubProjectPath, DETENT_TARGET_PROJECTS: [webRepo, apiRepo, ansibleRepo].join(','),
         DETENT_HUB_MEMBERS: gitlab.devUsername + ':30,' + gitlab.sreUsername + ':40',
@@ -193,8 +193,8 @@ async function main() {
     const releasePath = 'agents/release/AGENT.md';
     const imagePath = 'agents/image-sync/AGENT.md';
     const hubFile = (path: string) => gitlab.getFile(hub, path);
-    const templates = ['CLAUDE.md', 'events.json', imagePath, 'agents/image-sync/skills/mirror-to-harbor/SKILL.md', 'skills/gitlab-mr-conventions/SKILL.md'];
-    for (const name of ['audit', 'code-delivery', 'env-change', 'release'])
+    const templates = ['README.md', 'CLAUDE.md', 'events.json', imagePath, 'agents/image-sync/skills/mirror-to-harbor/SKILL.md', 'skills/gitlab-mr-conventions/SKILL.md'];
+    for (const name of ['audit', 'code-delivery', 'env-change', 'release', 'onboarding'])
       templates.push('agents/' + name + '/AGENT.md', '.gitlab/issue_templates/' + name + '.md');
     for (const path of templates)
       assert.equal(await hubFile(path), await readFile(join('examples/hub-workspace', path), 'utf8'), path);
@@ -209,7 +209,7 @@ async function main() {
     assert.equal(await hubFile(releasePath), savedSop, 'Bootstrap overwrote the customer Agent');
     assert.equal(await gitlab.headSha(hub), hubHead, 'Bootstrap changed the Hub repository on its second run');
     const labels = await admin.json<{ name: string }[]>('/projects/' + hub + '/labels?per_page=100');
-    for (const name of ['agent::image-sync', 'claude::coding', 'claude::done', 'claude::failed', 'claude::idle', 'claude::planning',
+    for (const name of ['agent::onboarding', 'agent::image-sync', 'claude::coding', 'claude::done', 'claude::failed', 'claude::idle', 'claude::planning',
       'claude::waiting-approval', 'delivery::audit', 'delivery::code', 'delivery::env-change', 'delivery::release'])
       assert.ok(labels.some(label => label.name === name), 'Missing Hub label ' + name);
     for (const p of projects) {
@@ -344,7 +344,18 @@ async function main() {
 
     const shared = { gitlab, admin, hub, rows, records, state, until, openIssue, pendingCard, anthropic,
       checkSecrets, observeGet, sandbox, stopPod: () => stopPod(true) };
-    const isolationIssue = await standaloneAndUpgrade({ ...shared, startPod, sql: { host, port, user, password, database },
+    const isolationIssue = await standaloneAndUpgrade({ ...shared, startPod, async checkWelcome() {
+      const before = anthropic.getRequests();
+      await provision(jmsEnv, true);
+      await provision(jmsEnv, true);
+      const welcome = await admin.json<{ iid: number; title: string; author: { username: string } }[]>('/projects/' + hub + '/issues');
+      assert.equal(welcome.length, 1);
+      assert.match(welcome[0].title, /Detent 已就绪/);
+      assert.equal(welcome[0].author.username, 'e2e-detent-bot');
+      issueIds.push(welcome[0].iid);
+      assert.deepEqual(await rows('SELECT id FROM issue_sessions WHERE hub_project_id=?', [hub]), []);
+      assert.equal(anthropic.getRequests(), before);
+    }, sql: { host, port, user, password, database },
       adminSql: { host, port, user: external ? user : 'root', password: rootPassword } });
     await checkStartupFailures(shared, localEnv, isolationIssue);
     if (gitlab.synthetic) await brownfieldOnboarding(shared, localEnv, tmp, publicUrl);
@@ -564,6 +575,9 @@ async function main() {
     const harness = { gitlab, admin, db, until, rows, records, mrState, state, openIssue, pendingCard, trackMr,
       anthropic, jev, bot, hub, api: api.id, isolationIssue, standalone, observeGet, checkSecrets, sandbox,
       stopPod: () => stopPod(true), startPod: (id: string, overrides?: NodeJS.ProcessEnv) => startPod(id, overrides) };
+    const payment = await onboardPayment(harness, apiRepo.slice(0, apiRepo.lastIndexOf('/')), developer.id, publicUrl + '/webhooks/gitlab');
+    await verifyOnboardedMr(harness, payment);
+    console.log('Verified production-approved repository onboarding, signed MR delivery and zero-token help.');
     await runMrScenarios(harness);
 
     const shaToPublish = await gitlab.headSha(web.id);
@@ -737,5 +751,5 @@ async function main() {
 
 main().then(() => {
   if (!process.env.E2E_GITLAB_URL)
-    console.log('Offline E2E passed: install/upgrade (3), Issues (11), MRs (14), concurrency (4), security/events (4). Total: 36.');
+    console.log('Offline E2E passed: install/upgrade, Issues, MRs, self-service onboarding, concurrency and security/events.');
 }).catch(error => { console.error(error); process.exitCode = 1; });

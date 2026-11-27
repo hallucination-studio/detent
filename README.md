@@ -80,6 +80,36 @@ For full sequence diagrams, MySQL schema, extension contracts, and state machine
 
 ## Quick Start
 
+### 1-Minute Agent-Driven Install
+
+Prepare these four inputs. Supply secrets through your local environment or secret manager.
+
+| Required | What to prepare |
+| --- | --- |
+| GitLab access | `GITLAB_BASE_URL` and `GITLAB_ADMIN_TOKEN` to provision a bot, or an existing bot's `GITLAB_TOKEN` with setup permissions |
+| Webhook callback | `DETENT_PUBLIC_URL`, the Detent base URL reachable from GitLab |
+| Target repositories | `DETENT_TARGET_GROUPS` (comma-separated group paths or IDs, including subgroups) or `DETENT_TARGET_PROJECTS` (project paths or IDs) |
+| Model access | `ANTHROPIC_API_KEY`, optionally `ANTHROPIC_BASE_URL` for a gateway and `CLAUDE_MODEL` to select the model |
+
+| Optional | What to prepare |
+| --- | --- |
+| Jev | `JEV_PROVIDER` (`bailian` or `typesafe`) and `JEV_API_KEY`. Bailian also needs `JEV_BASE_URL`. |
+| JumpServer | `JUMPSERVER_BASE_URL` and separate `JUMPSERVER_READONLY_TOKEN` and `JUMPSERVER_JOB_TOKEN` credentials, or an access key pair per role |
+
+Copy this prompt into your coding agent from the repository checkout.
+
+```text
+Install Detent from this checkout by following INSTALL.md. Use the installation
+values I supplied locally. Run the preflight checks, start MySQL, bootstrap my
+GitLab targets with the Welcome Issue enabled, then start and verify Detent.
+Report the Hub link, bot username and three lines on how to use it. Redact all secrets.
+```
+
+[Installation SOP](./INSTALL.md) · [Dockerfile](./Dockerfile) · [Compose services](./docker-compose.yml)
+
+After installation, open a Hub Issue with the `onboarding` template or the `agent::onboarding` label and enter a project or group path. Grant the Bot Maintainer access on each target. Delivery enables `gitlab-onboarding` when `DETENT_PUBLIC_URL` and the webhook secret are configured. A production approver authorizes the callback before the server installs it. Type `/help` in a Hub Issue or a targeted MR for context-specific commands. [Hub portal](./examples/hub-workspace/README.md) · [Onboarding Agent](./examples/hub-workspace/agents/onboarding/AGENT.md)
+
+
 ### Prerequisites
 
 - **Node.js** `>= 20.0.0`
@@ -176,9 +206,9 @@ E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab
 
 Set the live URL to the origin GitLab advertises for HTTP clones. Allow the GitLab container to send project webhooks to `host.docker.internal`. For another route, set `E2E_DETENT_PUBLIC_URL` to the address GitLab can reach and `E2E_POD_PORT` to the corresponding host listener port. Each live run leaves its own `e2e-*/workspace-hub` and three target projects for inspection and revokes its temporary tokens.
 
-The offline suite covers 36 scenarios across installation and upgrades, Issue workflows, MR workers, two-Pod concurrency, and security and event handling. The cluster shares MySQL and receives webhooks through a loopback proxy. The suite checks simultaneous SDK turns, competing approvals and watchdogs, credential redaction, and production guard denials.
+The offline suite covers self-service repository onboarding alongside installation and upgrades, Issue workflows, MR workers, two-Pod concurrency, and security and event handling. The cluster shares MySQL and receives webhooks through a loopback proxy. The suite checks simultaneous SDK turns, competing approvals and watchdogs, credential redaction, and production guard denials.
 
-Both targets run bootstrap twice to verify Hub files, labels, hooks, and preservation of credentials and a customized SOP. They exercise the six SOP scenarios and the V6 MR interactions.
+Both targets run bootstrap twice to verify Hub files, labels, hooks, and preservation of credentials and a customized SOP. They exercise Hub workflows and independent MR workers, including a newly onboarded payment repository.
 
 1. A missing capability produces guidance with zero model calls. An unlabeled image request is clarified, routed to its Agent, approved, and completed.
 2. Code delivery writes to two repositories. Closure is denied with two open MRs and again with one. The second merge triggers closure and archives both worktrees.
@@ -215,6 +245,8 @@ Four guards apply at request time and again at turn completion. A governed plan 
 | `/approve [note]` | Approve the pending item with optional additional instructions |
 | `/reject <reason>` | Reject the pending item and send the reason back to Claude |
 | `/plan [new request]` | Switch the session back to read-only `plan` mode to propose a revised plan |
+| `/help` | Show current Hub Agents and capability readiness, or the MR command guide, without starting a model turn |
+| `/use <agent>` | Select a Hub Agent and request a new plan |
 | `/status` | Display active worktrees, MRs, merge SHAs, delivery audit links, and pending approvals |
 | `/abort` | Immediately abort the currently running turn and release the lease lock |
 | `/reset` | Clear the Issue's Claude session history and start fresh |
@@ -224,16 +256,17 @@ Four guards apply at request time and again at turn completion. A governed plan 
 
 ## Governed Delivery Control Plane (`@detent/delivery`)
 
-Delivery reads `workflows/*.md` from the Hub default branch on each turn and approval. Each SOP declares its Issue `label`, `mode`, required capability packs (`requires`), and `approver_tier`. Its Markdown body supplies the instructions. To adopt a tag prefix such as `rel-`, edit the body of `workflows/release.md` in the Hub. The next release Issue uses the merged change without application code changes or a pod restart. [Example release SOP](./examples/hub-workspace/workflows/release.md)
+Delivery reads `agents/<id>/AGENT.md` and compatible `workflows/*.md` from the Hub default branch on each turn and approval. Each SOP declares its Issue `label`, `mode`, required capability packs (`requires`), and `approver_tier`. Its Markdown body supplies the instructions. To adopt a tag prefix such as `rel-`, edit the body of `agents/release/AGENT.md` in the Hub. The next release Issue uses the merged change without application code changes or a pod restart. [Example release SOP](./examples/hub-workspace/agents/release/AGENT.md)
 
 | Issue label | Workflow | Required capability |
 | --- | --- | --- |
 | `delivery::release` | Plan a version, approve the exact tag and commit SHA, and publish | `gitlab-release` (enabled by default) |
+| `agent::onboarding` | Inspect Bot access, approve the target scope, and configure repository webhooks | `gitlab-onboarding` |
 | `delivery::code` | Implement and review code across repositories | Built-in workspace tools |
 | `delivery::audit` | Inspect assets and report findings in read-only mode | `jumpserver` |
 | `delivery::env-change` | Inspect, approve a plan, merge the playbook MR, approve execution, and verify | `jumpserver` |
 
-With the seeded SOPs, an unlabeled Issue receives a menu showing which workflows are ready. If a selected SOP requires a disabled pack, the Issue lists the missing capability, setup instructions, and ready alternatives. Both paths return to `IDLE` before Claude runs. JumpServer is optional for release and code delivery. Set `DELIVERY_ENABLE_RELEASE_TOOLS=false` to disable the release pack.
+Jev can route an unlabeled Issue or ask for clarification. If a selected SOP requires a disabled pack, the Issue lists the missing capability, setup instructions, and ready alternatives. The missing-capability check returns to `IDLE` before Claude runs. JumpServer is optional for release and code delivery. Set `DELIVERY_ENABLE_RELEASE_TOOLS=false` to disable the release pack.
 
 <details>
 <summary><strong>Delivery & JumpServer Environment Variables</strong></summary>

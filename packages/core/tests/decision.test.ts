@@ -94,7 +94,7 @@ async function setup(mode: 'plan' | 'default' = 'default', readonly = false, wor
   const decide = vi.fn<DecisionClient['decide']>().mockResolvedValue(answers());
   const createIssueNote = vi.fn(async (_p: number, _i: number, _body: string) => ({ id: 1 }));
   const gate = new PermissionGate({
-    session, repo, config: loadConfig({ HOT_HOLD_TIMEOUT_MS: '0' }), workspaceRoot,
+    session, repo, config: loadConfig({ HOT_HOLD_TIMEOUT_MS: '0', JEV_API_KEY: secret }), workspaceRoot,
     gitlab: { createIssueNote, syncIssueStatusLabel: vi.fn() }, profile: { readonly },
     controller: new AbortController(), checkpoint: vi.fn(), decision: { provider: 'custom', threshold: 0.9, decide },
   });
@@ -150,8 +150,10 @@ it('opens a human approval card with a redacted risk note on errors, low safety 
   }
 });
 
-it('isolates the provider key from the SDK child, stderr and GitLab notes', async () => {
-  const config = loadConfig(bailian);
+it('isolates service credentials from the SDK child, prompt, stderr and GitLab notes', async () => {
+  const credentials = { GITLAB_TOKEN: 'gitlab-pat-1', GITLAB_WEBHOOK_SECRET: 'webhook-secret-2',
+    ANTHROPIC_API_KEY: 'model-key-3', JEV_API_KEY: secret };
+  const config = loadConfig({ ...bailian, ...credentials });
   const http = vi.fn<typeof fetch>(async () => Response.json({ id: 1 }));
   const gitlab = new GitLabClient(config, http);
   const repo = new InMemoryDetentRepository();
@@ -159,17 +161,22 @@ it('isolates the provider key from the SDK child, stderr and GitLab notes', asyn
   const sandbox = { rootDir: '/turn', workspaceRoot: '/turn/work', claudeHome: '/turn/home' };
   const tools = new WorkspaceTools(new EphemeralSandbox(config, repo, gitlab), sandbox, session.id);
   const { gate } = await setup();
-  vi.mocked(query).mockImplementationOnce(({ options }) => {
-    expect(options?.env).not.toHaveProperty('JEV_API_KEY');
-    expect(Object.values(options!.env!)).not.toContain(secret);
+  vi.mocked(query).mockImplementationOnce(({ options, prompt }) => {
+    for (const [key, value] of Object.entries(credentials)) {
+      expect(options?.env).not.toHaveProperty(key);
+      expect(Object.values(options!.env!)).not.toContain(value);
+      expect(prompt).not.toContain(value);
+      expect(options?.appendSystemPrompt).not.toContain(value);
+    }
     options?.stderr?.('diagnostic ' + secret);
     throw Error(secret);
   });
   vi.stubEnv('JEV_API_KEY', secret);
   try {
     const progress = vi.fn();
-    const turn = { gate, session, sandbox, tools, controller: new AbortController(), progress, resume: false, prompt: '', systemPrompt: '' };
+    const turn = { gate, session, sandbox, tools, controller: new AbortController(), progress, resume: false, prompt: Object.values(credentials).join(' '), systemPrompt: secret };
     await expect(new SdkClaudeRunner(config).run(turn)).rejects.toThrow(/^diagnostic \*\*\*$/);
+    expect(await gate.preflight('Bash', { command: 'printf ' + secret })).toMatchObject({ behavior: 'deny' });
     const callback = vi.mocked(query).mock.lastCall![0].options!.canUseTool!;
     expect(await callback('Bash', { command: 'pwd; ls' }, { signal: turn.controller.signal })).toMatchObject({ behavior: 'allow' });
     expect(progress).toHaveBeenCalledExactlyOnceWith('⚡ Bash pwd; ls（Jev 放行 · 0.96）');

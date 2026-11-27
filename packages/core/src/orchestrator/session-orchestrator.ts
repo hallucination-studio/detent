@@ -21,6 +21,7 @@ import { TranscriptHydrator } from '../claude/transcript-hydrator.js';
 import { ColdHold, PermissionGate } from '../claude/permission-gate.js';
 import { buildSystemPrompt } from '../claude/prompts.js';
 import type { ClaudeRunner } from '../claude/runner.js';
+import { missingHubCapabilities } from '../workflows/hub-workflows.js';
 import { loadHubAgents } from '../workflows/hub-agents.js';
 import { normalizeHubValue } from '../workflows/hub-frontmatter.js';
 
@@ -29,6 +30,7 @@ import { checkIssueClosure, createCloseIssueTool } from './close-issue.js';
 import { notifyHook } from './lifecycle.js';
 
 export { SessionBusy } from './turn-runtime.js';
+const helpHint = '> 💡 发送 `/help` 可随时查看当前工作区全部可用 Agent 与指令。';
 type Client = WorkspaceGitLab &
   Pick<
     GitLabClient,
@@ -142,7 +144,7 @@ export class SessionOrchestrator extends TurnRuntime {
       const profile = await this.resolveTurnProfile(s, { purpose: 'turn', prompt });
       controller.signal.throwIfAborted();
       if (profile?.blockedMessage?.trim()) {
-        await channel.createNote(redactGitUrl(profile.blockedMessage, this.config.jevApiKey));
+        await channel.createNote(redactGitUrl(profile.blockedMessage + '\n\n' + helpHint, this.config.jevApiKey));
         await this.state(s, 'IDLE');
         return;
       }
@@ -243,7 +245,7 @@ export class SessionOrchestrator extends TurnRuntime {
         issueClosed = true;
         await this.state(s, 'DONE');
       } else {
-        await streamer.flush(routingPrefix + result);
+        await streamer.flush(routingPrefix + result + (profile?.name === 'triage' ? '\n\n' + helpHint : ''));
         await this.state(s, 'IDLE');
       }
       if (s.recoveryAttempts) {
@@ -288,6 +290,21 @@ export class SessionOrchestrator extends TurnRuntime {
   }
   async handleUserIntent(project: number, iid: number, intent: ParsedUserIntent, eventId?: string) {
     if (project !== this.config.gitlabHubProjectId) return;
+    if (intent.type === 'HELP') {
+      if (!await this.gitlab.hasApprovalPermission(project, intent.userId)) return;
+      const { agents } = await loadHubAgents(this.gitlab, project, this.config.gitlabHubDefaultBranch);
+      const menu = agents.map(agent => {
+        const missing = missingHubCapabilities(agent, this.getCapabilities());
+        const status = missing.length ? '⚠️ 缺少能力包: ' + missing.join('、') : '✅ 就绪';
+        return '- ' + escapeTableCell(agent.label, 'code') + ' · ' + escapeTableCell(agent.description) + ' · ' + status;
+      });
+      await this.gitlab.createIssueNote(project, iid, [
+        '### 工作区 Agent', menu.join('\n') || 'Hub 尚未配置 Agent。',
+        '`/help` 查看帮助 · `/status` 查询进度 · `/plan` 先审方案 · `/use <agent>` 切换 Agent',
+        '审批卡上点 👍 / 👎，或发送 `/approve` / `/reject`。用 `/abort` 中止当前轮次，`/reset` 重置对话。',
+      ].join('\n\n'));
+      return;
+    }
     const s = await this.repo.getSessionByIssue(project, iid);
     if (!s) return;
     if (intent.type === 'STATUS') return this.replyStatus(s);

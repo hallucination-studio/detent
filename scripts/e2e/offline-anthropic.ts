@@ -274,6 +274,20 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
     return text('请提供带 Tag 的完整源镜像地址和目标镜像仓库地址。');
   }
 
+  if (sopPath === 'agents/onboarding/AGENT.md') {
+    const project = userText.join(' ').match(/([\w/-]+\/payment)\b/)?.[1];
+    assert.ok(project);
+    const check = result('detent_check_project_onboarding');
+    if (!check) return use('detent_check_project_onboarding', { project });
+    const [status] = JSON.parse(success(check)).projects;
+    assert.equal(status.botAccessLevel, 40);
+    assert.equal(status.webhookConfigured, false);
+    if (approved < 0) return text('Connect ' + project + ' to Detent after production approval.');
+    const onboard = result('detent_onboard_project');
+    if (!onboard) return use('detent_onboard_project', { project });
+    assert.deepEqual(JSON.parse(success(onboard)).onboarded, [{ projectId: status.projectId, path: project, action: 'created' }]);
+    return closeIssue('Webhook configured.', project + ' is ready.');
+  }
   if (sopPath === 'agents/image-sync/AGENT.md') {
     const skillPath = 'agents/image-sync/skills/mirror-to-harbor/SKILL.md';
     const { source_image, target_image } = imageMirror;
@@ -481,6 +495,7 @@ export function createOfflineAnthropic(repos: Repos) {
     async handle(req: Request) {
       requests++;
       if (req.method !== 'POST' || new URL(req.url).pathname !== '/v1/messages') return new Response(null, { status: 404 });
+      assert.ok(req.headers.get('x-api-key') === 'offline-api-key', 'Model transport did not authenticate the upstream request');
       const body: Messages = await req.json();
       checkPayload(body);
       if (body.tools?.length && observeRequest) await observeRequest(contents(body.system ?? ''));

@@ -142,6 +142,7 @@ export type ParsedIntentType =
   | 'PLAN'
   | 'ABORT'
   | 'RESET'
+  | 'HELP'
   | 'STATUS'
   | 'USE'
   | 'PROMPT';

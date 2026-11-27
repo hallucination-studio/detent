@@ -575,3 +575,11 @@ ALTER TABLE issue_sessions DROP INDEX hub_project_id,
 ### 8.2 Stage 12 验收
 
 Issue 和 MR 的工具调用均通过 NoteStreamer 写入折叠轨迹。双目标套件按真实源分支提交、原讨论串回复及 MySQL 会话终态验收。离线失败流水线使用 Bot 身份并提供真实 API 路径查询任务与日志。外部 MR 场景在模型返回下一次工具调用前等待评论进入收件箱，校验 PostToolUse 将评论中的随机标记传递到同一轮提交。部署失败按 Hub 策略创建带标签的告警 Issue。
+
+## Stage 13–14 · 安装、帮助与仓库接入
+
+`Dockerfile` 构建双包服务，`docker-compose.yml` 运行 MySQL 与 Delivery。按 `INSTALL.md` 运行 bootstrap，可按群组（含子群组）发现目标，或通过 `--welcome-issue` 在空 Hub 发布 Bot 自己的欢迎工单。新建 Hub 的初始 README 替换为 `examples/hub-workspace/README.md`。后续执行仅补齐缺失文件与标签。
+
+Hub Issue 的 `/help` 在成员检查后从默认分支加载 Agent，按当前能力包显示就绪状态。MR 的帮助接受 Bot 指派或显式提及，沿原讨论串回复。两者均无模型调用、租约或会话写入。首条 MR 工作评论用持久化的 active_note_id 区分首次接管与后续轮次。
+
+`agents/onboarding/AGENT.md` 请求 `gitlab-onboarding`。只读工具按项目或群组查询 Bot 有效权限，在有管理权限时核验目标事件。写工具先验证全部目标均达到 Maintainer，再由生产审批人审核范围、回调地址及事件。执行时重读目标和权限，以同一 URL 更新或创建 Webhook。服务端从 `DETENT_PUBLIC_URL` 生成回调地址，只在 GitLab API 请求中使用 Webhook 密钥。Claude 通过单轮回环连接调用 Messages API，由父进程添加上游认证头。

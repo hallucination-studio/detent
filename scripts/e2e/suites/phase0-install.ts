@@ -57,6 +57,10 @@ export async function brownfieldOnboarding(h: Install, local: NodeJS.ProcessEnv,
   const empty = await create('uninitialized', false);
   await create('existing-web', true);
   await create('existing-api', true);
+  const discovery = await admin.json<{ id: number }>('/groups', 'POST', { path: 'discovery', name: 'discovery' });
+  const discovered = await admin.json<{ id: number }>('/projects', 'POST', { namespace_id: discovery.id, path: 'service', name: 'service', initialize_with_readme: true });
+  await admin.request('/groups/' + discovery.id + '/members', 'POST', { user_id: bot.id, access_level: 40 });
+  await admin.request('/projects/' + discovered.id + '/members', 'POST', { user_id: bot.id, access_level: 40 });
   const targets = ['apps/uninitialized', 'apps/existing-web', 'apps/existing-api'];
   for (const ref of [String(hub.id), ...targets]) {
     const project = await admin.json<{ id: number }>('/projects/' + encodeURIComponent(ref));
@@ -67,7 +71,7 @@ export async function brownfieldOnboarding(h: Install, local: NodeJS.ProcessEnv,
   const provision = async () => {
     const result = await run(join(process.cwd(), 'node_modules/.bin/tsx'), ['scripts/bootstrap.ts', '--env-out', out], {
       env: { ...local, GITLAB_BASE_URL: gitlab.baseUrl, GITLAB_TOKEN: token, GITLAB_HUB_PROJECT_ID: String(hub.id),
-        DETENT_PUBLIC_URL: publicUrl, DETENT_TARGET_PROJECTS: targets.join(',') }, timeout: 90000,
+        DETENT_PUBLIC_URL: publicUrl, DETENT_TARGET_GROUPS: 'discovery', DETENT_TARGET_PROJECTS: targets.join(',') }, timeout: 90000,
     });
     const config = parseEnv(await readFile(out, 'utf8'));
     assert.ok(config.GITLAB_TOKEN === token, 'Bootstrap must reuse the existing bot PAT');
@@ -78,6 +82,7 @@ export async function brownfieldOnboarding(h: Install, local: NodeJS.ProcessEnv,
     return config;
   };
   const config = await provision();
+  assert.equal(await gitlab.getFile(hub.id, 'README.md'), '# existing-hub\n');
   assert.equal(await gitlab.getFile(empty.id, 'README.md', 'main'), '# apps/uninitialized\n');
   const template = '.gitlab/issue_templates/code-delivery.md';
   assert.equal(await gitlab.getFile(hub.id, template), await readFile(join('examples/hub-workspace', template), 'utf8'));
@@ -89,7 +94,7 @@ export async function brownfieldOnboarding(h: Install, local: NodeJS.ProcessEnv,
   assert.equal(await admin.lookup('/projects/apps%2Fworker'), null);
   assert.ok(isDeepStrictEqual(await provision(), config), 'Incremental bootstrap changed the environment');
   assert.equal(await gitlab.headSha(hub.id), head);
-  for (const ref of [String(hub.id), ...targets]) {
+  for (const ref of [String(hub.id), ...targets, String(discovered.id)]) {
     const path = '/projects/' + encodeURIComponent(ref);
     const hooks = await admin.json<{ url: string; issues_events: boolean; merge_requests_events: boolean }[]>(path + '/hooks');
     assert.equal(hooks.length, 1);
@@ -104,10 +109,12 @@ export async function brownfieldOnboarding(h: Install, local: NodeJS.ProcessEnv,
 
 export async function standaloneAndUpgrade(h: Install & {
   startPod(id: string, overrides?: NodeJS.ProcessEnv, service?: 'core' | 'delivery'): Promise<void>;
+  checkWelcome(): Promise<void>;
   sql: ConnectionOptions; adminSql: ConnectionOptions;
 }) {
   await h.startPod('standalone-core', {}, 'core');
   assert.deepEqual(await h.rows('SELECT id FROM issue_sessions WHERE hub_project_id=? LIMIT 1', [h.hub]), [], 'Hub already has sessions');
+  await h.checkWelcome();
   const iid = await h.openIssue('Verify standalone runtime', '', 'delivery::code');
   const plan = await h.pendingCard(iid, 'Plan', ['Standalone plan']);
   await h.gitlab.awardThumbsUp(h.hub, iid, plan.gitlab_note_id, 'dev');

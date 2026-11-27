@@ -7,6 +7,6 @@ export function redactGitUrl(text: string, secret?: string | readonly string[]) 
 }
 
 export function configuredSecrets(config: AppConfig) {
-  return [...new Set([config.jevApiKey, config.gitlabToken, config.anthropicApiKey, config.gitlabWebhookSecret,
+  return [...new Set([config.mysqlPassword, config.jevApiKey, config.gitlabToken, config.anthropicApiKey, config.gitlabWebhookSecret,
     ...(config.additionalSecrets ?? [])].filter((s): s is string => !!s))].sort((a, b) => b.length - a.length);
 }

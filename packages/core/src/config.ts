@@ -2,6 +2,12 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { z } from 'zod';
 
+const serviceUrl = z.string().url().refine(value => {
+  if (!URL.canParse(value)) return false;
+  const url = new URL(value);
+  return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && !/[?#]/.test(value);
+}, 'Expected an HTTP(S) service URL without credentials, query or fragment');
+
 const ConfigSchema = z.object({
   port: z.coerce.number().default(3000),
   host: z.string().default('0.0.0.0'),
@@ -16,6 +22,7 @@ const ConfigSchema = z.object({
   hotHoldTimeoutMs: z.coerce.number().default(180_000),
 
   gitlabBaseUrl: z.string().url().default('http://localhost:8080'),
+  detentPublicUrl: serviceUrl.transform(value => new URL(value).href.replace(/\/+$/, '').replace(/\/webhooks\/gitlab$/, '').replace(/\/+$/, '')).optional(),
   gitlabToken: z.string().min(1).default('glpat-placeholder'),
   gitlabWebhookSecret: z.string().optional(),
   gitlabHubProjectId: z.coerce.number().int().positive().default(1),
@@ -36,11 +43,7 @@ const ConfigSchema = z.object({
   claudeModel: z.string().default('claude-sonnet-4-20250514'),
   claudeMaxTurns: z.coerce.number().int().default(40),
   jevProvider: z.enum(['off', 'bailian', 'typesafe', 'custom']).default('off'),
-  jevBaseUrl: z.string().url().refine(value => {
-    if (!URL.canParse(value)) return false;
-    const url = new URL(value);
-    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && !/[?#]/.test(value);
-  }, 'Expected an HTTP(S) service URL without credentials, query or fragment').optional(),
+  jevBaseUrl: serviceUrl.optional(),
   jevApiKey: z.string().optional(),
   jevModel: z.string().optional(),
   jevThreshold: z.coerce.number().min(0.5).max(0.99).default(0.9),
@@ -72,6 +75,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     hotHoldTimeoutMs: env.HOT_HOLD_TIMEOUT_MS,
 
     gitlabBaseUrl: env.GITLAB_BASE_URL,
+    detentPublicUrl: env.DETENT_PUBLIC_URL?.trim() || undefined,
     gitlabToken: env.GITLAB_TOKEN,
     gitlabWebhookSecret: env.GITLAB_WEBHOOK_SECRET,
     gitlabHubProjectId: env.GITLAB_HUB_PROJECT_ID,

@@ -85,6 +85,12 @@ Issue 与 MR 复用 NoteStreamer 折叠工具轨迹。双目标共用真实 Clau
 
 `MR_MAX_AUTO_FIX_ATTEMPTS` 默认 3（0–10），`WATCHDOG_INTERVAL_MS` 默认 30000，`WATCHDOG_MAX_RECOVERIES` 默认 1（0–5）。既有库由初始化程序原子替换旧唯一键，升级 SQL 见[设计文档](docs/DESIGN.md#v6-mysql-upgrade)。
 
+### Stage 13–14 安装与 GitLab 内自助接入
+
+依照 `INSTALL.md` 使用 `Dockerfile` 和 `docker-compose.yml` 安装。bootstrap 支持 `DETENT_TARGET_GROUPS` 与 Bot 欢迎工单。新建 Hub 时用 `examples/hub-workspace/README.md` 替换 GitLab 自动生成的首页，已有 Hub 保留自己的首页。
+
+Hub 和 MR 的 `/help` 在检查成员权限后直接发评论，禁止创建会话或调用模型。MR 还须验证实时分配或显式提及，首次接管提示只出现在首条工作评论。`agents/onboarding/AGENT.md` 使用 Core 通用 `gitlab-onboarding` 能力包。回调地址来自 `DETENT_PUBLIC_URL`。服务端检查所有目标的有效 Maintainer 权限，Delivery 对写 Webhook 工具强制生产审批。Webhook 密钥只进入 GitLab 管理请求；模型 API 凭证由父进程为上游请求注入。
+
 ## 二、 质量门禁：本地提交前检查与推送前 OpenCodeReview 委托审查（必须遵守）
 
 为了确保仓库长期保持 **结构紧凑、逻辑自洽、测试覆盖完整**，所有 AI Agent 与工程师在提交和推送代码前必须遵守以下两道门禁：

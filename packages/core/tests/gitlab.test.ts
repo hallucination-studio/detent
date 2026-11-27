@@ -285,3 +285,17 @@ it('reads job traces only for the source branch or a pipeline belonging to the M
   await expect(client.getJobTrace(2, 3, mr)).rejects.toThrow('outside');
   expect(http.mock.calls.filter(([url]) => url.endsWith('/trace'))).toHaveLength(2);
 });
+
+it('accepts exact help commands and addressed help in English or Chinese', () => {
+  const parse = (noteBody: string) => parseNoteIntent({ ...actor, sessionStatus: 'WAITING_PLAN', botUsername: 'bot', noteBody });
+  for (const body of ['/help', '@bot /help', '@BOT HeLp  ', '@bot 帮助\n']) expect(parse(body)).toEqual({ ...actor, type: 'HELP' });
+  for (const body of ['help', '帮助', '@other help', '@bot help me', '`@bot help`', '> @bot 帮助', '/help more'])
+    expect(parse(body).type).toBe('PROMPT');
+});
+
+it('normalizes public callback bases and rejects credential-bearing or ambiguous URLs', () => {
+  for (const suffix of ['', '/', '/webhooks/gitlab///'])
+    expect(loadConfig({ DETENT_PUBLIC_URL: ' https://example.com/detent' + suffix + ' ' }).detentPublicUrl).toBe('https://example.com/detent');
+  for (const url of ['file:///tmp', 'https://user:key@example.com', 'https://host/?', 'https://host/#', 'bad'])
+    expect(() => loadConfig({ DETENT_PUBLIC_URL: url })).toThrow();
+});

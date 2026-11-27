@@ -337,9 +337,16 @@ export async function runMrScenarios(h: Harness) {
   const beforeIssue = await snapshot(issue);
   const resource = await gitlab.getIssue(hub, h.isolationIssue);
   const notes = await gitlab.listIssueNotes(hub, h.isolationIssue);
+  // The Welcome Issue occupies #1. Verify help on !1 before exercising the same-numbered working pair.
+  const unassigned = trackMr(await gitlab.openExternalMr(hub, 'hub-help'));
+  const calls = requests();
+  const help = await gitlab.openDiscussion(hub, unassigned.iid, '@' + bot.username + ' 帮助');
+  await until('help on unassigned MR', async () => (await gitlab.getDiscussion(hub, unassigned.iid, help.id)).notes
+    .some(n => n.author.username === bot.username && n.body.includes('/plan')));
+  assert.deepEqual(await rows("SELECT id FROM issue_sessions WHERE session_kind='mr' AND hub_project_id=? AND hub_issue_iid=?", [hub, unassigned.iid]), []);
+  assert.equal(requests(), calls);
   const twin = trackMr(await gitlab.openExternalMr(hub, 'hub-isolation'));
   assert.equal(twin.iid, h.isolationIssue);
-  assert.equal(twin.iid, 1);
   const mention = await gitlab.openDiscussion(hub, twin.iid, '@' + bot.username + ' Please inspect this contribution');
   const independent = await mrState(hub, twin.iid, 'IDLE', 0);
   assert.notEqual(independent.id, issue.id);
@@ -352,4 +359,19 @@ export async function runMrScenarios(h: Harness) {
   assert.deepEqual(await gitlab.listIssueNotes(hub, h.isolationIssue), notes);
   await clean(independent);
   await clean(issue);
+}
+
+export async function verifyOnboardedMr(h: Harness, project: number) {
+  await h.gitlab.upsertFile(project, 'payment.txt', 'ready\n', 'Prepare payment review', 'payment-feature', 'main');
+  const mr = h.trackMr(await h.gitlab.openMr(project, 'payment-feature', 'Review payment', h.bot.id));
+  const session = await h.mrState(project, mr.iid, 'IDLE');
+  const notes = await h.gitlab.listMrNotes(project, mr.iid);
+  assert.ok(notes.some(note => note.body.includes('Accepted the assigned MR.') && note.body.includes('已接管此 MR')));
+  const before = h.anthropic.getRequests();
+  const thread = await h.gitlab.openDiscussion(project, mr.iid, '/help');
+  await h.until('MR help in its triggering thread', async () => (await h.gitlab.getDiscussion(project, mr.iid, thread.id))
+    .notes.some(n => n.author.username === h.bot.username && ['/plan', '/help', '/status', '/abort', '/reset'].every(cmd => n.body.includes(cmd))));
+  assert.equal(h.anthropic.getRequests(), before);
+  assert.deepEqual(await h.mrState(project, mr.iid, 'IDLE'), session);
+  await checkSession(h, session);
 }

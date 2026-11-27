@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { configuredSecrets, redactGitUrl } from '../gitlab/redact.js';
 import type { AppConfig } from '../config.js';
 
 export type JevProvider = AppConfig['jevProvider'];
@@ -38,6 +39,7 @@ export function resolveJevEndpoint(provider: Provider, baseUrl: string) {
 }
 
 class HttpJevDecisionClient implements DecisionClient {
+  readonly #secrets: string[];
   private readonly endpoint: string;
   readonly #apiKey?: string;
   private readonly model: string;
@@ -46,6 +48,7 @@ class HttpJevDecisionClient implements DecisionClient {
   readonly routingThreshold: number;
   constructor(readonly provider: Provider, config: AppConfig, private http: typeof fetch) {
     if (!config.jevBaseUrl || !config.jevModel) throw Error('Missing System One endpoint or model');
+    this.#secrets = configuredSecrets(config);
     this.#apiKey = config.jevApiKey;
     this.model = config.jevModel;
     this.timeoutMs = config.jevTimeoutMs;
@@ -59,7 +62,8 @@ class HttpJevDecisionClient implements DecisionClient {
       const res = await this.http(this.endpoint, {
         method: 'POST', redirect: 'error', signal: AbortSignal.timeout(this.timeoutMs),
         headers: { 'Content-Type': 'application/json', ...(this.#apiKey && { Authorization: 'Bearer ' + this.#apiKey }) },
-        body: JSON.stringify({ model: this.model, state, questions }),
+        body: JSON.stringify({ model: this.model, state, questions }, (_key, value) =>
+          typeof value === 'string' ? redactGitUrl(value, this.#secrets) : value),
       });
       if (!res.ok) throw Error();
       const { answers } = response.parse(await res.json());

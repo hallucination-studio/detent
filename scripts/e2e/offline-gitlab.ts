@@ -49,7 +49,7 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
   const projects: Project[] = [];
   const firstProjectId = randomInt(1, 2 ** 31 - 1);
   const members = new Map<string, number>();
-  const namespaceMaintainers = new Map<number, Set<number>>();
+  const groupMembers = new Map<string, number>();
   const labels = new Map<number, { name: string; color: string }[]>();
   const hooks = new Map<number, Hook[]>();
   const mrs = new Map<number, MR[]>();
@@ -207,14 +207,22 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
       return reply(ref ? groups.find(g => g.full_path === ref) : groups);
     }
     if (resource === 'groups') {
-      if (post && ref && section === 'members') {
-        if (credential !== admin || body.access_level !== 40) return forbidden();
-        const users = namespaceMaintainers.get(Number(ref)) ?? new Set<number>();
-        users.add(body.user_id);
-        namespaceMaintainers.set(Number(ref), users);
-        return reply({ id: body.user_id, access_level: 40 });
+      const group = groups.find(g => g.full_path === ref || String(g.id) === ref);
+      if (section === 'members' && group) {
+        const id = Number(sub ?? item ?? body.user_id);
+        const key = group.id + '/' + id;
+        if (!get) {
+          if (credential !== admin) return forbidden();
+          groupMembers.set(key, body.access_level);
+        }
+        return reply(groupMembers.has(key) ? { id, access_level: groupMembers.get(key) } : undefined);
       }
-      if (get) return reply(ref ? groups.find(g => g.full_path === ref) : groups);
+      if (get && section === 'projects' && group) {
+        assert.equal(url.searchParams.get('include_subgroups'), 'true');
+        assert.equal(url.searchParams.get('archived'), 'false');
+        return reply(projects.filter(p => p.path_with_namespace.startsWith(group.full_path + '/')));
+      }
+      if (get) return reply(ref ? group : groups);
       if (post) {
         assert.match(body.path, safePart);
         const parent = groups.find(g => g.id === body.parent_id);
@@ -228,7 +236,7 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
     if (!ref && post) {
       assert.match(body.path, safePart);
       const group = groups.find(g => g.id === body.namespace_id)!;
-      if (credential !== admin && !namespaceMaintainers.get(group.id)?.has(actor.id)) return forbidden();
+      if (credential !== admin && (groupMembers.get(group.id + '/' + actor.id) ?? 0) < 40) return forbidden();
       const path = group.full_path + '/' + body.path;
       const p = { id: firstProjectId + projects.length, path_with_namespace: path, http_url_to_repo: url.origin + '/' + path + '.git',
         default_branch: body.default_branch ?? 'main' };
@@ -381,7 +389,7 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
         i.title.includes(url.searchParams.get('search') ?? '')));
       if (post && !item) {
         const iid = issues.size + 1;
-        const issue = { id: iid, iid, project_id: p.id, state: 'opened', title: body.title, description: body.description,
+        const issue = { id: iid, iid, author: actor, project_id: p.id, state: 'opened', title: body.title, description: body.description,
           labels: (body.labels ?? '').split(',').filter(Boolean) };
         issues.set(iid, issue);
         await dispatch(p, 'issue', 'issues_events', actor, { ...issue, action: 'open' });

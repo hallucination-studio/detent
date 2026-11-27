@@ -1,6 +1,6 @@
 import {
-  createDecisionClient, createDetentApp, createGitLabReleaseCapability, GitLabClient, loadConfig,
-  type AppConfig, type DetentCapabilityPack, type DetentExtensions, type ReleaseGitLab,
+  createDecisionClient, createDetentApp, createGitLabOnboardingCapability, createGitLabReleaseCapability, GitLabClient, loadConfig,
+  type AppConfig, type DetentCapabilityPack, type DetentExtensions, type ReleaseGitLab, type OnboardingGitLab,
 } from '@detent/core';
 import { createDeliveryTurnProfileResolver } from './agents/profiles.js';
 import { MySqlDeliveryAuditRepository, formatDeliveryExecutionsStatus, type DeliveryAuditRepository } from './db/audit.js';
@@ -23,7 +23,7 @@ export type { DeliveryExecutionRecord } from './jumpserver/tools.js';
 
 export interface DeliveryOptions extends DetentExtensions {
   deliveryConfig?: DeliveryConfig;
-  gitlabClient?: ReleaseGitLab;
+  gitlabClient?: ReleaseGitLab & (OnboardingGitLab | { getBotUser?: never });
   jumpserverClient?: JumpServerClient;
   executionTracker?: DeliveryExecutionTracker & Partial<Pick<DeliveryAuditRepository, 'listSessionExecutions'>>;
 }
@@ -36,9 +36,14 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
   const client = jumpserverClient ?? (deliveryConfig.jumpserverBaseUrl ? new HttpJumpServerClient(deliveryConfig, config) : undefined);
   const auditRepo = executionTracker ? undefined : new MySqlDeliveryAuditRepository();
   const tracker = executionTracker ?? auditRepo;
+  const api = gitlabClient ?? new GitLabClient(config);
+  const onboarding = createGitLabOnboardingCapability({
+    gitlab: api.getBotUser ? api : new GitLabClient(config),
+    publicUrl: config.detentPublicUrl, webhookSecret: config.gitlabWebhookSecret,
+  });
   const release: DetentCapabilityPack = deliveryConfig.enableReleaseTools
     ? {
-        ...createGitLabReleaseCapability({ gitlab: gitlabClient ?? new GitLabClient(config), blockFailedPipeline: deliveryConfig.blockFailedPipeline }),
+        ...createGitLabReleaseCapability({ gitlab: api, blockFailedPipeline: deliveryConfig.blockFailedPipeline }),
         setupHint: '可在服务端设置 DELIVERY_ENABLE_RELEASE_TOOLS=true 启用发版能力包',
       }
     : { name: 'gitlab-release', enabled: false, setupHint: '服务端已禁用 gitlab-release（DELIVERY_ENABLE_RELEASE_TOOLS=false）', tools: [] };
@@ -48,7 +53,7 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
     tools: client ? createJumpServerTools({ client, config: deliveryConfig, tracker, decision }) : [],
   };
   const packs = new Map<string, DetentCapabilityPack>();
-  for (const pack of [release, jumpserver, ...(extensions.capabilities ?? [])]) packs.set(pack.name.trim().toLowerCase(), pack);
+  for (const pack of [release, jumpserver, onboarding, ...(extensions.capabilities ?? [])]) packs.set(pack.name.trim().toLowerCase(), pack);
   const capabilities = [...packs.values()];
   return createDetentApp(config, {
     ...extensions, capabilities, decisionClient: decision,

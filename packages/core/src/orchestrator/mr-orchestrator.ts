@@ -92,7 +92,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
     const intent = parseNoteIntent({ userId: event.user.id, username: event.user.username, noteBody: a.note,
       sessionStatus: s?.status ?? 'IDLE', botUsername });
     const discussion = a.discussion_id ?? undefined;
-    if (intent.type !== 'PROMPT') {
+    if (intent.type !== 'PROMPT' && intent.type !== 'HELP') {
       if (s && s.status !== 'DONE') {
         if (s.autoFixAttempts) await this.repo.updateSessionState(s.id, { autoFixAttempts: 0 });
         await this.command(s, intent, discussion);
@@ -102,6 +102,13 @@ export class MergeRequestOrchestrator extends TurnRuntime {
     const mr = await this.gitlab.getMergeRequest(project, resource.iid);
     if (mr.state !== 'opened') return;
     if (!mr.assignees?.some(a => this.gitlab.isBotUser(a.id, a.username)) && !hasBotMention(a.note, botUsername)) return;
+    if (intent.type === 'HELP') {
+      await createMrChannel(this.gitlab, project, mr.iid, discussion).createNote(
+        '把打开的 MR 分配给 Bot，或在讨论串中提及 Bot。移出 Assignee 即可交回人工。\n\n' +
+        '`/plan` 先审方案 · `/status` 查看进度 · `/abort` 中止 · `/reset` 重置 · `/help` 查看指令。审批卡上点 👍 批准或 👎 拒绝。',
+      );
+      return;
+    }
     s ??= await this.repo.getOrCreateMrSession(project, mr.iid, mr.title);
     if (s.status === 'DONE') await this.reopen(s);
     const added = await this.repo.enqueueSessionInbox({ sessionId: s.id, eventId, sourceKind: 'note', discussionId: discussion,
@@ -197,11 +204,13 @@ export class MergeRequestOrchestrator extends TurnRuntime {
       const plan = s.permissionMode === 'plan';
       const resume = !!s.claudeSessionId && s.lastMessageSeq > 0;
       s.claudeSessionId ??= randomUUID();
-      const note = await channel.createNote('正在检查 MR…');
+      const footer = s.activeNoteId ? '' : '\n\n> 💡 已接管此 MR · 发 `/plan` 可先审方案 · 发 `/help` 查看指令 · 移出 Assignee 即可交回人工';
+      const note = await channel.createNote('正在检查 MR…' + footer);
+      s.activeNoteId = note.id;
       s.status = plan ? 'PLANNING' : 'CODING';
       await this.repo.updateSessionState(s.id, { status: s.status, activeNoteId: note.id,
         permissionMode: s.permissionMode, claudeSessionId: s.claudeSessionId });
-      streamer = new NoteStreamer(this.config.noteStreamThrottleMs, body => channel.updateNote(note.id, redact(body)), async () => '');
+      streamer = new NoteStreamer(this.config.noteStreamThrottleMs, body => channel.updateNote(note.id, redact(body) + footer), async () => '');
       sandbox = await host.prepareTurnSandbox(s);
       const tree = await host.ensureMrWorktree(sandbox, s.id, { sourceProjectId: mr.source_project_id, sourceBranch: mr.source_branch, targetBranch: mr.target_branch });
       const transcript = new TranscriptHydrator(this.repo, configuredSecrets(this.config));

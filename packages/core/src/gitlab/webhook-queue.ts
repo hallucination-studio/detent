@@ -22,6 +22,7 @@ function queueKey(event: QueuedWebhook, id: string, canSteer: boolean, botUserna
     userId: event.user.id,
     username: event.user.username,
   });
+  // HELP and STATUS use the event lane even when an Issue turn holds its lease.
   return (type === 'PROMPT' && !canSteer) || type === 'PLAN' ? `issue/${event.project.id}/${event.issue?.iid}` : id;
 }
 

@@ -15,6 +15,12 @@ export async function runIssueScenarios(h: Issues) {
   const revision = await open('Revise the public API');
   const first = await pendingCard(revision, 'Plan', ['Plan v1']);
   const initial = await state(revision, 'WAITING_PLAN');
+  const beforeHelp = anthropic.getRequests();
+  await post(revision, '/help');
+  const help = await until('Hub help', async () => (await notes(revision)).find(n => n.body.includes('工作区 Agent')));
+  for (const field of ['agent::onboarding', 'delivery::release', '✅ 就绪', '/use <agent>', '/abort', '/plan']) assert.ok(help.body.includes(field));
+  assert.equal(anthropic.getRequests(), beforeHelp);
+  assert.deepEqual(await state(revision, 'WAITING_PLAN'), initial);
   await post(revision, '/reject Keep API signature unchanged');
   const revised = await state(revision, 'WAITING_PLAN', initial.last_message_seq);
   const second = await pendingCard(revision, 'Plan', ['Plan v2 preserves the API signature']);
@@ -121,4 +127,35 @@ export async function runIssueScenarios(h: Issues) {
   assert.ok(!(await gitlab.getIssue(hub, interrupt)).labels.includes('claude::done'));
   await checkSession(h, reopened);
   console.log('Verified I-7 through I-11, including an interrupted SDK turn and manual close/reopen.');
+}
+
+export async function onboardPayment(h: Harness, groupPath: string, developer: number, webhookUrl: string) {
+  const group = await h.admin.json<{ id: number }>('/groups/' + encodeURIComponent(groupPath));
+  const project = await h.admin.json<{ id: number; path_with_namespace: string }>('/projects', 'POST', {
+    name: 'payment', path: 'payment', namespace_id: group.id, initialize_with_readme: true, default_branch: 'main',
+  });
+  const path = '/projects/' + project.id;
+  await h.admin.request(path + '/members', 'POST', { user_id: developer, access_level: 30 });
+  await h.admin.request(path + '/members', 'POST', { user_id: h.bot.id, access_level: 40 });
+  const hooks = () => h.admin.json<{ url: string; note_events: boolean; emoji_events: boolean; merge_requests_events: boolean;
+    pipeline_events: boolean; deployment_events: boolean }[]>(path + '/hooks');
+  assert.deepEqual(await hooks(), []);
+  const iid = await h.openIssue('Connect payment repository', project.path_with_namespace, 'agent::onboarding');
+  const plan = await h.pendingCard(iid, 'Plan', [project.path_with_namespace]);
+  await h.gitlab.awardThumbsUp(h.hub, iid, plan.gitlab_note_id, 'dev');
+  const card = await h.pendingCard(iid, 'detent_onboard_project', [project.path_with_namespace, webhookUrl, 'deployment_events']);
+  await h.observeGet('/projects/' + h.hub + '/members/all/' + developer,
+    () => h.gitlab.awardThumbsUp(h.hub, iid, card.gitlab_note_id, 'dev'));
+  assert.equal((await h.rows('SELECT status FROM approval_requests WHERE id=?', [card.id]))[0].status, 'PENDING');
+  assert.deepEqual(await hooks(), []);
+  await h.gitlab.awardThumbsUp(h.hub, iid, card.gitlab_note_id, 'sre');
+  const session = await h.state(iid, 'DONE');
+  const installed = await hooks();
+  assert.equal(installed.length, 1);
+  assert.equal(installed[0].url, webhookUrl);
+  for (const key of ['note_events', 'emoji_events', 'merge_requests_events', 'pipeline_events', 'deployment_events'] as const)
+    assert.equal(installed[0][key], true);
+  assert.equal((await h.gitlab.getIssue(h.hub, iid)).state, 'closed');
+  await checkSession(h, session);
+  return project.id;
 }

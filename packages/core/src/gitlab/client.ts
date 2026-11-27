@@ -9,6 +9,16 @@ interface Project {
   http_url_to_repo: string;
   default_branch: string;
 }
+interface ProjectHook {
+  id: number;
+  url: string;
+  issues_events: boolean;
+  note_events: boolean;
+  emoji_events: boolean;
+  merge_requests_events: boolean;
+  pipeline_events: boolean;
+  deployment_events: boolean;
+}
 interface Issue {
   id: number;
   iid: number;
@@ -76,7 +86,7 @@ const labels: Record<SessionStatus, string> = {
   FAILED: 'claude::failed',
 };
 export { redactGitUrl };
-class GitLabError extends Error {
+export class GitLabError extends Error {
   constructor(readonly status: number) {
     super('GitLab HTTP ' + status);
   }
@@ -113,8 +123,11 @@ export class GitLabClient {
   private project(id: string | number) {
     return '/projects/' + encodeURIComponent(id);
   }
+  getBotUser() {
+    return this.json<GitLabUser>('/user');
+  }
   async initBotIdentity() {
-    this.identity = await this.json<GitLabUser>('/user');
+    this.identity = await this.getBotUser();
   }
   getBotIdentity() {
     return this.identity;
@@ -124,12 +137,10 @@ export class GitLabClient {
   }
   async hasApprovalPermission(project: number, user: number, minAccessLevel = this.config.gitlabMinAccessLevel): Promise<boolean> {
     try {
-      const member = await this.json<{ access_level: number }>(
-        this.project(project) + '/members/all/' + user,
-      );
-      return member.access_level >= minAccessLevel;
+      const access = await this.getProjectMemberAccess(project, user);
+      return access !== null && access >= minAccessLevel;
     } catch (error) {
-      if (error instanceof GitLabError && [403, 404].includes(error.status)) return false;
+      if (error instanceof GitLabError && error.status === 403) return false;
       throw error;
     }
   }
@@ -185,6 +196,29 @@ export class GitLabClient {
       page = res.headers.get('x-next-page') ?? '';
     }
     return rows;
+  }
+  getGroup(ref: number | string) {
+    return this.json<{ id: number; full_path: string }>('/groups/' + encodeURIComponent(ref));
+  }
+  listGroupProjects(groupId: number) {
+    return this.pages<Project>('/groups/' + groupId + '/projects', { include_subgroups: 'true', archived: 'false', with_shared: 'false' });
+  }
+  async getProjectMemberAccess(project: number, user: number) {
+    const member = await onNotFound(this.json<{ access_level: number }>(this.project(project) + '/members/all/' + user), null);
+    return member?.access_level ?? null;
+  }
+  async listProjectHooks(project: number) {
+    const hooks = await this.pages<ProjectHook>(this.project(project) + '/hooks');
+    return hooks.map(({ id, url, issues_events, note_events, emoji_events, merge_requests_events, pipeline_events, deployment_events }) =>
+      ({ id, url, issues_events, note_events, emoji_events, merge_requests_events, pipeline_events, deployment_events }));
+  }
+  async upsertProjectHook(project: number, hook: Omit<ProjectHook, 'id'> & {
+    token: string; enable_ssl_verification: boolean; push_events: boolean;
+  }) {
+    const path = this.project(project) + '/hooks';
+    const prior = (await this.listProjectHooks(project)).find(row => row.url === hook.url);
+    const { id, url } = await this.json<ProjectHook>(prior ? path + '/' + prior.id : path, prior ? 'PUT' : 'POST', hook);
+    return { id, url, action: prior ? 'updated' as const : 'created' as const };
   }
   listProjects(search = '') {
     return this.pages<Project>('/projects', { membership: 'true', search });

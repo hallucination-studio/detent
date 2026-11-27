@@ -1,7 +1,8 @@
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-code';
 import { z } from 'zod';
 import buffer from 'node:buffer';
-import { redactGitUrl } from '../gitlab/client.js';
+import { configuredSecrets, redactGitUrl } from '../gitlab/redact.js';
+import { openModelTransport } from './model-transport.js';
 import type { AppConfig } from '../config.js';
 import { formatInboxMessages } from '../orchestrator/turn-runtime.js';
 import type { IssueSessionRow, SessionInboxRow } from '../types.js';
@@ -34,9 +35,11 @@ export class SdkClaudeRunner implements ClaudeRunner {
   constructor(private config: AppConfig) {}
   async run(t: TurnInput) {
     const { session, sandbox, gate, drainInbox } = t;
+    const secrets = configuredSecrets(this.config);
+    const redact = (value: string) => redactGitUrl(value, secrets);
     const id = session.claudeSessionId!;
     const canUseTool = async (name: string, input: Record<string, unknown>) => {
-      const label = redactGitUrl(name + (typeof input.command === 'string' ? ' ' + input.command : ''), this.config.jevApiKey)
+      const label = redact(name + (typeof input.command === 'string' ? ' ' + input.command : ''))
         .replaceAll(sandbox.workspaceRoot + '/', '').replaceAll(sandbox.workspaceRoot, '.')
         .replaceAll(sandbox.rootDir, '.').replace(/\s+/g, ' ').trim();
       let summary = label.length > 100 ? label.slice(0, 99) + '…' : label;
@@ -54,21 +57,26 @@ export class SdkClaudeRunner implements ClaudeRunner {
       t.controller.signal.throwIfAborted();
       return t.tools.invoke(name, permission.updatedInput);
     };
-    const result = (value: unknown) => ({
-      content: [{ type: 'text' as const, text: JSON.stringify(value) ?? '' }],
-    });
+    const result = async (operation: Promise<unknown>) => {
+      try {
+        const text = JSON.stringify(await operation, (_key, value) => typeof value === 'string' ? redact(value) : value);
+        return { content: [{ type: 'text' as const, text: text ?? '' }] };
+      } catch (error) {
+        throw Error(redact(error instanceof Error ? error.message : String(error)));
+      }
+    };
     const server = createSdkMcpServer({
       name: 'detent',
       tools: [
         ...(t.allowedWorkspaceTools ?? Object.keys(schemas) as ToolName[]).map(name =>
           tool(name, 'GitLab workspace: ' + name, schemas[name], async (input) =>
-            result(await invoke(name, input)),
+            result(invoke(name, input)),
           ),
         ),
         ...Array.from(gate.extensionTools, ([id, extension]) =>
           tool(extension.name, extension.description, extension.schema, async (input) => {
             t.progress(extension.name);
-            return result(await gate.invokeExtension(id, input));
+            return result(gate.invokeExtension(id, input));
           }),
         ),
         tool(
@@ -78,7 +86,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
           async (input) => {
             const decision = await canUseTool('AskUserQuestion', input);
             if (decision.behavior === 'deny') throw Error(decision.message);
-            return result(decision.updatedInput.answers);
+            return result(Promise.resolve(decision.updatedInput.answers));
           },
         ),
       ],
@@ -89,7 +97,6 @@ export class SdkClaudeRunner implements ClaudeRunner {
       CLAUDE_CONFIG_DIR: sandbox.claudeHome + '/.claude',
       TMPDIR: sandbox.rootDir,
       LANG: 'en_US.UTF-8',
-      ANTHROPIC_API_KEY: this.config.anthropicApiKey,
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
       GIT_CONFIG_NOSYSTEM: '1',
       GIT_CONFIG_GLOBAL: '/dev/null',
@@ -100,6 +107,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
       GIT_CONFIG_VALUE_1: 'false',
     };
     if (this.config.anthropicBaseUrl) env.ANTHROPIC_BASE_URL = this.config.anthropicBaseUrl;
+    let model: Awaited<ReturnType<typeof openModelTransport>> | undefined;
     let diagnostic = '';
     const transport = new AbortController();
     let interrupt: (() => void) | undefined;
@@ -107,13 +115,18 @@ export class SdkClaudeRunner implements ClaudeRunner {
     try {
       let resultText: string | undefined;
       t.controller.signal.throwIfAborted();
+      if (this.config.anthropicApiKey) {
+        model = await openModelTransport(this.config.anthropicBaseUrl ?? 'https://api.anthropic.com', this.config.anthropicApiKey);
+        env.ANTHROPIC_BASE_URL = model.url;
+        env.ANTHROPIC_AUTH_TOKEN = 'detent-local';
+      }
       const messages = query({
-        prompt: t.prompt,
+        prompt: redact(t.prompt),
         options: {
           hooks: drainInbox && { PostToolUse: [{ hooks: [async () => {
             const items = await drainInbox();
             return items.length ? { hookSpecificOutput: {
-              hookEventName: 'PostToolUse', additionalContext: formatInboxMessages(items, this.config.jevApiKey),
+              hookEventName: 'PostToolUse', additionalContext: redact(formatInboxMessages(items, this.config.jevApiKey)),
             } } : {};
           }] }] },
           stderr: (chunk) => {
@@ -149,7 +162,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
           allowedTools: ['mcp__detent'],
           model: this.config.claudeModel,
           maxTurns: this.config.claudeMaxTurns,
-          appendSystemPrompt: t.systemPrompt,
+          appendSystemPrompt: redact(t.systemPrompt),
           mcpServers: { detent: server },
           strictMcpConfig: true,
           includePartialMessages: true,
@@ -185,12 +198,9 @@ export class SdkClaudeRunner implements ClaudeRunner {
     } catch (error) {
       const original = error instanceof Error ? error.message : String(error);
       const detail = t.controller.signal.aborted ? original : diagnostic.trim() || original;
-      let message = redactGitUrl(detail);
-      for (const secret of [this.config.anthropicApiKey, this.config.gitlabToken, this.config.jevApiKey]) {
-        if (secret) message = message.replaceAll(secret, '***');
-      }
-      throw Error(message);
+      throw Error(redact(detail));
     } finally {
+      model?.close();
       clearTimeout(shutdown);
       if (interrupt) t.controller.signal.removeEventListener('abort', interrupt);
     }

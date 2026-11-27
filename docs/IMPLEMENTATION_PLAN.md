@@ -238,3 +238,14 @@ Stage 6 已实现。使用 `loadHubWorkflows` 和 `matchHubWorkflow` 解析当�
 - 外部 MR 通过单次提及和后续分配分别触发。离线驱动发送 Bot 用户的失败流水线，检查任务日志、独立修复、Hub Issue 评论不变、在线策略从 `notify` 切换到 `run`，以及 PostToolUse 消费轮中指示并影响提交。仓库部署失败应生成带来源信息的 Hub 告警 Issue。
 - `npm run e2e:offline` 包含合成 CI 和部署事件；`e2e:gitlab` 使用真实 GitLab 产生的 Webhook。质量门禁为 `npm run check`、`npm run build` 与 `git diff --check`。
 - V6 新增 `MR_MAX_AUTO_FIX_ATTEMPTS`、`WATCHDOG_INTERVAL_MS` 和 `WATCHDOG_MAX_RECOVERIES`。默认值、范围和 MySQL 8.0 升级 SQL 见[设计文档](DESIGN.md#v6-mysql-upgrade)。
+
+## Stage 13 · 可重复安装
+
+- `Dockerfile`、`docker-compose.yml` 与 `INSTALL.md` 提供安装路径。bootstrap 可配置单个项目或整个群组，按需在空 Hub 发布 Bot 欢迎工单。重跑复用凭证及客户定制内容。
+
+## Stage 14 · GitLab 原生接入与工作区帮助
+
+- 新 Hub 的 GitLab 首页来自 `examples/hub-workspace/README.md`。Issue 模板提供编辑器内提示，`agents/onboarding/AGENT.md` 指导用户授权目标仓库与申请接入。
+- Hub 与 MR 的 `/help` 走免模型、免会话写入路径。验收实时 Agent 就绪状态、权限、讨论串和首次接管提示。
+- `gitlab-onboarding` 根据 `DETENT_PUBLIC_URL` 和服务端 Webhook 密钥启用。验收只读检查、整组 Maintainer 门槛、生产审批、幂等更新及凭证隔离。
+- 离线套件从引导首页、群组发现与欢迎工单开始，验证 Developer 无法批准、SRE 批准后新项目的签名 Webhook 能实际启动 MR Worker。质量门禁为 `npm run check && npm run build && npm run e2e:offline`。

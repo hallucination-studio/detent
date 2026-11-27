@@ -1,5 +1,6 @@
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-code';
 import { z } from 'zod';
+import path from 'node:path';
 import buffer from 'node:buffer';
 import { configuredSecrets, redactGitUrl } from '../gitlab/redact.js';
 import { openModelTransport } from './model-transport.js';
@@ -31,6 +32,43 @@ export interface TurnInput {
 export interface ClaudeRunner {
   run(turn: TurnInput): Promise<string>;
 }
+const toolLabels: Record<string, string> = {
+  detent_list_projects: '查询 GitLab 仓库列表',
+  detent_close_worktree: '归档工作树',
+  detent_commit_and_push: '提交推送分支',
+  detent_create_mr: '创建或更新 Merge Request',
+  detent_get_pipeline_status: '查询流水线状态',
+  detent_get_pipeline_job_log: '查看流水线任务日志',
+  detent_get_mr_diff: '查看 MR 代码变更',
+  detent_list_mr_discussions: '查看 MR 评审讨论',
+  detent_sync_target_branch: '同步目标分支',
+  detent_check_project_onboarding: '检查仓库接入状态',
+  detent_onboard_project: '配置仓库 Webhook',
+  detent_list_tags: '查询历史 Tag',
+  detent_create_release: '创建 Tag / Release',
+};
+
+export function formatToolProgress(name: string, input: Record<string, unknown>, sandbox: TurnSandbox,
+  redact: (value: string) => string, description?: string, jevConfidence?: number): string | null {
+  let label = Object.hasOwn(toolLabels, name) ? toolLabels[name] : description;
+  if (['Glob', 'Grep', 'detent_close_issue'].includes(name)) return null;
+  if (name === 'Read' || name === 'Edit' || name === 'Write') {
+    if (typeof input.file_path !== 'string') return null;
+    const relative = path.relative(sandbox.workspaceRoot, path.resolve(sandbox.workspaceRoot, input.file_path));
+    const projectPath = /^projects\/([^/]+\/.+)$/.exec(relative)?.[1];
+    if (name === 'Read' && !projectPath) return null;
+    label = (name === 'Read' ? '读取 ' : '修改 ') + (projectPath ?? relative);
+  } else if (name === 'Bash' && typeof input.command === 'string') {
+    label = '执行命令：' + input.command.replaceAll(sandbox.workspaceRoot + '/', '').replaceAll(sandbox.workspaceRoot, '.').replaceAll(sandbox.rootDir, '.');
+  } else if (name === 'detent_checkout_project' || name === 'detent_checkout_worktree') {
+    label = '检出仓库 ' + input.project;
+  }
+  if (!label) return null;
+  const clean = redact(label).replace(/\s+/g, ' ').trim();
+  const summary = clean.length > 100 ? clean.slice(0, 99) + '…' : clean;
+  return name === 'Bash' && jevConfidence !== undefined ? summary + '（已自动放行）' : summary;
+}
+
 export class SdkClaudeRunner implements ClaudeRunner {
   constructor(private config: AppConfig) {}
   async run(t: TurnInput) {
@@ -39,17 +77,12 @@ export class SdkClaudeRunner implements ClaudeRunner {
     const redact = (value: string) => redactGitUrl(value, secrets);
     const id = session.claudeSessionId!;
     const canUseTool = async (name: string, input: Record<string, unknown>) => {
-      const label = redact(name + (typeof input.command === 'string' ? ' ' + input.command : ''))
-        .replaceAll(sandbox.workspaceRoot + '/', '').replaceAll(sandbox.workspaceRoot, '.')
-        .replaceAll(sandbox.rootDir, '.').replace(/\s+/g, ' ').trim();
-      let summary = label.length > 100 ? label.slice(0, 99) + '…' : label;
-      try {
-        const { jevConfidence, ...result } = await gate.canUseTool(name, input);
-        if (jevConfidence !== undefined) summary = '⚡ ' + summary + '（Jev 放行 · ' + jevConfidence.toFixed(2) + '）';
-        return result;
-      } finally {
-        t.progress(summary);
+      const { jevConfidence, ...result } = await gate.canUseTool(name, input);
+      if (result.behavior === 'allow') {
+        const step = formatToolProgress(name, input, sandbox, redact, undefined, jevConfidence);
+        if (step) t.progress(step);
       }
+      return result;
     };
     const invoke = async (name: ToolName, input: Record<string, unknown>) => {
       const permission = await canUseTool(name, input);
@@ -74,9 +107,11 @@ export class SdkClaudeRunner implements ClaudeRunner {
           ),
         ),
         ...Array.from(gate.extensionTools, ([id, extension]) =>
-          tool(extension.name, extension.description, extension.schema, async (input) => {
-            t.progress(extension.name);
-            return result(gate.invokeExtension(id, input));
+          tool(extension.name, redact(extension.description), extension.schema, async (input) => {
+            const output = await result(gate.invokeExtension(id, input));
+            const step = formatToolProgress(extension.name, input, sandbox, redact, extension.description);
+            if (step) t.progress(step);
+            return output;
           }),
         ),
         tool(

@@ -33,7 +33,7 @@ export async function runConcurrency(h: Harness, cluster: Cluster, web: number) 
         }),
         ...(collide ? [(async () => {
           const status = await discuss('/status');
-          await until('status while coding is paused', async () => (await replies(api, mr.iid, status.id)).some(n => n.body === 'CODING'));
+          await until('status while coding is paused', async () => (await replies(api, mr.iid, status.id)).some(n => n.body.startsWith('⚙️ **执行中** · 正在按已批准方案实施')));
         })()] : []),
       ]);
       await until('all steering rows pending', async () => {

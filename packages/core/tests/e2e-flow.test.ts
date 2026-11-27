@@ -180,12 +180,16 @@ it('resumes a cold Bash approval, answers a hot question and reports two MRs and
     expect(await repo.getLatestPendingApproval(s.id)).toMatchObject({ approvalType: 'TOOL_USE' });
     expect(runner.run.mock.calls[1][0].prompt).toBe('实施方案已获批准，请按方案开始实施。');
     expect(await readdir(config.ephemeralRoot)).toEqual([]);
+    await send(note('请调整命令'));
+    await route.drain();
+    expect(gitlab.notes.at(-1)).toContain('当前正在等待上方审批卡确认');
+    expect(await repo.getLatestPendingApproval(s.id)).toMatchObject({ approvalType: 'TOOL_USE', status: 'PENDING' });
     route = pod('B', 15000);
     await send(note('/approve'));
     await vi.waitFor(async () => {
       expect(await repo.getLatestPendingApproval(s.id)).toMatchObject({ approvalType: 'ASK_USER' });
     }, { timeout: 10000 });
-    await send(note('/approve main'));
+    await send(note('main'));
     await route.drain();
     expect(await repo.getSession(s.id)).toMatchObject({
       status: 'IDLE',
@@ -251,7 +255,7 @@ it('revises plans, ignores superseded cards, resets transcript context and repor
     await send(note('/plan 评估下一步'));
     await send(note('/abort'));
     await send(note('/status'));
-    expect(gitlab.notes.at(-1)).toContain('IDLE');
+    expect(gitlab.notes.at(-1)).toContain('💤 **待命**');
     expect(await repo.getLatestPendingApproval(first.id)).toBeNull();
     await send(note('/reset Fresh start'));
     expect(runner.run.mock.calls.at(-1)![0].prompt).toBe('Fresh start');
@@ -503,7 +507,7 @@ it('publishes readonly results directly and includes extension status before app
     expect(await repo.getLatestApproval(s.id)).toBeNull();
     expect(gitlab.notes.at(-1)).toContain('Inspection complete');
     await dispatchWebhook(app, note('/status'));
-    expect(gitlab.notes.at(-1)).toBe('IDLE\n\nReview for #42\n\n无待审批项');
+    expect(gitlab.notes.at(-1)).toBe('💤 **待命** · 直接回复即可继续\n\nReview for #42');
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -528,7 +532,7 @@ it('renders live Hub help before session creation and preserves pending approval
   permit.mockResolvedValue(true);
   await dispatchWebhook(worker, note('/help'));
   const guide = reply.mock.calls[0][2];
-  for (const field of ['agent::code', '示例任务', '✅ 就绪', 'agent::setup', '⚠️ 缺少能力包: missing', '/approve', '/use <agent>'])
+  for (const field of ['| 能力场景 | 触发方式 / 标签 | 状态 |', '| 示例任务 | `agent::code` | ✅ 已就绪 |', '| 示例任务 | `agent::setup` | ⚪ 未开通（待配置 missing） |', '/abort', '/use <agent>'])
     expect(guide).toContain(field);
   expect(await repo.getSessionByIssue(1, issue.iid)).toBeNull();
   const s = await repo.getOrCreateSession(1, issue.iid, 'pending');

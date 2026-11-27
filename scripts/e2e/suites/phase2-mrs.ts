@@ -153,7 +153,7 @@ export async function runMrScenarios(h: Harness) {
   assert.match((await mrNotes()).find(n => n.id === plan.gitlab_note_id)?.body ?? '', /实施方案审批[\s\S]*Refactor the config loader/);
   assert.deepEqual((await gitlab.getMr(api, config.iid)).labels.filter(l => l.startsWith('claude::')), []);
   const status = await discuss('/status');
-  await until('MR /status reply', async () => (await threadNotes(status.id)).some(n => n.author.username === bot.username && n.body.includes('WAITING_PLAN')));
+  await until('MR /status reply', async () => (await threadNotes(status.id)).some(n => n.author.username === bot.username && n.body.includes('⏸️ **等待方案确认**')));
   await gitlab.awardMrThumbsUp(api, config.iid, plan.gitlab_note_id, 'dev');
   await mrState(api, config.iid, 'WAITING_TOOL');
   const tool = (await approvals()).find(a => a.approval_type === 'TOOL_USE');
@@ -191,7 +191,7 @@ export async function runMrScenarios(h: Harness) {
     assert.equal(repliesInThread.length, 1);
     const body = repliesInThread[0].body;
     assert.match(body, /Reviewed both the config defaults and the override\./);
-    assert.match(body, /<details><summary>🛠️ 已执行 [1-9]\d* 个步骤[\s\S]*detent_list_mr_discussions[\s\S]*<\/details>/);
+    assert.match(body, /<details><summary>📎 执行记录（[1-9]\d* 步）[\s\S]*查看 MR 评审讨论[\s\S]*<\/details>/);
     replies.push(body);
   }
   assert.equal(replies[0], replies[1]);

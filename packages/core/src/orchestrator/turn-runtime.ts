@@ -5,7 +5,7 @@ import type { DetentRepository } from '../db/repository.js';
 import type { ApprovalRequestRow, IssueSessionRow, ParsedUserIntent, SessionInboxRow } from '../types.js';
 import type { PermissionGate } from '../claude/permission-gate.js';
 import type { SessionLifecycleHooks } from '../extensions.js';
-import { redactGitUrl } from '../gitlab/client.js';
+import { configuredSecrets, redactGitUrl } from '../gitlab/redact.js';
 import { resolveApproval } from './lifecycle.js';
 
 import type { SessionChannel } from './channel.js';
@@ -83,8 +83,9 @@ export class TurnRuntime {
   protected async applyApproval(s: IssueSessionRow, pending: ApprovalRequestRow, intent: ParsedUserIntent,
     run: (session: IssueSessionRow, active: Active, prompt: string, previous?: ApprovalRequestRow) => Promise<void>) {
     const status = intent.type === 'APPROVE' ? 'APPROVED' : 'REJECTED';
+    const comment = intent.comment && redactGitUrl(intent.comment, configuredSecrets(this.config));
     if (!(await resolveApproval(
-      this.repo, s, pending.id, status, intent.username, intent.comment, this.hooks?.onApprovalResolved, this.config.jevApiKey,
+      this.repo, s, pending.id, status, intent.username, comment, this.hooks?.onApprovalResolved, this.config.jevApiKey,
     ))) return;
     if (await this.active.get(s.id)?.gate?.notify(pending.id)) return;
     const expected = pending.approvalType === 'PLAN' ? 'WAITING_PLAN' : 'WAITING_TOOL';
@@ -92,7 +93,6 @@ export class TurnRuntime {
       session?.status === expected && (await this.repo.getLatestApproval(s.id))?.id === pending.id;
     await this.withLease(s, async (session, active) => {
       if (!(await stillWaiting(session))) return;
-      const comment = intent.comment ?? '';
       if (pending.approvalType === 'PLAN') {
         const approved = status === 'APPROVED';
         session.permissionMode = approved ? 'default' : 'plan';
@@ -101,7 +101,7 @@ export class TurnRuntime {
         await run(session, active, comment ? instruction + '\n' + feedback + comment : instruction);
       } else {
         const decision = (await this.repo.getApproval(pending.id))!;
-        const prompt = `GitLab 审批结果 ${status}，工具 ${decision.toolName}，参数 ${JSON.stringify(decision.toolInput)}。审批说明：${comment}`;
+        const prompt = `GitLab 审批结果 ${status}，工具 ${decision.toolName}，参数 ${JSON.stringify(decision.toolInput)}。审批说明：${comment ?? ''}`;
         await run(session, active, prompt, decision);
       }
     }, async () => stillWaiting(await this.repo.getSession(s.id)));

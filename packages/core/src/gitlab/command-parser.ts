@@ -51,7 +51,7 @@ export function parseNoteIntent({
     ['WAITING_PLAN', 'WAITING_TOOL'].includes(sessionStatus) &&
     /^(同意|批准|通过|可以|lgtm|approve)$/i.test(body)
   )
-    return { ...actor, type: 'APPROVE' };
+    return { ...actor, type: 'APPROVE', ...(sessionStatus === 'WAITING_TOOL' && { comment: body }) };
   return { ...actor, type: 'PROMPT', comment: body };
 }
 export function parseEmojiIntent({

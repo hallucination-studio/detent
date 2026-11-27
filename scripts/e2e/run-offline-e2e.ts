@@ -338,7 +338,11 @@ async function main() {
       return card;
     }
     async function rejectDeveloper(iid: number, approval: RowDataPacket) {
+      const denial = '该操作需要生产审批权限';
+      const count = async () => (await notes(iid)).filter(n => n.body.includes(denial)).length;
+      const before = await count();
       await observeGet('/projects/' + hub + '/members/all/' + developer.id, () => award(iid, approval, 'dev'));
+      await until('production approval feedback', async () => await count() === before + 1);
       assert.equal((await rows('SELECT status FROM approval_requests WHERE id=?', [approval.id]))[0].status, 'PENDING');
     }
 
@@ -373,9 +377,9 @@ async function main() {
     assert.equal((await gitlab.getIssue(hub, missing)).state, 'opened');
     assert.equal(anthropic.getRequests(), requestsBeforeMissing);
     const guidance = (await notes(missing)).map(n => n.body).join('\n');
-    assert.match(guidance, /agents\/env-change\/AGENT\.md/);
+    assert.match(guidance, /### ⚪ 当前能力尚未开通/);
     assert.match(guidance, /jumpserver：.*JUMPSERVER_BASE_URL/);
-    const alternatives = guidance.split('\n').find(line => line.includes('已就绪的Agent标签')) ?? '';
+    const alternatives = guidance.split('<details>')[0];
     for (const label of ['delivery::release', 'delivery::code', 'agent::image-sync']) assert.ok(alternatives.includes(label));
     assert.deepEqual(jev.routingRequests, []);
     console.log('Missing-capability guidance posted with zero Anthropic requests.');
@@ -398,12 +402,12 @@ async function main() {
 
     // Include a prior user note so routing must read GitLab history and discard bot replies.
     await gitlab.postNote(hub, mirror, '/status');
-    await until('triage /status reply', async () => (await notes(mirror)).some(n => n.body.startsWith('IDLE\n')));
+    await until('triage /status reply', async () => (await notes(mirror)).some(n => n.body.startsWith('💤 **待命**')));
     const { source_image, target_image } = imageMirror;
     const clarification = `请将 ${source_image} 同步到 ${target_image}。`;
     await gitlab.postNote(hub, mirror, clarification);
-    const mirrorPlan = await pendingCard(mirror, 'Plan', ['🧭 已由 Jev 自动路由', '0.96', '实施方案审批',
-      source_image, target_image, 'harbor-sync__check_image_exists']);
+    const mirrorPlan = await pendingCard(mirror, 'Plan', ['🧭 已进入', '实施方案审批',
+      source_image, target_image, '检查目标镜像是否存在']);
     const routed = await state(mirror, 'WAITING_PLAN', triage.last_message_seq);
     assert.equal(routed.permission_mode, 'plan');
     assert.equal(routed.claude_session_id, triage.claude_session_id);
@@ -442,7 +446,7 @@ async function main() {
     const reviewNote = (await notes(code)).find(n => n.body.includes('Please review and merge both MRs'));
     assert.ok(reviewNote && mrs.every(m => reviewNote.body.includes(m.mr_web_url)));
     assert.equal((await gitlab.getIssue(hub, code)).state, 'opened');
-    assert.ok(reviewNote.body.includes('Jev 放行'));
+    assert.ok(reviewNote.body.includes('已自动放行'));
     assert.ok(jev.requests.includes('pwd; ls -la') && jev.requests.some(command => command.startsWith('git -C ')));
     assert.ok(!(await records(review.id, 'approval_requests')).some(a => a.tool_name === 'Bash'));
     const firstMr = mrs.find(m => m.target_project_id === web.id)!;
@@ -489,7 +493,7 @@ async function main() {
     const inlineNotes = (await gitlab.getDiscussion(api.id, inlineMr.iid, thread.id)).notes;
     assert.equal(inlineNotes[0].type, 'DiffNote');
     assert.ok(inlineNotes.some(n => n.author.username === bot.username && n.body.includes('Added the requested greeting regression test.') &&
-      /<details><summary>🛠️ 已执行 [1-9]\d* 个步骤/.test(n.body)));
+      /<details><summary>📎 执行记录（[1-9]\d* 步）/.test(n.body)));
     const reviewed = await gitlab.getMr(api.id, inlineMr.iid);
     assert.notEqual(reviewed.sha, inlineMr.sha);
     assert.ok((await gitlab.getFile(api.id, 'test-greeting.sh', reviewed.sha)).includes('Hello from ' + apiRepo));
@@ -677,8 +681,8 @@ async function main() {
     const production = approvals.find(a => a.tool_name === 'jms_run_ansible_job')!;
     await pendingCard(change, 'jms_run_ansible_job', ['生产变更执行审批', sha, 'web01', 'deploy/nginx-reload.yml', mr.mr_web_url]);
     await gitlab.postNote(hub, change, '/status');
-    const status = await until('/status reply', async () => (await notes(change)).find(n => n.body.startsWith('WAITING_TOOL\n')));
-    for (const field of [ansibleRepo + '!1', 'merged @ ' + sha.slice(0, 8), production.id]) assert.ok(status.body.includes(field));
+    const status = await until('/status reply', async () => (await notes(change)).find(n => n.body.startsWith('⏸️ **等待操作审批**')));
+    for (const field of [ansibleRepo + '!1', 'merged @ ' + sha.slice(0, 8), '在上方审批卡点 👍']) assert.ok(status.body.includes(field));
     await rejectDeveloper(change, production);
     assert.deepEqual(jms.uploads, []);
     assert.deepEqual(jms.executions, []);

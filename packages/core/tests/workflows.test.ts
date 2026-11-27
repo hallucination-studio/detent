@@ -126,7 +126,7 @@ it('lists the available SOPs and gives actionable guidance for each missing capa
   const unavailable = matchHubWorkflow(workflows, ['publish'], [disabled]);
   expect(unavailable).toMatchObject({ kind: 'blocked', workflow: needs });
   if (unavailable.kind === 'blocked') {
-    for (const text of ['sample：请配置 API_KEY', 'unknown：服务端未注册该能力包', '编辑 Hub 仓库的 workflows/publish.md', 'scan'])
+    for (const text of ['sample：请配置 API_KEY', 'unknown：请在服务端配置并启用此能力', '<details><summary>管理员如何开通？</summary>', '检查 · `scan`'])
       expect(unavailable.message).toContain(text);
   }
 });

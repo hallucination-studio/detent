@@ -22,6 +22,7 @@ export async function routeHubAgent(
   decision: DecisionClient,
   agents: readonly HubAgent[],
   input: { title: string; description?: string | null; labels: readonly string[]; recentMessages?: readonly string[] },
+  capabilities?: readonly DetentCapabilityPack[],
 ): Promise<AgentRouteResult> {
   if (!agents.length) return { kind: 'triage', reason: 'Hub 仓库尚未定义可用 Agent' };
 
@@ -72,10 +73,14 @@ export async function routeHubAgent(
       .filter(([id]) => id !== noMatch && Object.hasOwn(criteria, id))
       .map(([id, probability]) => ({ id, probability }))
       .sort((a, b) => b.probability - a.probability).slice(0, 2);
+    // The full choice distribution can include a ready candidate outside the displayed shortlist.
+    const strongerReady = matched && capabilities && probabilities && missingHubCapabilities(matched, capabilities).length > 0 &&
+      agents.some(candidate => (probabilities[candidate.id] ?? 0) > (probabilities[matched.id] ?? 0) &&
+        !missingHubCapabilities(candidate, capabilities).length);
     return {
       kind: 'triage',
       reason: agent.choice === noMatch ? 'Jev 未找到匹配的 Agent' : 'Jev 未能确定唯一且高置信度的 Agent',
-      ...(matched && { suggestion: { agent: matched, confidence } }),
+      ...(matched && !strongerReady && { suggestion: { agent: matched, confidence } }),
       ...(topCandidates && { topCandidates }),
     };
   } catch {
@@ -88,28 +93,23 @@ export function buildTriageSystemPrompt(
   capabilities: readonly DetentCapabilityPack[],
   context?: { reason?: string; suggestion?: RoutingSuggestion; topCandidates?: AgentRoutingCandidate[]; invalidFiles?: readonly string[] },
 ): string {
-  const { reason, suggestion, topCandidates, invalidFiles } = context ?? {};
-  const summarize = (value: string) => redactGitUrl(value).replace(/\s+/g, ' ').trim().slice(0, 240);
-  const menu = agents.map(agent => {
-    const missing = missingHubCapabilities(agent, capabilities);
-    const readiness = missing.length ? '缺少能力包：' + missing.join('、') : '已就绪';
-    const hint = agent.routingHint && summarize(agent.routingHint);
-    return `- ${agent.id}（标签 ${agent.label}，文件 ${agent.file}）[${readiness}] ${summarize(agent.description)}${hint ? '。路由提示：' + hint : ''}`;
-  });
+  const ready: string[] = [];
+  const unavailable: string[] = [];
+  for (const agent of agents) {
+    const needs = missingHubCapabilities(agent, capabilities);
+    const entry = `- ${agent.label} · ${agent.description} ${agent.routingHint ?? ''}`.replace(/\s+/g, ' ').trim().slice(0, 400);
+    if (needs.length) unavailable.push(entry + '（待配置 ' + needs.join('、') + '）');
+    else ready.push(entry);
+  }
   return redactGitUrl([
     '## 需求澄清与引导模式（只读）',
-    '当前 Issue 尚未匹配到 Agent。' + (reason ? '原因：' + reason + '。' : ''),
-    suggestion && `Jev 参考建议：${suggestion.agent.id}（置信度 ${suggestion.confidence.toFixed(2)}）。请独立判断。`,
-    topCandidates?.length && 'Jev 参考候选：' + topCandidates.map(({ id, probability }) => `${id}（${probability.toFixed(2)}）`).join('、'),
-    '',
-    '### Hub 已登记的 Agent',
-    ...(menu.length ? menu : ['暂无可用 Agent。']),
-    invalidFiles?.length && '已忽略的无效文件：' + invalidFiles.join('、'),
-    '',
-    '1. 对照 Hub 的 CLAUDE.md 和上述 Agent，分析用户的请求。',
-    '2. 直接在回复中询问缺失的具体信息，例如目标仓库、准确版本或 Tag、目标镜像仓库或环境，以及需要只读检查还是变更。',
-    '3. 如有合适的 Agent，指出最可能的选项。告诉用户可直接回复缺失信息以自动重新路由，或回复 `/use <agent-id>`、添加对应的 Issue 标签。',
-    '4. 如现有 Agent 均不适用，简述如何在 Hub 新增 `agents/<name>/AGENT.md`，按需增加 `skills/<skill>/SKILL.md`。',
-    '5. 仅提供澄清和引导。禁止写入、创建 MR 或执行命令，不要调用 AskUserQuestion，请勿声称已执行工具或任何变更。',
-  ].filter(line => typeof line === 'string').join('\n'));
+    '### 已就绪', ...(ready.length ? ready : ['暂无']),
+    '### 未开通', ...(unavailable.length ? unavailable : ['无']),
+    ...(context?.suggestion ? ['待核对的场景：' + context.suggestion.agent.description] : []),
+    '只依据用户需求及以上能力作答。需求明确依赖未开通能力时，用 2–3 行说明尚未接入；如有已就绪的替代途径，给出具体做法（如提供仓库路径即可检查配置或代码），然后结束。不要追问无法使用的参数，不要推荐切换到未开通的流程。',
+    '需求适合已就绪的流程但信息不足时，最多 8 行：用一句话概括需求，只问最少的关键信息（最多 3 个简短编号问题），以「直接回复即可继续」结束。',
+    '如果没有合适的能力，简短说明当前可处理的范围，然后结束。',
+    '不要逐一解释其他流程为何不匹配，不要提及内部分流机制、模型名称或评分，不要指导普通用户创建流程或技能文件。',
+    '只在回复中澄清，不调用 AskUserQuestion，禁止写入、创建 MR 或执行命令，不声称已实施变更。',
+  ].join('\n'));
 }

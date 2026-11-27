@@ -249,3 +249,5 @@ Stage 6 已实现。使用 `loadHubWorkflows` 和 `matchHubWorkflow` 解析当�
 - Hub 与 MR 的 `/help` 走免模型、免会话写入路径。验收实时 Agent 就绪状态、权限、讨论串和首次接管提示。
 - `gitlab-onboarding` 根据 `DETENT_PUBLIC_URL` 和服务端 Webhook 密钥启用。验收只读检查、整组 Maintainer 门槛、生产审批、幂等更新及凭证隔离。
 - 离线套件从引导首页、群组发现与欢迎工单开始，验证 Developer 无法批准、SRE 批准后新项目的签名 Webhook 能实际启动 MR Worker。质量门禁为 `npm run check && npm run build && npm run e2e:offline`。
+
+交互验收覆盖未开通能力零 Claude 调用、就绪场景的简短澄清、Issue 与 MR 的直接回答、生产审批拒绝提示去重与外部人员静默，以及状态、帮助和脱敏的业务执行记录。

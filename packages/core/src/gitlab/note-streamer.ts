@@ -1,4 +1,4 @@
-import type { ApprovalRequestRow, SessionWorktreeRow, SessionMergeRequestRow } from '../types.js';
+import type { SessionStatus, ApprovalRequestRow, SessionWorktreeRow, SessionMergeRequestRow } from '../types.js';
 import { redactGitUrl } from './redact.js';
 
 export function neutralizeQuickActions(text: string) {
@@ -27,6 +27,23 @@ export function escapeTableCell(text: string, format: 'text' | 'code' = 'text') 
 function codeFence(text: string, lang = '') {
   const fence = backtickFence(text, 3);
   return [fence + lang, neutralizeQuickActions(text), fence].join('\n');
+}
+
+export const waitingToolGuidance = '> ⏸️ 当前正在等待上方审批卡确认：点 👍 放行执行；如需按新意见调整方案，请对审批卡点 👎（或回复 `/reject`），我会按你的要求重新规划。';
+export const recoveryHint = '\n\n> 💡 可直接补充说明重试，或发送 `/reset` 重置会话。';
+
+export function renderStatus(status: SessionStatus, pending?: ApprovalRequestRow | null) {
+  const badges: Record<SessionStatus, string> = {
+    PLANNING: '🔄 **规划中** · 正在分析需求并拟定方案',
+    WAITING_PLAN: '⏸️ **等待方案确认** · 请在方案卡点 👍 批准，或直接回复修改意见',
+    CODING: '⚙️ **执行中** · 正在按已批准方案实施',
+    WAITING_TOOL: pending?.approvalType === 'ASK_USER' ? '💬 **等待你的确认** · 请直接回复确认内容'
+      : '⏸️ **等待操作审批** · 请在上方审批卡点 👍 放行或 👎 拒绝',
+    IDLE: '💤 **待命** · 直接回复即可继续',
+    DONE: '✅ **已完成**',
+    FAILED: '⚠️ **执行失败** · 可补充说明重试，或发 `/reset` 重置',
+  };
+  return badges[status];
 }
 
 export function renderSummary(trees: SessionWorktreeRow[], mrs: SessionMergeRequestRow[]) {
@@ -62,7 +79,7 @@ export function renderToolApprovalCard(
     return renderNote([
       '### 💬 需要你的确认',
       lines.join('\n'),
-      '> 请回复 `/approve <你的回答>` 继续，或 `/reject <原因>` 取消。',
+      '> 💬 直接回复你的确认内容即可继续（或回复 `/abort` 取消）。',
     ].filter(Boolean).join('\n\n'));
   }
   const footer = `> 👍 或 \`/approve\` 放行 · 👎 或 \`/reject <原因>\` 拒绝 · <sub>\`${a.id}\`</sub>`;
@@ -91,7 +108,7 @@ export class NoteStreamer {
   private pending = Promise.resolve('');
   private revision = 0;
   private written = -1;
-  private heading = '## 🤖 Claude 执行进展';
+  private heading = '⏳ 正在处理…';
   constructor(
     private throttle: number,
     private update: (body: string) => Promise<void>,
@@ -103,8 +120,28 @@ export class NoteStreamer {
     this.schedule();
   }
   push(step: string) {
+    if (this.steps.at(-1) === step) return;
     this.steps.push(step);
     this.schedule();
+  }
+  private traceSteps() {
+    const steps: string[] = [];
+    let project: string | undefined;
+    const reads = new Set<string>();
+    const flushReads = () => {
+      if (reads.size > 1) steps.push(`读取 ${project} 内 ${reads.size} 个文件`);
+      else steps.push(...reads);
+      reads.clear();
+    };
+    for (const step of this.steps) {
+      const directory = /^读取 ([^/]+)\/.+/.exec(step)?.[1];
+      if (directory !== project) flushReads();
+      project = directory;
+      if (project) reads.add(step);
+      else steps.push(step);
+    }
+    flushReads();
+    return steps;
   }
   private schedule() {
     this.revision++;
@@ -120,10 +157,11 @@ export class NoteStreamer {
       .then(async previous => {
         if (this.written === this.revision) return previous;
         const revision = this.revision;
-        const trace = this.steps.length && [
-          '<details><summary>🛠️ 已执行 ' + this.steps.length + ' 个步骤（点击展开轨迹）</summary>',
+        const steps = this.traceSteps();
+        const trace = steps.length && [
+          '<details><summary>📎 执行记录（' + steps.length + ' 步）</summary>',
           '',
-          ...this.steps.map((s) => '- ' + escapeTableCell(s, 'code')),
+          ...steps.map((s) => '- ' + escapeTableCell(s, 'code')),
           '',
           '</details>',
         ].join('\n');

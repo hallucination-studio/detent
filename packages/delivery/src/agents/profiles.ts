@@ -57,10 +57,10 @@ async function hubProfile(ctx: ResolverContext, options: ProfileOptions, capabil
       const currentPrompt = prompt?.trim();
       if (currentPrompt && currentPrompt !== recentMessages.at(-1) &&
           currentPrompt !== (issue.title + '\n' + (issue.description ?? '')).trim()) recentMessages.push(currentPrompt);
-      routed = await routeHubAgent(decision, agents, { title: issue.title, description: issue.description, labels: issue.labels, recentMessages });
+      routed = await routeHubAgent(decision, agents, { title: issue.title, description: issue.description, labels: issue.labels, recentMessages }, capabilities);
     }
     if (routed.kind === 'matched') {
-      const { agent, confidence } = routed;
+      const { agent } = routed;
       const profile = agentProfile(resolveHubAgentCapabilities(agent, agents, capabilities, invalidFiles));
       if (profile.blockedMessage) return profile;
 
@@ -70,8 +70,12 @@ async function hubProfile(ctx: ResolverContext, options: ProfileOptions, capabil
       await gitlab.updateIssueLabels?.(session.hubProjectId, session.hubIssueIid, { add: [agent.label] });
       return {
         ...profile,
-        routingNotice: redactGitUrl(`> 🧭 已由 Jev 自动路由至 Agent ${escapeMarkdownCell(agent.id, 'code')}（置信度 ${confidence.toFixed(2)}，标签 ${escapeMarkdownCell(agent.label, 'code')}）。如需切换，请修改 Issue 标签或回复 \`/use <agent>\`。`),
+        routingNotice: redactGitUrl(`> 🧭 已进入 **${escapeMarkdownCell(agent.description)}** 流程（发 \`/help\` 可查看或切换其他能力）`),
       };
+    }
+    if (routed.suggestion) {
+      const result = resolveHubAgentCapabilities(routed.suggestion.agent, agents, capabilities, invalidFiles);
+      if (result.kind === 'blocked') return agentProfile(result);
     }
     if (agents.some(agent => agent.isDefault)) return agentProfile(matchHubAgent(agents, [], capabilities, invalidFiles));
 
@@ -126,6 +130,19 @@ export function createDeliveryTurnProfileResolver(config: DeliveryConfig, option
       : await hubProfile(ctx, options, capabilities);
     const packProdTools = new Set(capabilities.filter(pack => pack.enabled && pack.approverTier === 'prod')
       .flatMap(pack => pack.tools.map(tool => tool.name)));
+    function approvalTier({ approvalType, toolName }: NonNullable<ResolverContext['approval']>): WorkflowApproverTier | null {
+      if (approvalType === 'PLAN' || toolName === 'Plan') return 'standard';
+      if (toolName === 'detent_close_issue' && selected.closePolicy !== 'approve') return null;
+      const packProdTool = packProdTools.has(toolName);
+      if (packProdTool || prodTools.has(toolName)) {
+        const enabled = selected.enabledExtensionTools?.includes(toolName) ?? !packProdTool;
+        return selected.readonly || !enabled ? null : 'prod';
+      }
+      return approvalType === 'TOOL_USE' && selected.approverTier === 'prod' ? 'prod' : 'standard';
+    }
+    // A removed tool cannot be approved by any member. Keep stale cards silent.
+    if (ctx.purpose === 'approval' && ctx.approval && !approvalTier(ctx.approval))
+      return blocked(selected.name ?? 'unavailable', '该操作已不在当前流程的授权范围内。');
     return {
       ...selected,
       ...(!selected.blockedMessage && canCloseIssue && {
@@ -138,16 +155,9 @@ export function createDeliveryTurnProfileResolver(config: DeliveryConfig, option
       async canApprove(params) {
         if (selected.blockedMessage) return false;
         const { projectId, userId, username, approvalType, toolName } = params;
-        const plan = approvalType === 'PLAN' || toolName === 'Plan';
-        if (!plan && toolName === 'detent_close_issue' && selected.closePolicy !== 'approve') return false;
-        const packProdTool = packProdTools.has(toolName);
-        const prodTool = !plan && (packProdTool || prodTools.has(toolName));
-        if (prodTool) {
-          const enabled = selected.enabledExtensionTools?.includes(toolName) ?? !packProdTool;
-          if (selected.readonly || !enabled) return false;
-        }
-        const prod = prodTool || (!plan && approvalType === 'TOOL_USE' && selected.approverTier === 'prod');
-        const permitted = prod
+        const tier = approvalTier({ approvalType, toolName });
+        if (!tier) return false;
+        const permitted = tier === 'prod'
           ? await canApproveProd(ctx.gitlab, projectId, userId, username)
           : await ctx.gitlab.hasApprovalPermission(projectId, userId);
         return permitted && (selected.canApprove?.(params) ?? true);

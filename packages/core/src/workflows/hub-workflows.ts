@@ -1,3 +1,4 @@
+import { escapeTableCell, renderNote } from '../gitlab/note-streamer.js';
 import type { DetentCapabilityPack, IssueClosePolicy } from '../extensions.js';
 import type { GitLabClient } from '../gitlab/client.js';
 import { normalizeHubValue as normalize, readHubFrontmatter, readHubList, type HubFrontmatter } from './hub-frontmatter.js';
@@ -115,25 +116,27 @@ export function matchHubDefinitions<T extends HubWorkflow>(
       `未匹配到${term}。请给 Issue 添加以下任一${term}标签，或在 Hub 仓库新增 ${template}。`, ...menu, ...invalid,
     ].join('\n') };
   }
-  return resolveHubDefinitionCapabilities(workflow, workflows, capabilities, { term, pathPrefix });
+  return resolveHubDefinitionCapabilities(workflow, workflows, capabilities);
 }
 
 export function resolveHubDefinitionCapabilities<T extends HubWorkflow>(
   workflow: T, workflows: readonly T[], capabilities: readonly DetentCapabilityPack[],
-  { term, pathPrefix }: Pick<typeof workflowGuidance, 'term' | 'pathPrefix'>,
 ): WorkflowMatch<T> {
   const needs = missingHubCapabilities(workflow, capabilities);
   if (needs.length) {
-    const message = [pathPrefix + workflow.file + ' 缺少能力包，请补齐服务端配置：'];
-    for (const name of needs) {
+    const ready = workflows.filter(w => !missingHubCapabilities(w, capabilities).length);
+    const hints = needs.map(name => {
       const pack = capabilities.find(pack => normalize(pack.name) === name);
-      const hint = pack ? pack.setupHint || '请在服务端启用该能力包' : '服务端未注册该能力包';
-      message.push('- ' + name + '：' + hint);
-    }
-    message.push('也可编辑 Hub 仓库的 ' + pathPrefix + workflow.file + '，调整 requires 和流程步骤。');
-    const alternatives = workflows.filter(w => !missingHubCapabilities(w, capabilities).length).map(w => w.label);
-    if (alternatives.length) message.push(`可切换到已就绪的${term}标签：` + alternatives.join('、'));
-    return { kind: 'blocked', workflow, message: message.join('\n') };
+      return '- ' + escapeTableCell(name) + '：' + (pack?.setupHint || '请在服务端配置并启用此能力。');
+    });
+    const message = [
+      '### ⚪ 当前能力尚未开通',
+      `「${escapeTableCell(workflow.description)}」需要 ${needs.map(name => escapeTableCell(name, 'code')).join('、')}，当前尚未接入。`,
+      ready.length && ['现在可以使用以下能力，回复 `/use <标签>` 即可切换：',
+        ...ready.map(w => '- ' + escapeTableCell(w.description) + ' · ' + escapeTableCell(w.label, 'code'))].join('\n'),
+      ['<details><summary>管理员如何开通？</summary>', '', ...hints, '', '</details>'].join('\n'),
+    ].filter(Boolean).join('\n\n');
+    return { kind: 'blocked', workflow, message: renderNote(message) };
   }
   const tools = capabilities.filter(pack => pack.enabled && workflow.requires.includes(normalize(pack.name))).flatMap(pack => pack.tools);
   const enabled = tools.filter(tool => workflow.mode !== 'readonly' || tool.policy === 'readonly');

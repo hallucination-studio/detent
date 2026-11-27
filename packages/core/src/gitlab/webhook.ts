@@ -147,7 +147,7 @@ export function normalizeGitLabEvent(eventId: string, body: Record<string, unkno
 }
 
 export function createWebhookApp<T extends MatchedWebhook = never>(
-  config: AppConfig, gitlab: Pick<GitLabClient, 'isBotUser'>,
+  config: AppConfig, gitlab: Pick<GitLabClient, 'isBotUser'> & Partial<Pick<GitLabClient, 'getBotIdentity'>>,
   submit: (id: string, event: WebhookEvent | T) => void | Promise<void>,
   matchWebhookEvent?: (event: ExtensionWebhookEvent) => T | null,
   matchPolicy?: (event: NormalizedGitLabEvent) => T | null,
@@ -201,7 +201,14 @@ export function createWebhookApp<T extends MatchedWebhook = never>(
     if (e.object_kind === 'note') {
       const a = e.object_attributes;
       if (a.system || (a.action && a.action !== 'create')) return { ignored: true };
-      if (a.noteable_type === 'MergeRequest') return e.merge_request?.state === 'opened' ? accept(e) : { ignored: true };
+      const resource = a.noteable_type === 'MergeRequest' ? e.merge_request : e.issue;
+      const finished = resource?.state === 'closed' || resource?.state === 'merged';
+      if (finished) {
+        const intent = parseNoteIntent({ noteBody: a.note, userId: e.user.id, username: e.user.username,
+          sessionStatus: 'DONE', botUsername: gitlab.getBotIdentity?.()?.username });
+        if (intent.type !== 'STATUS') return { ignored: true };
+      }
+      if (a.noteable_type === 'MergeRequest') return resource?.state === 'opened' || finished ? accept(e) : { ignored: true };
     }
     if (e.object_kind === 'emoji' && (e.merge_request || e.note?.noteable_type === 'MergeRequest'))
       return e.object_attributes.awardable_type === 'Note' ? accept(e) : { ignored: true };
@@ -214,7 +221,7 @@ export function createWebhookApp<T extends MatchedWebhook = never>(
       return { ignored: true };
     if (e.object_kind === 'note' && !e.issue)
       return { ignored: true };
-    if ((e.object_kind === 'note' || e.object_kind === 'emoji') && e.issue?.state === 'closed')
+    if (e.object_kind === 'emoji' && e.issue?.state === 'closed')
       return { ignored: true };
     if (e.object_kind === 'emoji' && e.object_attributes.awardable_type !== 'Note')
       return { ignored: true };

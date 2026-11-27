@@ -263,12 +263,11 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
   if (system.includes('需求澄清与引导模式（只读）')) {
     assert.equal(sopPath, undefined);
     assert.match(system, /本轮仅允许只读检查/);
-    assert.match(system, /Jev 参考建议：image-sync（置信度 0\.55）/);
-    const menu = system.split('\n');
+    const [ready, unavailable] = system.split('### 未开通');
     for (const label of ['delivery::audit', 'delivery::env-change'])
-      assert.ok(menu.some(line => line.includes(label) && line.includes('缺少能力包：jumpserver')));
+      assert.ok(unavailable.split('\n').some(line => line.includes(label) && line.includes('待配置 jumpserver')));
     for (const label of ['delivery::code', 'delivery::release', 'agent::image-sync'])
-      assert.ok(menu.some(line => line.includes(label) && line.includes('已就绪')));
+      assert.ok(ready.includes(label));
     assert.ok(!body.tools.some(t => ['Edit', 'Write', 'Bash', toolName('detent_close_issue')].includes(t.name) ||
       t.name.startsWith(prefix + 'harbor-sync__')), 'Triage advertised a restricted tool');
     return text('请提供带 Tag 的完整源镜像地址和目标镜像仓库地址。');

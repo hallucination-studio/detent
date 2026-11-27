@@ -79,6 +79,7 @@ export type TurnProfileResolver = (ctx: {
     Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile' | 'listIssueNotes' | 'updateIssueLabels' | 'isBotUser'>>;
   capabilities?: readonly DetentCapabilityPack[];
   purpose?: 'turn' | 'approval';
+  approval?: Pick<ApprovalRequestRow, 'approvalType' | 'toolName'>;
   prompt?: string;
   decision?: DecisionClient;
 }) => TurnProfile | Promise<TurnProfile>;

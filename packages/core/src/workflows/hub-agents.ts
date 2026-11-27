@@ -161,9 +161,9 @@ export function matchHubAgent(
 }
 
 export function resolveHubAgentCapabilities(
-  agent: HubAgent, agents: readonly HubAgent[], capabilities: readonly DetentCapabilityPack[], invalidFiles: readonly string[] = [],
+  agent: HubAgent, agents: readonly HubAgent[], capabilities: readonly DetentCapabilityPack[], _invalidFiles?: readonly string[],
 ): AgentMatch {
-  return toAgentMatch(resolveHubDefinitionCapabilities(agent, agents, capabilities, agentGuidance(agents, invalidFiles)));
+  return toAgentMatch(resolveHubDefinitionCapabilities(agent, agents, capabilities));
 }
 
 export function renderAgentSystemPrompt(agent: HubAgent) {

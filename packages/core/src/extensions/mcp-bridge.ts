@@ -368,7 +368,7 @@ async function connect(cfg: McpCapabilityConfig, { env = process.env, http = fet
       const override = cfg.toolPolicies && Object.hasOwn(cfg.toolPolicies, remote.name) ? cfg.toolPolicies[remote.name] : undefined;
       const policy = override ?? cfg.defaultPolicy ?? 'always_approve';
       return defineExtensionTool({
-        name, policy, description: scrub(remote.description ?? remote.name),
+        name, policy, description: scrub(remote.description?.trim() || `调用 ${cfg.name} 扩展服务`),
         schema: jsonSchemaToZodShape(remote.inputSchema, scrub),
         ...(policy === 'always_approve' && {
           renderApprovalCard(approvalId, input) {

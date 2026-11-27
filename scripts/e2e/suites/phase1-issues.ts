@@ -17,8 +17,8 @@ export async function runIssueScenarios(h: Issues) {
   const initial = await state(revision, 'WAITING_PLAN');
   const beforeHelp = anthropic.getRequests();
   await post(revision, '/help');
-  const help = await until('Hub help', async () => (await notes(revision)).find(n => n.body.includes('工作区 Agent')));
-  for (const field of ['agent::onboarding', 'delivery::release', '✅ 就绪', '/use <agent>', '/abort', '/plan']) assert.ok(help.body.includes(field));
+  const help = await until('Hub help', async () => (await notes(revision)).find(n => n.body.includes('### 可用能力')));
+  for (const field of ['agent::onboarding', 'delivery::release', '✅ 已就绪', '/use <agent>', '/abort', '/plan']) assert.ok(help.body.includes(field));
   assert.equal(anthropic.getRequests(), beforeHelp);
   assert.deepEqual(await state(revision, 'WAITING_PLAN'), initial);
   await post(revision, '/reject Keep API signature unchanged');
@@ -48,9 +48,9 @@ export async function runIssueScenarios(h: Issues) {
   const clarify = await open('Select service port');
   await pendingCard(clarify, 'Plan', ['Confirm the deployment port']);
   await post(clarify, '/approve');
-  const ask = await pendingCard(clarify, 'AskUserQuestion', ['### 💬 需要你的确认', '1. Which service port?']);
+  const ask = await pendingCard(clarify, 'AskUserQuestion', ['### 💬 需要你的确认', '1. Which service port?', '直接回复你的确认内容即可继续']);
   assert.equal(ask.approval_type, 'ASK_USER');
-  await post(clarify, '/approve Use port 6380');
+  await post(clarify, 'Use port 6380');
   const clarified = await state(clarify, 'IDLE');
   await report(clarify, 'Confirmed port 6380');
   assert.equal((await approval(ask.id)).decision_comment, 'Use port 6380');

@@ -8,9 +8,9 @@ export const imageMirror = {
 
 const target = { target_image: { type: 'string' } };
 const tools = [
-  { name: 'check_image_exists', description: 'Check if the target image exists.',
+  { name: 'check_image_exists', description: '检查目标镜像是否存在',
     inputSchema: { type: 'object', properties: target, required: ['target_image'] } },
-  { name: 'sync_image', description: 'Mirror an image to the internal registry.',
+  { name: 'sync_image', description: '同步镜像到内部仓库',
     inputSchema: { type: 'object', properties: { ...target, source_image: { type: 'string' } },
       required: ['source_image', 'target_image'] } },
 ];

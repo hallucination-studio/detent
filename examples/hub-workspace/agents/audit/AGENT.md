@@ -4,7 +4,7 @@ mode: readonly
 requires: [jumpserver]
 close_policy: auto
 approver_tier: standard
-description: 生产环境只读巡检与排障诊断
+description: 主机与服务只读巡检与排障诊断
 routing_hint: 采集目标服务、主机或端口的状态与诊断证据，汇报影响范围
 ---
 

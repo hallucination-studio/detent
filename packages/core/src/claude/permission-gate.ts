@@ -9,7 +9,7 @@ import type { DetentRepository } from '../db/repository.js';
 import type { AnyDetentExtensionTool, DetentCapabilityPack, ExtensionToolContext, SessionLifecycleHooks, TurnProfile } from '../extensions.js';
 import type { GitLabClient } from '../gitlab/client.js';
 import { configuredSecrets } from '../gitlab/redact.js';
-import { renderNote, renderToolApprovalCard } from '../gitlab/note-streamer.js';
+import { renderNote, renderStatus, renderToolApprovalCard } from '../gitlab/note-streamer.js';
 import type { ApprovalRequestRow, IssueSessionRow } from '../types.js';
 import { isHubScopePath } from '../workspace/hub-paths.js';
 import { allowedInPlan, isWorkspaceTool, type ToolName } from '../workspace/mcp-tools.js';
@@ -22,8 +22,8 @@ type GateResult = PermissionResult & { approvalId?: string; jevConfidence?: numb
 type Decision = 'APPROVED' | 'REJECTED';
 const deny = (message: string): PermissionResult => ({ behavior: 'deny', message });
 export class ColdHold extends Error {
-  constructor() {
-    super('Waiting for GitLab approval');
+  constructor(pending: ApprovalRequestRow) {
+    super(renderStatus('WAITING_TOOL', pending));
   }
 }
 const fileTools = new Set(['Read', 'Edit', 'Write', 'Glob', 'Grep']);
@@ -355,7 +355,7 @@ export class PermissionGate {
           return this.result(stored, input, extension);
         }
         if (Date.now() >= deadline) {
-          const hold = new ColdHold();
+          const hold = new ColdHold(a);
           controller.abort(hold);
           throw hold;
         }

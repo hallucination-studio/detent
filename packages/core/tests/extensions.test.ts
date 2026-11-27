@@ -146,8 +146,9 @@ it('registers only enabled extensions with the SDK and disables Bash in both lay
   const { config, controller, session, workspaceRoot } = ctx;
   const sandbox = { workspaceRoot, rootDir: '/', claudeHome: '/home' };
   const tools = new WorkspaceTools(new EphemeralSandbox(config, ctx.repo, ctx.gitlab), sandbox, session.id);
+  const progress = vi.fn();
   await new SdkClaudeRunner(config).run({
-    gate, controller, session, sandbox, tools, resume: false, prompt: 'go', systemPrompt: '', progress: vi.fn(),
+    gate, controller, session, sandbox, tools, resume: false, prompt: 'go', systemPrompt: '', progress,
   });
   const options = vi.mocked(query).mock.calls.at(-1)![0].options!;
   expect(options.disallowedTools).toContain('Bash');
@@ -158,6 +159,7 @@ it('registers only enabled extensions with the SDK and disables Bash in both lay
   const handler = registered.find(t => t.name === 'example')!.handler;
   const count = registered.find(t => t.name === 'count')!;
   expect(await count.handler({ entries: [4, 5] }, {})).toMatchObject({ content: [{ type: 'text', text: '2' }] });
+  await options.canUseTool!(toolId, input, { signal: controller.signal });
   const response = handler(input, {});
   await vi.waitFor(() => expect(ctx.gitlab.createIssueNote).toHaveBeenCalledOnce());
   const approval = (await ctx.repo.getApprovalByNoteId(session.id, 20))!;
@@ -168,6 +170,7 @@ it('registers only enabled extensions with the SDK and disables Bash in both lay
   expect(guard).toHaveBeenLastCalledWith(input, expect.objectContaining({ approvalId: approval.id }));
   expect(execute).toHaveBeenCalledWith(input, guard.mock.calls[1][1]);
   expect(execute).toHaveBeenCalledOnce();
+  expect(progress.mock.calls).toEqual([['Count entries'], ['Example tool']]);
 });
 
 it('expires a request if its custom card fails to render', async () => {
@@ -229,9 +232,8 @@ it.each(['plan', 'default'] as const)('uses the default SDK mode and locks reado
     prompt: 'inspect', systemPrompt: '', progress });
   const options = vi.mocked(query).mock.lastCall![0].options!;
   const command = 'git -C ' + workspaceRoot + '/projects/app status ' + workspaceRoot + ' ' + 'x'.repeat(100);
-  await options.canUseTool!('Bash', { command }, { signal: controller.signal });
-  expect(progress).toHaveBeenCalledWith(expect.stringMatching(/^Bash git -C projects\/app status \. x+…$/));
-  expect(progress.mock.calls[0][0]).toHaveLength(100);
+  expect(await options.canUseTool!('Bash', { command }, { signal: controller.signal })).toMatchObject({ behavior: 'deny' });
+  expect(progress).not.toHaveBeenCalled();
   expect(options).toMatchObject({
     permissionMode: 'default', disallowedTools: expect.arrayContaining(['Edit', 'Write']),
   });

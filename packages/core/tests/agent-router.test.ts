@@ -134,13 +134,12 @@ it('guides read-only triage with the Agent catalog, capability readiness and adv
     topCandidates: [{ id: sync.id, probability: 0.65 }, { id: scan.id, probability: 0.3 }],
     invalidFiles: ['agents/broken/AGENT.md'],
   });
-  for (const text of [
-    '需求澄清与引导模式（只读）', '需求含糊', 'Jev 参考建议：image-sync（置信度 0.67）', '请独立判断',
-    'Jev 参考候选：image-sync（0.65）、scan（0.30）',
-    'scan（标签 agent::scan，文件 agents/scan/AGENT.md）[已就绪] Inspect project state',
-    'image-sync（标签 agent::image-sync，文件 agents/image-sync/AGENT.md）[缺少能力包：registry] Sync container images',
-    'Copy or mirror an exact image tag to a target registry', review.file, 'agents/broken/AGENT.md',
-    'CLAUDE.md', '目标仓库', '目标镜像仓库或环境', '直接回复缺失信息', '/use <agent-id>',
-    'agents/<name>/AGENT.md', 'skills/<skill>/SKILL.md', '禁止写入、创建 MR 或执行命令',
-  ]) expect(prompt).toContain(text);
+  const [available, unavailable] = prompt.split('### 未开通');
+  expect(available).toContain('### 已就绪');
+  expect(available).toContain(scan.description);
+  expect(available).toContain(review.description);
+  expect(available).not.toContain(sync.description);
+  for (const text of [sync.description, '待配置 registry', '2–3 行', '最多 8 行', '最多 3 个简短编号问题', '直接回复即可继续'])
+    expect(unavailable).toContain(text);
+  expect(prompt).not.toMatch(/Jev|置信度|自动重新路由|AGENT\.md|SKILL\.md|\/use/);
 });

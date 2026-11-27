@@ -10,7 +10,7 @@ import { configuredSecrets } from '../gitlab/redact.js';
 import { TranscriptHydrator } from '../claude/transcript-hydrator.js';
 import { redactGitUrl, type GitLabClient } from '../gitlab/client.js';
 import { hasBotMention, parseNoteIntent, parseEmojiIntent } from '../gitlab/command-parser.js';
-import { NoteStreamer, renderPlanApprovalCard } from '../gitlab/note-streamer.js';
+import { NoteStreamer, recoveryHint, renderPlanApprovalCard, renderStatus, renderSummary, waitingToolGuidance } from '../gitlab/note-streamer.js';
 import { actionableMr, normalizeGitLabEvent, type EventOf } from '../gitlab/webhook.js';
 import { evaluateEventPolicy, loadHubEventPolicy } from '../router/event-policy.js';
 import { sendEventNotification } from '../router/notifier.js';
@@ -84,7 +84,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
   async handleMergeRequestNote(event: EventOf<'note'>, eventId = 'note/' + event.object_attributes.id) {
     const a = event.object_attributes;
     const resource = event.merge_request;
-    if (a.noteable_type !== 'MergeRequest' || a.system || (a.action && a.action !== 'create') || resource?.state !== 'opened') return;
+    if (a.noteable_type !== 'MergeRequest' || a.system || (a.action && a.action !== 'create') || !resource) return;
     const project = resource.target_project_id ?? event.project.id;
     if (!await this.gitlab.hasApprovalPermission(project, event.user.id)) return;
     let s = await this.repo.getSessionByMr(project, resource.iid);
@@ -92,6 +92,11 @@ export class MergeRequestOrchestrator extends TurnRuntime {
     const intent = parseNoteIntent({ userId: event.user.id, username: event.user.username, noteBody: a.note,
       sessionStatus: s?.status ?? 'IDLE', botUsername });
     const discussion = a.discussion_id ?? undefined;
+    if (intent.type === 'STATUS') {
+      if (s) await this.command(s, intent, discussion);
+      return;
+    }
+    if (resource.state !== 'opened') return;
     if (intent.type !== 'PROMPT' && intent.type !== 'HELP') {
       if (s && s.status !== 'DONE') {
         if (s.autoFixAttempts) await this.repo.updateSessionState(s.id, { autoFixAttempts: 0 });
@@ -101,6 +106,13 @@ export class MergeRequestOrchestrator extends TurnRuntime {
     }
     const mr = await this.gitlab.getMergeRequest(project, resource.iid);
     if (mr.state !== 'opened') return;
+    if (intent.type === 'PROMPT' && s?.status === 'WAITING_TOOL') {
+      const pending = await this.repo.getLatestPendingApproval(s.id);
+      if (pending?.status === 'PENDING' && pending.approvalType === 'ASK_USER')
+        await this.command(s, { ...intent, type: 'APPROVE', targetNoteId: pending.gitlabNoteId ?? undefined }, discussion, pending);
+      else if (pending?.approvalType === 'TOOL_USE') await this.channel(s, discussion).createNote(waitingToolGuidance);
+      return;
+    }
     if (!mr.assignees?.some(a => this.gitlab.isBotUser(a.id, a.username)) && !hasBotMention(a.note, botUsername)) return;
     if (intent.type === 'HELP') {
       await createMrChannel(this.gitlab, project, mr.iid, discussion).createNote(
@@ -128,11 +140,14 @@ export class MergeRequestOrchestrator extends TurnRuntime {
     const s = iid ? await this.repo.getSessionByMr(project, iid) : await this.repo.getMrSessionByApprovalNote(project, a.awardable_id);
     if (s && s.status !== 'DONE') await this.command(s, intent, event.note?.discussion_id ?? undefined);
   }
-  private async command(s: IssueSessionRow, intent: ParsedUserIntent, discussion?: string) {
-    const pending = intent.targetNoteId ? await this.repo.getApprovalByNoteId(s.id, intent.targetNoteId)
-      : await this.repo.getLatestPendingApproval(s.id);
+  private async command(s: IssueSessionRow, intent: ParsedUserIntent, discussion?: string, question?: ApprovalRequestRow) {
+    const pending = question ?? (intent.targetNoteId ? await this.repo.getApprovalByNoteId(s.id, intent.targetNoteId)
+      : await this.repo.getLatestPendingApproval(s.id));
     if (intent.type === 'STATUS') {
-      await this.channel(s, discussion).createNote([s.status, pending?.approvalType].filter(Boolean).join(' · '));
+      const summary = renderSummary(...await Promise.all([
+        this.repo.listActiveWorktrees(s.id), this.repo.listSessionMergeRequests(s.id),
+      ]));
+      await this.channel(s, discussion).createNote([renderStatus(s.status, pending), summary].filter(Boolean).join('\n\n'));
     } else if (intent.type === 'APPROVE' || intent.type === 'REJECT') {
       if (pending?.status === 'PENDING') await this.applyApproval(s, pending, intent, (session, active, prompt, previous) =>
         this.run(session, active, prompt, discussion ? [discussion] : [], previous));
@@ -186,7 +201,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
     const channel = this.channel(s, discussions[0]);
     const { controller } = active;
     const host = new EphemeralSandbox(this.config, this.repo, this.gitlab);
-    const redact = (text: string) => redactGitUrl(text, this.config.jevApiKey);
+    const redact = (text: string) => redactGitUrl(text, configuredSecrets(this.config));
     let sandbox: TurnSandbox | undefined;
     let streamer: NoteStreamer | undefined;
     try {
@@ -265,13 +280,13 @@ export class MergeRequestOrchestrator extends TurnRuntime {
       try {
         if (sandbox) await host.checkpoint(sandbox, s.id);
       } finally {
-        if (cause instanceof ColdHold) await streamer?.flush('等待工具审批，审批后继续。');
+        if (cause instanceof ColdHold) await streamer?.flush(cause.message);
         else {
           await this.expire(s);
           const stopped = cause instanceof StopTurn;
           s.status = stopped ? 'IDLE' : 'FAILED';
           await this.repo.updateSessionState(s.id, { status: s.status });
-          const body = stopped ? '本轮已中止。' : redact('本轮执行失败：' + String(cause));
+          const body = stopped ? '本轮已中止。' : redact('本轮执行失败：' + String(cause)) + recoveryHint;
           if (streamer) await streamer.flush(body);
           else await channel.createNote(body);
         }

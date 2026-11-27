@@ -200,7 +200,7 @@ it('resolves an Agent with local and shared Skills and enforces its production a
 it('lists available Hub routes and gives setup instructions and ready alternatives for a missing pack', async () => {
   const { profile } = await resolve(['delivery::env-change'], {}, [release, disabled], agentTemplates);
   expect(profile).toMatchObject({ readonly: true, disableBash: true, enabledExtensionTools: [] });
-  for (const text of ['jumpserver', disabled.setupHint, 'agents/env-change/AGENT.md', 'delivery::release', 'delivery::code', 'agent::image-sync'])
+  for (const text of ['jumpserver', disabled.setupHint, '### ⚪ 当前能力尚未开通', 'delivery::release', 'delivery::code', 'agent::image-sync'])
     expect(profile.blockedMessage).toContain(text);
   expect(await profile.canApprove!({ ...approve, userId: 50, toolName: 'jms_run_ansible_job' })).toBe(false);
   const { profile: triage, currentProfile, gitlab } = await resolve([], {}, [release, disabled], agentTemplates);
@@ -213,7 +213,7 @@ it('lists available Hub routes and gives setup instructions and ready alternativ
   expect(approval).toMatchObject({ name: 'unmatched', readonly: true });
   expect(approval.extraSystemPrompt).toBeUndefined();
   for (const file of Object.keys(agentTemplates)) {
-    expect(triage.extraSystemPrompt).toContain(file);
+    expect(triage.extraSystemPrompt).not.toContain(file);
     expect(approval.blockedMessage).toContain(file);
   }
   expect(await approval.canApprove!({ ...approve, approvalType: 'PLAN', toolName: 'Plan', userId: 50 })).toBe(false);
@@ -275,6 +275,49 @@ it('returns capability setup guidance and alternatives without labeling a high-c
   expect(profile.routingNotice).toBeUndefined();
 });
 
+it.each([0.95, 0.55])('posts unavailable capability guidance without a Claude turn at routing confidence %s', async confidence => {
+  const { gitlab, repo, notes, config, deliveryConfig } = await deliveryFixture([]);
+  const decision = routingDecision();
+  decision.decide.mockResolvedValue(routingAnswers('env-change', confidence));
+  const run = vi.fn();
+  const orchestrator = new SessionOrchestrator(config, repo, { ...gitlab, ...hubTree(agentTemplates) }, { run }, {
+    decisionClient: decision, resolveTurnProfile: createDeliveryTurnProfileResolver(deliveryConfig, { capabilities: [release, disabled] }),
+  });
+  await orchestrator.handleIssueOpened(opened);
+  expect(await repo.getSessionByIssue(hub.id, issue.iid)).toMatchObject({ status: 'IDLE' });
+  expect(notes).toEqual([expect.stringContaining('### ⚪ 当前能力尚未开通')]);
+  expect(run).not.toHaveBeenCalled();
+});
+
+it('keeps triage open when a ready candidate outranks the unavailable suggestion', async () => {
+  const { currentProfile } = await resolve([], {}, [release, disabled], agentTemplates);
+  const decision = routingDecision();
+  const answers = routingAnswers('env-change', 0.55);
+  decision.decide.mockResolvedValue({ ...answers, agent: { ...answers.agent, probabilities: { 'env-change': 0.3, release: 0.6 } } });
+  expect(await currentProfile({ decision })).toMatchObject({ name: 'triage' });
+});
+
+it('notifies each project member once per denied production approval and stays silent for outsiders', async () => {
+  const { notes, repo, config, gitlab, deliveryConfig } = await deliveryFixture(['delivery::release']);
+  const run = vi.fn();
+  const orchestrator = new SessionOrchestrator(config, repo, { ...gitlab, ...hubTree(agentTemplates) }, { run }, {
+    resolveTurnProfile: createDeliveryTurnProfileResolver(deliveryConfig, { capabilities: [release] }),
+  });
+  const session = await repo.getOrCreateSession(hub.id, issue.iid, issue.title);
+  await repo.updateSessionState(session.id, { status: 'WAITING_TOOL' });
+  for (let i = 0; i < 2; i++) {
+    const pending = await repo.createApprovalRequest(session.id, 'TOOL_USE', 'detent_create_release', {});
+    await dispatchWebhook(orchestrator, userNote('/approve', { id: 100, username: 'outside' }));
+    expect(notes).toHaveLength(i);
+    await Promise.all([1, 2].map(() => dispatchWebhook(orchestrator, userNote('/approve'))));
+    expect(notes).toHaveLength(i + 1);
+    expect(notes.at(-1)).toContain('🔒 该操作需要生产审批权限');
+    expect(await repo.getApproval(pending.id)).toMatchObject({ status: 'PENDING' });
+    await repo.resolveApprovalRequest(pending.id, 'EXPIRED', 'test');
+  }
+  expect(run).not.toHaveBeenCalled();
+});
+
 const imageSyncFile = 'agents/image-sync/AGENT.md';
 const agentFiles = {
   [imageSyncFile]: '---\ndescription: Mirror container images\nrouting_hint: Sync an exact image tag to a registry\n---\nPlan the image sync.',
@@ -325,7 +368,7 @@ it('clarifies a vague Issue, routes the follow-up into a scoped Agent plan and f
       expect(await gate.preflight('Bash', { command: 'git status' })).toMatchObject({ behavior: 'deny' });
       expect(await gate.preflight('Write', { file_path: 'file' })).toMatchObject({ behavior: 'deny' });
       expect(systemPrompt).toContain('需求澄清与引导模式（只读）');
-      expect(systemPrompt).toContain('Jev 参考建议：image-sync（置信度 0.56）');
+      expect(systemPrompt).toContain('待核对的场景：Mirror container images');
       return '请提供源镜像的 Tag 和目标镜像仓库。';
     })
     .mockImplementationOnce(async ({ gate, sandbox, session, systemPrompt }) => {
@@ -348,7 +391,7 @@ it('clarifies a vague Issue, routes the follow-up into a scoped Agent plan and f
   expect(resolveTurnProfile.mock.calls[0][0]).toMatchObject({ purpose: 'turn', prompt: request.title + '\n' + request.description, decision });
   expect(decision.decide.mock.calls[0][0]).toMatchObject({ recent_user_messages: [] });
   expect(gitlab.updateIssueLabels).not.toHaveBeenCalled();
-  expect(notes.at(-1)).toBe('请提供源镜像的 Tag 和目标镜像仓库。\n\n> 💡 发送 `/help` 可随时查看当前工作区全部可用 Agent 与指令。');
+  expect(notes.at(-1)).toBe('请提供源镜像的 Tag 和目标镜像仓库。');
 
   const details = '同步 app:v2 到 staging.example。';
   issueNotes.push(
@@ -367,7 +410,7 @@ it('clarifies a vague Issue, routes the follow-up into a scoped Agent plan and f
   expect(await repo.getSession(session.id)).toMatchObject({ status: 'WAITING_PLAN', permissionMode: 'plan' });
   const approval = (await repo.getLatestPendingApproval(session.id))!;
   expect(approval).toMatchObject({ approvalType: 'PLAN', status: 'PENDING' });
-  expect(notes.at(-1)).toBe('> 🧭 已由 Jev 自动路由至 Agent `image-sync`（置信度 0.95，标签 `agent::image-sync`）。如需切换，请修改 Issue 标签或回复 `/use <agent>`。' +
+  expect(notes.at(-1)).toBe('> 🧭 已进入 **Mirror container images** 流程（发 `/help` 可查看或切换其他能力）' +
     '\n\n### 📋 实施方案审批\n\n镜像同步方案\n\n---\n> 👍 或 `/approve` 批准实施 · 直接回复即可调整方案');
 
   labels.pop();

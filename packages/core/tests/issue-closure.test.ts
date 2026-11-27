@@ -119,6 +119,10 @@ it.each(['error', 'abort during flush', 'cold hold', 'new blocker'])('discards a
   await turn('default');
   expect(scheduled).toHaveBeenCalledExactlyOnceWith({ scheduled: true, ...input });
   expect(await status()).toBe(failure === 'cold hold' ? 'WAITING_TOOL' : 'FAILED');
+  if (failure === 'error' || failure === 'cold hold') {
+    const hint = failure === 'error' ? '可直接补充说明重试，或发送 `/reset` 重置会话。' : '💬 **等待你的确认** · 请直接回复确认内容';
+    expect(gitlab.updateIssueNote).toHaveBeenLastCalledWith(expect.any(Number), expect.any(Number), expect.any(Number), expect.stringContaining(hint));
+  }
   expect(gitlab.closeIssue).not.toHaveBeenCalled();
 });
 

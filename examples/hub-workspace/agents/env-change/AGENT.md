@@ -4,11 +4,11 @@ mode: governed
 requires: [jumpserver]
 close_policy: auto
 approver_tier: prod
-description: 受治理生产环境变更（JumpServer 巡检 + Ansible MR + 二次审批执行）
-routing_hint: 用 Ansible 修改环境配置或服务状态，合并变更 MR 后申请生产执行
+description: 受治理环境与配置变更（巡检 + Ansible MR + 审批执行）
+routing_hint: 用 Ansible 修改环境配置或服务状态，合并变更 MR 后申请执行审批
 ---
 
-# 生产环境变更
+# 环境与配置变更
 
 1. 用 `jms_list_assets` 确认资产，用 `jms_readonly_inspect` 记录服务基线。
 2. 提交简短变更方案，列明资产范围、影响、验收命令和回滚条件及步骤。

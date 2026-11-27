@@ -1,3 +1,4 @@
+import { formatToolProgress } from '../src/claude/runner.js';
 import { it, expect, vi } from 'vitest';
 import { createMrChannel } from '../src/orchestrator/channel.js';
 import { stripBotMention, hasBotMention, parseNoteIntent, parseEmojiIntent } from '../src/gitlab/command-parser.js';
@@ -145,7 +146,7 @@ it('coalesces 20 events, serializes final flush and redacts approval cards and t
     const body = update.mock.calls.flat().join('');
     for (const fragment of [
       '正在分析',
-      '20 个步骤',
+      '📎 执行记录（20 步）',
       'step 19',
       '<details>',
       'oauth2:***@',
@@ -167,6 +168,31 @@ it('coalesces 20 events, serializes final flush and redacts approval cards and t
   }
 });
 
+it('keeps Hub discovery silent and summarizes only business actions with redacted arguments', async () => {
+  const sandbox = { rootDir: '/turn', workspaceRoot: '/turn/work', claudeHome: '/turn/home' };
+  const format = (name: string, input = {}, description?: string, confidence?: number) =>
+    formatToolProgress(name, input, sandbox, text => text.replaceAll('private-value', '***'), description, confidence);
+  for (const name of ['Glob', 'Grep', 'detent_close_issue']) expect(format(name)).toBeNull();
+  for (const file of ['CLAUDE.md', 'agents/a/AGENT.md', 'skills/s/SKILL.md', 'README.md', 'events.json', '/etc/projects/x/y', 'projects/../secret'])
+    expect(format('Read', { file_path: file })).toBeNull();
+  for (const name of ['Edit', 'Write'])
+    expect(format(name, { file_path: 'projects/web/private-value.ts' })).toBe('修改 web/***.ts');
+  expect(format('detent_checkout_worktree', { project: 'apps/web' })).toBe('检出仓库 apps/web');
+  expect(format('Bash', { command: 'echo private-value' }, undefined, 0)).toBe('执行命令：echo ***（已自动放行）');
+  expect(format('remote__inspect', {}, '检查 private-value')).toBe('检查 ***');
+  const stream = new NoteStreamer(200, vi.fn(), async () => '');
+  expect(await stream.flush()).toBe('⏳ 正在处理…');
+  for (const file of ['web/a', 'web/a', 'web/sub/b', 'api/a', 'web/c']) {
+    const step = format('Read', { file_path: '/turn/work/projects/' + file });
+    expect(step).toBe('读取 ' + file);
+    stream.push(step!);
+  }
+  for (let i = 0; i < 2; i++) stream.push(format('detent_list_projects')!);
+  const body = await stream.flush('完成');
+  expect(body).toContain('📎 执行记录（4 步）');
+  expect(body.match(/^- .+$/gm)).toEqual(['- `读取 web 内 2 个文件`', '- `读取 api/a`', '- `读取 web/c`', '- `查询 GitLab 仓库列表`']);
+});
+
 it('publishes a text-only result without empty sections or executable quick actions', async () => {
   const update = vi.fn();
   const stream = new NoteStreamer(200, update, async () => '');
@@ -180,6 +206,7 @@ it('renders numbered questions, fenced commands and escaped fallback tool inputs
   const questions = [{ question: '哪个分支？\n /label' }, { question: '/close' }];
   const ask = renderToolApprovalCard({ ...tool, toolInput: { questions } });
   expect(ask).toContain('1. 哪个分支？\n \\/label\n2. \\/close');
+  expect(ask).toContain('直接回复你的确认内容即可继续');
   expect(ask).not.toMatch(/AskUserQuestion|approval-id|questions/);
 
   const approval = { ...tool, approvalType: 'TOOL_USE' } as const;

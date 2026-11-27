@@ -246,8 +246,10 @@ it('enforces the live MCP pack production tier for an Agent with standard SOP ap
     const resolve = vi.spyOn(orchestrator.repo, 'resolveApprovalRequest').mockResolvedValue(false);
     const approve = (userId: number) => orchestrator.handleUserIntent(1, 42, { type: 'APPROVE', userId, username: 'user' + userId });
 
+    const notice = vi.spyOn(GitLabClient.prototype, 'createIssueNote').mockResolvedValue({ id: 1 });
     await approve(30);
-    expect(permission).toHaveBeenLastCalledWith(1, 30, 40);
+    expect(permission.mock.calls).toEqual([[1, 30, 40], [1, 30]]);
+    expect(notice).toHaveBeenCalledExactlyOnceWith(1, 42, expect.stringContaining('生产审批权限'));
     expect(resolve).not.toHaveBeenCalled();
     await approve(40);
     expect(permission).toHaveBeenLastCalledWith(1, 40, 40);
@@ -264,6 +266,7 @@ it('enforces the live MCP pack production tier for an Agent with standard SOP ap
     markdown = '---\nrequires: []\n---\nPlan a standalone change.';
     await approve(40);
     expect(permission).not.toHaveBeenCalled();
+    expect(notice).toHaveBeenCalledOnce();
     expect(resolve).not.toHaveBeenCalled();
 
     pending = await repo.createApprovalRequest(session.id, 'PLAN', 'Plan', {});

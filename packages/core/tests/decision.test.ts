@@ -179,7 +179,7 @@ it('isolates service credentials from the SDK child, prompt, stderr and GitLab n
     expect(await gate.preflight('Bash', { command: 'printf ' + secret })).toMatchObject({ behavior: 'deny' });
     const callback = vi.mocked(query).mock.lastCall![0].options!.canUseTool!;
     expect(await callback('Bash', { command: 'pwd; ls' }, { signal: turn.controller.signal })).toMatchObject({ behavior: 'allow' });
-    expect(progress).toHaveBeenCalledExactlyOnceWith('⚡ Bash pwd; ls（Jev 放行 · 0.96）');
+    expect(progress).toHaveBeenCalledExactlyOnceWith('执行命令：pwd; ls（已自动放行）');
     await gitlab.createIssueNote(1, 2, secret);
     await gitlab.updateIssueNote(1, 2, 3, secret);
     for (const [, init] of http.mock.calls) expect(JSON.parse(String(init?.body))).toEqual({ body: '***' });

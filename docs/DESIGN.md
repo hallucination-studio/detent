@@ -330,7 +330,7 @@ erDiagram
     }
 ```
 
-`delivery_executions` 使用 InnoDB，与 Core 外键使用相同的 `utf8mb4_bin` 排序规则。共享池初始化完成后登记提交时的角色、目标资产、Playbook 和合并 SHA。`(session_id, jumpserver_job_id)` 唯一标识会话中的任务，`(session_id, created_at)` 支持按时间列出审计记录。结果查询保存状态与摘要，首次进入 SUCCESS 或 FAILED 时保存毫秒级完成时间。`/status` 在 MR 摘要和待审批行之间显示执行记录、审批单 ID 和 JumpServer 详情链接。
+`delivery_executions` 使用 InnoDB，与 Core 外键使用相同的 `utf8mb4_bin` 排序规则。共享池初始化完成后登记提交时的角色、目标资产、Playbook 和合并 SHA。`(session_id, jumpserver_job_id)` 唯一标识会话中的任务，`(session_id, created_at)` 支持按时间列出审计记录。结果查询保存状态与摘要，首次进入 SUCCESS 或 FAILED 时保存毫秒级完成时间。`/status` 在状态和 MR 摘要下显示已有执行记录、关联审批单与任务链接。
 
 ---
 
@@ -417,7 +417,7 @@ description: 标准仓库发版流程
    - `SessionOrchestrator.run()` 在解析 `profile` 后、**克隆沙箱与调用 Claude 之前**检测 `profile.blockedMessage`：若存在则直接将引导说明发布到 Issue 评论、置状态为 `IDLE`（保留原 `permissionMode` 以便用户补齐配置或打标签后无缝继续）并结束本轮，**零 Token 消耗、不让 AI 盲猜报错**。
 
 3. **逻辑/能力缺失时的 Issue 友好引导（4 种场景）**：
-   - **场景 1（SOP 依赖的能力包未启用 / 为空）**：例如命中 `workflows/env-change.md`（`requires: [jumpserver]`）但未配置 JumpServer → 直接在 Issue 提示缺失能力名 + `setupHint`，并列出两条可操作路径（补齐服务端配置，或编辑 Hub 对应 `workflows/*.md` 改写流程 / 切换为当前可用的其他工作流标签）。
+   - **场景 1（SOP 依赖的能力包未启用 / 为空）**：例如命中 `workflows/env-change.md`（`requires: [jumpserver]`）但未配置 JumpServer → 直接在 Issue 提示缺失能力名。正文列出已就绪的流程与标签，管理员配置提示折叠展示。
    - **场景 2（Issue 未匹配到任何 SOP）**：Hub 仓库存在 `workflows/`，但 Issue 无匹配标签且无 `default: true` 流程 → 直接在 Issue 列出 Hub 当前全部可用流程（标签、文件、说明），指导用户加标签或新增 `workflows/<name>.md`。
    - **场景 3（多条冲突流程标签同时命中）**：同一 Issue 同时打了多个非只读流程标签（如同时打 `delivery::release` 与 `delivery::env-change`）→ 在 Issue 提示仅保留一个目标流程标签，避免歧义。
    - **场景 4（老 Hub 仓库尚无 `workflows/` 目录）**：平滑兼容回退——仅启用服务端实际已配置的能力包，按 `CLAUDE.md` 工作（若无 `jumpserver` 能力则绝不注入 JumpServer/Ansible 提示词）。
@@ -470,7 +470,7 @@ Core 从 Hub 默认分支递归读取 `agents/` 和 `skills/`。`agents/<id>/AGE
 
 1. Delivery 每轮重读 Hub 定义及 Issue 标签。匹配标签时按确定性规则选择，唯一的只读匹配优先于其他匹配，其余冲突返回引导。缺失 `requires` 时在创建沙箱前返回能力名、配置指引和就绪选项。
 2. 无匹配标签的普通轮次使用同一个 `DecisionClient` 评估 `hub_agent_routing`。输入包括工单标题、描述、非状态标签和最多四条去重后的近期用户消息，排除 Bot 与系统评论。三问校验是否存在唯一候选、`clear_match` 是否达到 `JEV_ROUTING_THRESHOLD`（默认 0.8）及 `ambiguity` 是否不超过 1.2。
-3. 高置信度且能力已就绪时，编排器在当前租约内先将权限模式持久化为 `plan`，再写回 Agent 标签，本轮评论附路由提示。后续轮次按该标签选择。路由未命中、低置信度或 Jev 不可用时可回退到默认 Agent。没有默认 Agent 时，Triage 以只读模式运行，无扩展能力工具，询问缺失信息并回到 `IDLE`。用户补充信息后可再次路由。
+3. 高置信度且能力已就绪时，编排器在当前租约内先将权限模式持久化为 `plan`，再写回 Agent 标签，本轮评论附路由提示。后续轮次按该标签选择。候选需要未开通能力且没有更强的就绪候选时直接返回同一张能力卡。其余不确定的请求可回退到默认 Agent。没有默认 Agent 时，Triage 以只读模式运行，无扩展能力工具，区分已就绪与未开通的能力，最多询问三个必要问题并回到 `IDLE`。用户补充信息后可再次路由。
 4. 具备项目普通审批权限的成员可用 `/use <id 或标签> [补充需求]` 切换。旧轮次停止后，编排器在租约内作废待审单，先持久化 Plan 重置，再替换 Agent 标签并启动新轮次。`purpose === 'approval'` 只按现有标签或默认 Agent 重读授权，无 Jev 调用或 Triage 轮次。
 
 ### 7.3 声明式外部 MCP 能力包
@@ -583,3 +583,6 @@ Issue 和 MR 的工具调用均通过 NoteStreamer 写入折叠轨迹。双目�
 Hub Issue 的 `/help` 在成员检查后从默认分支加载 Agent，按当前能力包显示就绪状态。MR 的帮助接受 Bot 指派或显式提及，沿原讨论串回复。两者均无模型调用、租约或会话写入。首条 MR 工作评论用持久化的 active_note_id 区分首次接管与后续轮次。
 
 `agents/onboarding/AGENT.md` 请求 `gitlab-onboarding`。只读工具按项目或群组查询 Bot 有效权限，在有管理权限时核验目标事件。写工具先验证全部目标均达到 Maintainer，再由生产审批人审核范围、回调地址及事件。执行时重读目标和权限，以同一 URL 更新或创建 Webhook。服务端从 `DETENT_PUBLIC_URL` 生成回调地址，只在 GitLab API 请求中使用 Webhook 密钥。Claude 通过单轮回环连接调用 Messages API，由父进程添加上游认证头。
+
+
+Issue 的 `/help` 按当前 Hub 定义列出场景、标签和就绪状态。Issue 与 MR 的 `/status` 显示中文状态和下一步操作。`WAITING_TOOL` 下的普通回复绑定当前 `ASK_USER` 审批记录，校验身份后按原热等待或冷恢复路径继续。其他工具仍需审批卡决定。审批解析器接收待审类型与工具名；已移出流程的操作无法通过更高权限放行。生产审批拒绝提示先核验普通成员权限，进程内按审批单和用户去重，最多保留 1024 条记录。

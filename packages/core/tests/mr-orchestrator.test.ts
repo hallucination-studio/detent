@@ -137,7 +137,7 @@ it('checks out the assigned source, registers only MR tools, resolves a real sha
     expect(await t.gate.preflight('Edit', { file_path: path.join(dir, 'tracked') })).toMatchObject({ behavior: 'allow' });
     await writeFile(path.join(dir, 'tracked'), 'resolved');
     await push(tree.directoryName);
-    t.progress('detent_commit_and_push');
+    t.progress('提交推送分支');
     return 'CI fixed';
   });
   expect((await send(opened)).statusCode).toBe(202);
@@ -146,7 +146,7 @@ it('checks out the assigned source, registers only MR tools, resolves a real sha
   expect(await git(['rev-parse', 'main'], remote, root)).toBe(targetBefore);
   expect(await git(['rev-parse', 'feature^2'], remote, root)).toBe(targetBefore);
   expect(gitlab.updateMergeRequestNote).toHaveBeenCalledWith(2, 1, expect.any(Number),
-    expect.stringMatching(/CI fixed[\s\S]*<details><summary>🛠️ 已执行 1 个步骤[\s\S]*detent_commit_and_push[\s\S]*<\/details>/));
+    expect.stringMatching(/CI fixed[\s\S]*<details><summary>📎 执行记录（1 步）[\s\S]*提交推送分支[\s\S]*<\/details>/));
   expect(gitlab.syncIssueStatusLabel).not.toHaveBeenCalled();
   expect(await readdir(config.ephemeralRoot)).toEqual([]);
 });
@@ -330,6 +330,29 @@ it.each([0, 10000])('binds MR emoji decisions to the approval note and handles t
   expect(gitlab.syncIssueStatusLabel).not.toHaveBeenCalled();
 });
 
+it('accepts an authorized plain-text MR answer to the pending question and resumes in the discussion', async () => {
+  const { gitlab, repo, run, send, session } = await setup();
+  const questions = [{ question: 'Target branch?' }];
+  run.mockImplementationOnce(async turn => {
+    await turn.gate.canUseTool('AskUserQuestion', { questions });
+    return 'question';
+  }).mockImplementationOnce(async turn => {
+    expect(await turn.gate.canUseTool('AskUserQuestion', { questions })).toMatchObject({
+      behavior: 'allow', updatedInput: { answers: { 'Target branch?': 'main' } },
+    });
+    return '已确认 main';
+  });
+  await send(opened);
+  const s = await session();
+  const pending = (await repo.getLatestPendingApproval(s.id))!;
+  await send(note('/status', { discussion_id: 'answer' }));
+  expect(gitlab.createMergeRequestDiscussionNote).toHaveBeenCalledWith(2, 1, 'answer', expect.stringContaining('💬 **等待你的确认**'));
+  await send(note('main', { discussion_id: 'answer' }));
+  expect(await repo.getApproval(pending.id)).toMatchObject({ status: 'APPROVED', decisionComment: 'main' });
+  expect((await session()).status).toBe('IDLE');
+  expect(gitlab.updateMergeRequestDiscussionNote).toHaveBeenCalledWith(2, 1, 'answer', expect.any(Number), '已确认 main');
+});
+
 it('handles MR plan, reject, approve, abort, status and reset without touching the same-numbered Hub issue', async () => {
   const { mr, gitlab, repo, run, send, session } = await setup();
   mr.target_project_id = mr.source_project_id = 1;
@@ -346,7 +369,7 @@ it('handles MR plan, reject, approve, abort, status and reset without touching t
   expect((await session()).permissionMode).toBe('default');
   await command('/abort');
   await command('/status');
-  expect(gitlab.createMergeRequestDiscussionNote).toHaveBeenCalledWith(1, 1, 'conversation', 'IDLE');
+  expect(gitlab.createMergeRequestDiscussionNote).toHaveBeenCalledWith(1, 1, 'conversation', expect.stringContaining('💤 **待命**'));
   await command('/reset');
   expect(await session()).toMatchObject({ status: 'IDLE', permissionMode: 'default', id: s.id });
   expect((await session()).claudeSessionId).not.toBe(s.claudeSessionId);
@@ -354,7 +377,7 @@ it('handles MR plan, reject, approve, abort, status and reset without touching t
 });
 
 it.each(['close', 'merge'])('stops an active turn, expires approvals and archives its source worktree on %s', async action => {
-  const { repo, run, send, post, session, link } = await setup();
+  const { repo, run, send, post, session, link, gitlab } = await setup();
   await link();
   run.mockImplementationOnce(async t => new Promise((_resolve, reject) => {
     t.controller.signal.addEventListener('abort', () => reject(t.controller.signal.reason), { once: true });
@@ -367,6 +390,9 @@ it.each(['close', 'merge'])('stops an active turn, expires approvals and archive
   expect(await session()).toMatchObject({ status: 'DONE', lockedByPod: null });
   expect(await repo.findWorktree(s.id, 2, 'feature')).toMatchObject({ status: 'ARCHIVED' });
   expect((await repo.getApproval(pending.id))?.status).toBe('EXPIRED');
+  await send({ ...note('/status'), merge_request: { iid: 1, state: action === 'close' ? 'closed' : 'merged' } });
+  expect(gitlab.createMergeRequestNote).toHaveBeenLastCalledWith(2, 1, '✅ **已完成**');
+  expect(run).toHaveBeenCalledOnce();
   if (action === 'close') {
     expect(await repo.findMergeRequest(2, 1)).toMatchObject([{ mrState: 'closed' }]);
     await send({ ...opened, object_attributes: { ...opened.object_attributes, action: 'reopen' } });

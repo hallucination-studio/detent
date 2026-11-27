@@ -13,7 +13,7 @@ import type {
 } from '../types.js';
 import { redactGitUrl, type GitLabClient } from '../gitlab/client.js';
 import type { WebhookEvent } from '../gitlab/webhook.js';
-import { escapeTableCell, NoteStreamer, renderPlanApprovalCard, renderSummary } from '../gitlab/note-streamer.js';
+import { escapeTableCell, NoteStreamer, recoveryHint, renderPlanApprovalCard, renderStatus, renderSummary, waitingToolGuidance } from '../gitlab/note-streamer.js';
 import { EphemeralSandbox, type TurnSandbox, type WorkspaceGitLab } from '../workspace/ephemeral-sandbox.js';
 import { WorkspaceTools } from '../workspace/mcp-tools.js';
 import { configuredSecrets } from '../gitlab/redact.js';
@@ -30,13 +30,14 @@ import { checkIssueClosure, createCloseIssueTool } from './close-issue.js';
 import { notifyHook } from './lifecycle.js';
 
 export { SessionBusy } from './turn-runtime.js';
-const helpHint = '> 💡 发送 `/help` 可随时查看当前工作区全部可用 Agent 与指令。';
+const helpHint = '> 💡 发送 `/help` 可随时查看当前工作区的能力与指令。';
 type Client = WorkspaceGitLab &
   Pick<
     GitLabClient,
     'createIssueNote' | 'updateIssueNote' | 'syncIssueStatusLabel' | 'getIssue' | 'hasApprovalPermission'
   > & Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile' | 'listIssueNotes' | 'updateIssueLabels' | 'isBotUser' | 'closeIssue'>>;
 export class SessionOrchestrator extends TurnRuntime {
+  private readonly denialNotices = new Set<string>();
   private readonly decision?: DecisionClient;
   constructor(
     config: AppConfig,
@@ -51,7 +52,8 @@ export class SessionOrchestrator extends TurnRuntime {
   private getCapabilities() {
     return this.extensions.capabilities ?? [];
   }
-  private resolveTurnProfile(session: IssueSessionRow, context: { purpose: 'turn' | 'approval'; prompt?: string }) {
+  private resolveTurnProfile(session: IssueSessionRow, context: { purpose: 'turn'; prompt: string } |
+    { purpose: 'approval'; approval: Pick<ApprovalRequestRow, 'approvalType' | 'toolName'> }) {
     return this.extensions.resolveTurnProfile?.({
       session, repo: this.repo, gitlab: this.gitlab, decision: this.decision, capabilities: this.getCapabilities(), ...context,
     });
@@ -144,12 +146,12 @@ export class SessionOrchestrator extends TurnRuntime {
       const profile = await this.resolveTurnProfile(s, { purpose: 'turn', prompt });
       controller.signal.throwIfAborted();
       if (profile?.blockedMessage?.trim()) {
-        await channel.createNote(redactGitUrl(profile.blockedMessage + '\n\n' + helpHint, this.config.jevApiKey));
+        await channel.createNote(redactGitUrl(profile.blockedMessage + '\n\n' + helpHint, configuredSecrets(this.config)));
         await this.state(s, 'IDLE');
         return;
       }
       const plan = s.permissionMode === 'plan';
-      const routingPrefix = profile?.routingNotice ? redactGitUrl(profile.routingNotice, this.config.jevApiKey) + '\n\n' : '';
+      const routingPrefix = profile?.routingNotice ? redactGitUrl(profile.routingNotice, configuredSecrets(this.config)) + '\n\n' : '';
       await this.state(s, plan ? 'PLANNING' : 'CODING', s.permissionMode);
       const note = await channel.createNote(
         plan ? '正在分析需求…' : '正在执行已审批方案…',
@@ -245,7 +247,7 @@ export class SessionOrchestrator extends TurnRuntime {
         issueClosed = true;
         await this.state(s, 'DONE');
       } else {
-        await streamer.flush(routingPrefix + result + (profile?.name === 'triage' ? '\n\n' + helpHint : ''));
+        await streamer.flush(routingPrefix + result);
         await this.state(s, 'IDLE');
       }
       if (s.recoveryAttempts) {
@@ -261,7 +263,7 @@ export class SessionOrchestrator extends TurnRuntime {
       if (issueClosed || !active.ownsLease) throw cause;
       if (sandbox) await host.checkpoint(sandbox, s.id);
       if (cause instanceof ColdHold) {
-        await streamer?.flush('等待工具审批，审批后将恢复会话。');
+        await streamer?.flush(cause.message);
         return;
       }
       await this.expire(s);
@@ -271,7 +273,7 @@ export class SessionOrchestrator extends TurnRuntime {
         return;
       }
       await this.state(s, 'FAILED');
-      const message = redactGitUrl('本轮执行失败：' + (error instanceof Error ? error.message : '未知错误'), this.config.jevApiKey);
+      const message = redactGitUrl('本轮执行失败：' + (error instanceof Error ? error.message : '未知错误'), configuredSecrets(this.config)) + recoveryHint;
       if (streamer) await streamer.flush(message);
       else await this.gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, message);
     } finally {
@@ -295,19 +297,23 @@ export class SessionOrchestrator extends TurnRuntime {
       const { agents } = await loadHubAgents(this.gitlab, project, this.config.gitlabHubDefaultBranch);
       const menu = agents.map(agent => {
         const missing = missingHubCapabilities(agent, this.getCapabilities());
-        const status = missing.length ? '⚠️ 缺少能力包: ' + missing.join('、') : '✅ 就绪';
-        return '- ' + escapeTableCell(agent.label, 'code') + ' · ' + escapeTableCell(agent.description) + ' · ' + status;
+        const status = missing.length ? '⚪ 未开通（待配置 ' + escapeTableCell(missing.join('、')) + '）' : '✅ 已就绪';
+        return `| ${escapeTableCell(agent.description)} | ${escapeTableCell(agent.label, 'code')} | ${status} |`;
       });
       await this.gitlab.createIssueNote(project, iid, [
-        '### 工作区 Agent', menu.join('\n') || 'Hub 尚未配置 Agent。',
-        '`/help` 查看帮助 · `/status` 查询进度 · `/plan` 先审方案 · `/use <agent>` 切换 Agent',
-        '审批卡上点 👍 / 👎，或发送 `/approve` / `/reject`。用 `/abort` 中止当前轮次，`/reset` 重置对话。',
+        '### 可用能力',
+        menu.length === 0 ? '当前工作区尚未登记能力。' : ['| 能力场景 | 触发方式 / 标签 | 状态 |', '| :--- | :--- | :--- |', ...menu].join('\n'),
+        '`/status` 查看进度 · `/plan` 拟定方案 · `/use <agent>` 切换能力',
+        '审批卡上点 👍 批准或 👎 拒绝 · `/abort` 中止 · `/reset` 重置会话',
       ].join('\n\n'));
       return;
     }
     const s = await this.repo.getSessionByIssue(project, iid);
     if (!s) return;
-    if (intent.type === 'STATUS') return this.replyStatus(s);
+    if (intent.type === 'STATUS') {
+      if (await this.gitlab.hasApprovalPermission(project, intent.userId)) await this.replyStatus(s);
+      return;
+    }
     if (
       ['RESET', 'ABORT', 'USE'].includes(intent.type) &&
       !(await this.gitlab.hasApprovalPermission(project, intent.userId))
@@ -317,7 +323,11 @@ export class SessionOrchestrator extends TurnRuntime {
     if (intent.type === 'APPROVE' || intent.type === 'REJECT') return this.handleApprovalIntent(s, intent);
     if (intent.type !== 'PROMPT') return this.handleSessionCommand(s, intent);
     if (s.status === 'WAITING_TOOL') {
-      await this.channel(s).createNote('有工具请求正在等待审批，请回复 /approve 或 /reject <原因>。');
+      const pending = await this.repo.getLatestPendingApproval(s.id);
+      if (pending?.status === 'PENDING' && pending.approvalType === 'ASK_USER')
+        return this.handleApprovalIntent(s, { ...intent, type: 'APPROVE', targetNoteId: pending.gitlabNoteId ?? undefined }, pending);
+      if (pending?.approvalType === 'TOOL_USE' && await this.gitlab.hasApprovalPermission(project, intent.userId))
+        await this.channel(s).createNote(waitingToolGuidance);
       return;
     }
     if (s.status === 'DONE') return;
@@ -345,29 +355,43 @@ export class SessionOrchestrator extends TurnRuntime {
       s.hubProjectId,
       s.hubIssueIid,
       [
-        s.status,
+        renderStatus(s.status, pending),
         await this.summary(s.id),
         (await this.extensions.renderStatusExtra?.(s))?.trim(),
-        pending ? '待审批 ' + pending.approvalType + ' ' + pending.id : '无待审批项',
       ].filter(Boolean).join('\n\n'),
     );
   }
-  private async handleApprovalIntent(s: IssueSessionRow, intent: ParsedUserIntent) {
-    const pending =
+  private async handleApprovalIntent(s: IssueSessionRow, intent: ParsedUserIntent, question?: ApprovalRequestRow) {
+    const pending = question ?? (
       intent.targetNoteId !== undefined
         ? await this.repo.getApprovalByNoteId(s.id, intent.targetNoteId)
-        : await this.repo.getLatestPendingApproval(s.id);
+        : await this.repo.getLatestPendingApproval(s.id));
     if (pending?.status !== 'PENDING') return;
-    const profile = await this.resolveTurnProfile(s, { purpose: 'approval' });
+    const { approvalType, toolName } = pending;
+    const profile = await this.resolveTurnProfile(s, { purpose: 'approval', approval: { approvalType, toolName } });
     if (profile?.blockedMessage?.trim()) return;
     const { approvalProjectId } = this.channel(s);
     const permitted = profile?.canApprove
       ? await profile.canApprove({
           projectId: approvalProjectId, userId: intent.userId, username: intent.username,
-          approvalType: pending.approvalType, toolName: pending.toolName,
+          approvalType, toolName,
         })
       : await this.gitlab.hasApprovalPermission(approvalProjectId, intent.userId);
-    if (!permitted) return;
+    if (!permitted) {
+      if (intent.type !== 'APPROVE' || !profile?.canApprove ||
+          !await this.gitlab.hasApprovalPermission(approvalProjectId, intent.userId)) return;
+      const key = pending.id + ':' + intent.userId;
+      if (this.denialNotices.has(key)) return;
+      this.denialNotices.add(key);
+      if (this.denialNotices.size > 1024) this.denialNotices.delete(this.denialNotices.values().next().value!);
+      try {
+        await this.channel(s).createNote('> 🔒 该操作需要生产审批权限（Maintainer 及以上），请邀请项目负责人在审批卡上点 👍 放行。');
+      } catch (error) {
+        this.denialNotices.delete(key);
+        throw error;
+      }
+      return;
+    }
     await this.applyApproval(s, pending, intent, (session, active, prompt, decision) => this.run(session, active, prompt, decision));
   }
   private async handleUseAgent(s: IssueSessionRow, intent: ParsedUserIntent) {

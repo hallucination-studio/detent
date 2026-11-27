@@ -202,7 +202,7 @@ it('lists full paths and invalid files and explains missing capabilities with re
   const missing = matchHubAgent([ready, needs], ['agent::deploy.v1'], [capability]);
   expect(missing).toMatchObject({ kind: 'blocked', agent: needs });
   if (missing.kind !== 'blocked') throw Error('Expected missing capabilities');
-  for (const line of [agentFile, 'checks：Configure CHECKS_TOKEN.', 'missing：服务端未注册该能力包', '已就绪的Agent标签：audit'])
+  for (const line of ['### ⚪ 当前能力尚未开通', 'checks：Configure CHECKS_TOKEN.', 'missing：请在服务端配置并启用此能力', '`audit`'])
     expect(missing.message).toContain(line);
 });
 

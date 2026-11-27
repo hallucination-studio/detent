@@ -39,7 +39,7 @@ It is built as a **two-package layered monorepo**:
 - **Dual-Layer Approval Gates (and Three-Gate Production Compliance)**
   - **Plan Gate (Macro)**: New Issues start in read-only `plan` mode to explore code and post an implementation plan card. Coding begins only after a human reacts with 👍 or comments `/approve`.
   - **Runtime Hook Gate (Micro)**: Integrates with Claude Code `canUseTool`. Routine file reads/writes and built-in `detent_*` tools run smoothly, while risky operations (`Bash` commands requiring review, `AskUserQuestion`) pause and post an approval card controlled via 👍/👎 or `/approve` / `/reject`.
-  - **Production Hard Guards (`@detent/delivery`)**: Before running an Ansible job via JumpServer, code-level guards enforce that the target MR is `merged` with a matching `merge_commit_sha`, enforce production approver lists/access levels, and isolate read-only vs. execution credentials.
+  - **Production Hard Guards (`@detent/delivery`)**: Before running an Ansible job via JumpServer, code-level guards enforce that the target MR is `merged` with a matching `merge_commit_sha`, enforce production approver lists/access levels, and restrict execution to authorized workflows.
 - **100% Stateless Pods (Zero PVC / Zero Local Disk)**
   Each turn executes inside an ephemeral `/tmp/detent-sandboxes/turn-<uuid>` directory that is deleted (`rm -rf`) immediately after the turn finishes. Across turns, pod restarts, or horizontal scaling, Detent hydrates Claude `.jsonl` history from MySQL and reconstructs multi-repo workspaces via shallow clones plus stored binary `uncommitted_diff` patches.
 - **Append-Only MySQL Persistence (Zero Write Amplification)**
@@ -94,7 +94,7 @@ Prepare these four inputs. Supply secrets through your local environment or secr
 | Optional | What to prepare |
 | --- | --- |
 | Jev | `JEV_PROVIDER` (`bailian` or `typesafe`) and `JEV_API_KEY`. Bailian also needs `JEV_BASE_URL`. |
-| JumpServer | `JUMPSERVER_BASE_URL` and separate `JUMPSERVER_READONLY_TOKEN` and `JUMPSERVER_JOB_TOKEN` credentials, or an access key pair per role |
+| JumpServer | Hub `jumpserver.base_url` and one AccessKey supplied through `DETENT_SECRET_JMS_AK_ID` and `DETENT_SECRET_JMS_AK_SECRET` |
 
 Copy this prompt into your coding agent from the repository checkout.
 
@@ -116,7 +116,7 @@ After installation, open a Hub Issue with the `onboarding` template or the `agen
 - **MySQL 8.0**
 - **GitLab CE v18.3.0+** (or compatible GitLab instance)
 - **Anthropic API Key** (or compatible gateway via `ANTHROPIC_BASE_URL`)
-- *(Optional, for `@detent/delivery`)* **JumpServer** with separate read-only and Job Center credentials
+- *(Optional, for `@detent/delivery`)* **JumpServer** with one AccessKey authorized for inspection and Job Center jobs
 
 ### 1. Install & Build
 
@@ -158,7 +158,7 @@ Minimum required variables for `@detent/core`:
 
 Local Bash uses deterministic hard gates, a static allowlist, then optional System One assessment for eligible commands. A confident read-only result can run in any Bash-enabled mode. Coding also permits low-impact workspace development. Uncertain results and provider failures require a human in coding and deny execution in plan or readonly mode. Accepted decisions appear in the Issue trace.
 
-Set `JEV_PROVIDER` to `bailian`, `typesafe`, or `custom` to enable assessment. Bailian's Decision Model API requires the workspace endpoint and a key. The default is `off`. The server keeps the key out of Claude's environment, logs, and Issue notes. Delivery shares the client for readonly inspection, with a hard command filter, asset checks, and the readonly account. Plan, release, production job, and approval-based closure retain human authorization. [Provider examples](./.env.example)
+Set `JEV_PROVIDER` to `bailian`, `typesafe`, or `custom` to enable assessment. Bailian's Decision Model API requires the workspace endpoint and a key. The default is `off`. The server keeps the key out of Claude's environment, logs, and Issue notes. Delivery shares the client for readonly inspection, with a hard command filter, asset checks, and per-asset account authorization. Plan, release, production job, and approval-based closure retain human authorization. [Provider examples](./.env.example)
 
 ### 3. Run the Service
 
@@ -273,10 +273,11 @@ Jev can route an unlabeled Issue or ask for clarification. If a selected SOP req
 
 | Variable | Purpose & Default |
 | :--- | :--- |
-| `JUMPSERVER_BASE_URL` / `JUMPSERVER_ORG_ID` | Enables the JumpServer MCP tools. Organization ID is optional. |
-| `JUMPSERVER_READONLY_TOKEN` or `JUMPSERVER_READONLY_ACCESS_KEY_ID` + `JUMPSERVER_READONLY_ACCESS_KEY_SECRET` | Dedicated credentials for asset lookup and read-only inspection. |
-| `JUMPSERVER_JOB_TOKEN` or `JUMPSERVER_JOB_ACCESS_KEY_ID` + `JUMPSERVER_JOB_ACCESS_KEY_SECRET` | Physically separate credentials for Job Center execution. |
-| `JUMPSERVER_READONLY_ACCOUNT` / `JUMPSERVER_TIMEOUT_MS` | Inspection system account (default: `readonly`) and HTTP timeout (default: `30000` ms). |
+| `DETENT_SECRET_JMS_AK_ID` and `DETENT_SECRET_JMS_AK_SECRET` | Recommended service secrets for the shared Hub AccessKey. |
+| `JUMPSERVER_BASE_URL` / `JUMPSERVER_ORG_ID` | Legacy environment-only service URL and optional organization ID. |
+| `JUMPSERVER_READONLY_TOKEN` or `JUMPSERVER_READONLY_ACCESS_KEY_ID` + `JUMPSERVER_READONLY_ACCESS_KEY_SECRET` | Legacy role credentials for asset lookup and read-only inspection. |
+| `JUMPSERVER_JOB_TOKEN` or `JUMPSERVER_JOB_ACCESS_KEY_ID` + `JUMPSERVER_JOB_ACCESS_KEY_SECRET` | Legacy role credentials for Job Center execution. |
+| `JUMPSERVER_READONLY_ACCOUNT` / `JUMPSERVER_TIMEOUT_MS` | Optional legacy inspection account and HTTP timeout (default 30000 ms). |
 | `JUMPSERVER_INSPECT_ALLOW_PREFIXES` | Comma-separated allowlisted read-only command prefixes (see [`.env.example`](./.env.example)); arguments are still validated for read-only safety. |
 | `JUMPSERVER_BLOCKED_ASSETS` / `JUMPSERVER_BLOCK_FAILED_PIPELINE` | Blocked asset IDs (default: empty). Failed MR pipelines block execution by default (`false` or `0` to disable). |
 | `DELIVERY_PROD_APPROVERS` | Comma-separated GitLab usernames (case-insensitive) allowed to approve production execution; listed users must also meet `GITLAB_MIN_ACCESS_LEVEL`. |
@@ -329,3 +330,11 @@ detent/
 - **Implementation Plan & Acceptance Criteria**: [`docs/IMPLEMENTATION_PLAN.md`](./docs/IMPLEMENTATION_PLAN.md) *(Chinese)*
 - **AI Agent Guidelines & Architectural Invariants**: [`AGENT.md`](./AGENT.md) *(Chinese)*
 - **Hub Workspace Prompt Template**: [`examples/hub-workspace/CLAUDE.md`](./examples/hub-workspace/CLAUDE.md) *(Chinese)*
+
+### Hub capabilities and server-side secrets
+
+The Hub default branch can define capability packs in `capabilities.json`. Issue turns, approval checks and `/help` read the current file. For external MCP packs, set `type` to `mcp`, choose `http` or `sse`, and specify an HTTP(S) `url`. Use `readonly_tools` to name read-only operations and `approver_tier` to select the approval tier. Other remote tools require approval. Hub administrators control the destinations that receive authentication headers.
+
+Set `DETENT_SECRET_CUSTOM_MCP_TOKEN` in the service environment and reference it with `${secret:CUSTOM_MCP_TOKEN}` inside an MCP header. The JumpServer template uses one `auth` object with `$secret:JMS_AK_ID` and `$secret:JMS_AK_SECRET` for inspection and Ansible. Missing names appear in the setup guidance. The example Hub keeps JumpServer disabled until configured.
+
+A workflow’s `account` takes precedence over the Hub’s `default_account`. With both unset or empty, Detent uses each asset’s first active authorized account in JumpServer order, skipping names that start with `@`. Inspection groups assets by account and combines the results. Ansible requires one account for the entire job. If the first accounts differ, specify a common `account` or submit one job per group. An asset with no eligible account stops the request before submission. [Hub template](examples/hub-workspace/capabilities.json) · [Installation](INSTALL.md#hub-capability-configuration)

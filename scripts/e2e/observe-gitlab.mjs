@@ -14,3 +14,12 @@ subscribe('undici:request:headers', ({ request, response }) => {
 subscribe('http.server.response.finish', ({ request, response }) => {
   if (request.url === '/webhooks/gitlab' && response.statusCode === 202) process.send?.('webhook-accepted');
 });
+
+// Inspect the actual spawn boundary. Only the pass/fail marker leaves the parent process.
+subscribe('tracing:child_process.spawn:start', ({ options }) => {
+  if (!options.args?.some(arg => /claude-code[/\\]cli\.js$/.test(arg))) return;
+  const vault = Object.entries(process.env).filter(([key]) => key.startsWith('DETENT_SECRET_'));
+  const leaked = options.envPairs.some(pair => pair.startsWith('DETENT_SECRET_') || vault.some(([, value]) => value && pair.includes(value)));
+  if (leaked) throw Error('Claude subprocess inherited a vault credential');
+  process.send?.('isolated-claude-env');
+});

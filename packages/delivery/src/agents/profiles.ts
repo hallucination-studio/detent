@@ -33,6 +33,7 @@ function agentProfile(result: ReturnType<typeof matchHubAgent>): WorkflowProfile
   const name = Array.from(agent.id).slice(0, 64).join('');
   return {
     name, readonly, closePolicy: agent.closePolicy,
+    workflow: { account: agent.account, allowPrefixes: agent.allowPrefixes },
     disableBash: readonly || !(agent.allowBash ?? (agent.approverTier === 'standard')),
     enabledExtensionTools: enabledToolNames, extraSystemPrompt: renderAgentSystemPrompt(agent),
     ...(agent.source === 'agents' && { sandboxScope: { agentDir: agent.agentDir, sharedSkills: agent.sharedSkills } }),
@@ -133,6 +134,8 @@ export function createDeliveryTurnProfileResolver(config: DeliveryConfig, option
     function approvalTier({ approvalType, toolName }: NonNullable<ResolverContext['approval']>): WorkflowApproverTier | null {
       if (approvalType === 'PLAN' || toolName === 'Plan') return 'standard';
       if (toolName === 'detent_close_issue' && selected.closePolicy !== 'approve') return null;
+      if (approvalType === 'TOOL_USE' && toolName.includes('__') && selected.enabledExtensionTools &&
+          !selected.enabledExtensionTools.includes(toolName)) return null;
       const packProdTool = packProdTools.has(toolName);
       if (packProdTool || prodTools.has(toolName)) {
         const enabled = selected.enabledExtensionTools?.includes(toolName) ?? !packProdTool;

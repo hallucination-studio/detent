@@ -45,7 +45,7 @@ const asTool = (name: string) => 'mcp__detent__jms_' + name;
 
 it('validates role-specific configuration and parses list, timeout and pipeline settings', () => {
   expect(loadDeliveryConfig({})).toEqual({
-    enableReleaseTools: true, prodApprovers: [], prodMinAccessLevel: 40, jumpserverTimeoutMs: 30000, jumpserverReadonlyAccount: 'readonly', blockedAssets: [], blockFailedPipeline: true,
+    enableReleaseTools: true, prodApprovers: [], prodMinAccessLevel: 40, jumpserverTimeoutMs: 30000, blockedAssets: [], blockFailedPipeline: true,
     inspectAllowPrefixes: ['systemctl status', 'nginx -t', 'df -h', 'free -m', 'uptime', 'ss -tlnp', 'kubectl get', 'cat /etc/nginx'],
   });
   expect(loadDeliveryConfig({ ...env, JUMPSERVER_TIMEOUT_MS: '4500', JUMPSERVER_READONLY_ACCOUNT: 'audit',
@@ -65,7 +65,6 @@ it('validates role-specific configuration and parses list, timeout and pipeline 
   for (const value of ['false', '0']) expect(loadDeliveryConfig({ JUMPSERVER_BLOCK_FAILED_PIPELINE: value }).blockFailedPipeline).toBe(false);
   expect(() => loadDeliveryConfig({ JUMPSERVER_BASE_URL: 'invalid' })).toThrow();
   expect(() => loadDeliveryConfig({ JUMPSERVER_TIMEOUT_MS: '0' })).toThrow();
-  expect(() => loadDeliveryConfig({ JUMPSERVER_JOB_TOKEN: 'same', JUMPSERVER_READONLY_TOKEN: 'same' })).toThrow('separate');
 });
 
 function http() {
@@ -105,13 +104,14 @@ it('fails before I/O if the required credential is missing, and never changes ro
   await expect(new HttpJumpServerClient(loadDeliveryConfig({ JUMPSERVER_BASE_URL: base })).getJobResult('1')).rejects.toThrow('credentials');
   expect(fetch).not.toHaveBeenCalled();
 
+  reply(['readonly']);
   reply({ id: 'definition', task_id: 'execution' });
   reply({ status: { value: 'success', label: 'Success' }, summary: { ok: ['web01'] } });
   reply({ result: { stdout: 'load average' } });
   expect(await new HttpJumpServerClient(config).runReadonlyInspect(inspect)).toMatchObject({
     jobId: 'execution', status: 'SUCCESS', outputSummary: expect.stringContaining('load average'),
   });
-  expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toEqual({
+  expect(JSON.parse(String(fetch.mock.calls[1][1]?.body))).toEqual({
     instant: true, type: 'adhoc', module: 'shell', args: 'uptime', assets: ['web01'], runas: 'readonly', runas_policy: 'skip', timeout: 30,
   });
   reply({ status: 'running', summary: {} });
@@ -125,11 +125,13 @@ it('fails before I/O if the required credential is missing, and never changes ro
 it.each([3, 4])('runs the SHA-pinned playbook with native job parameters on v%s', async version => {
   const { fetch, reply } = http();
   const files = { 'site-sha/deploy/run.yml': strToU8('- hosts: all'), 'site-sha/roles/test/tasks/main.yml': strToU8('[]') };
+  reply(['@SPEC', 'ops-first', 'root']);
   fetch.mockResolvedValueOnce(new Response(Uint8Array.from(zipSync(files))));
   reply({ id: 'playbook-id' }); reply({ id: 'definition', variable: version === 3 ? undefined : [] }); reply({ task_id: submission.jobId });
   const client = new HttpJumpServerClient(loadDeliveryConfig(env), { gitlabBaseUrl: 'https://git.test', gitlabToken: 'git-token' });
   expect(await client.runAnsibleJob(request)).toEqual(submission);
-  const [archive, upload, job, execution] = fetch.mock.calls;
+  const [lookup, archive, upload, job, execution] = fetch.mock.calls;
+  expect(String(lookup[0])).toBe(base + '/api/v1/perms/users/self/assets/web01/accounts/');
   expect(String(archive[0])).toBe('https://git.test/api/v4/projects/ops%2Fsite/repository/archive.zip?sha=' + sha);
   expect(archive[1]?.mode).toBe('same-origin');
   expect(new Headers(archive[1]?.headers).get('private-token')).toBe('git-token');
@@ -141,25 +143,27 @@ it.each([3, 4])('runs the SHA-pinned playbook with native job parameters on v%s'
   expect(imported['site-sha/roles/test/tasks/main.yml']).toEqual(files['site-sha/roles/test/tasks/main.yml']);
   expect(form.get('scope')).toBe('private');
   expect(String(job[0])).toBe(base + '/api/v1/ops/jobs/');
-  expect(JSON.parse(String(job[1]?.body))).toEqual({ name: expect.stringMatching(/^detent-/), type: 'playbook', playbook: 'playbook-id', assets: ['web01'], comment: 'approved' });
+  expect(JSON.parse(String(job[1]?.body))).toEqual({ name: expect.stringMatching(/^detent-/), type: 'playbook', playbook: 'playbook-id', runas: 'ops-first', runas_policy: 'skip', assets: ['web01'], comment: 'approved' });
   expect(String(execution[0])).toBe(base + '/api/v1/ops/job-executions/');
   expect(JSON.parse(String(execution[1]?.body))).toEqual({
     job: 'definition', parameters: version === 3 ? '{"jms_version":2}' : { jms_version: 2 },
   });
-  for (const [, init] of [upload, job, execution]) {
+  for (const [, init] of [lookup, upload, job, execution]) {
     expect(new Headers(init?.headers).get('authorization')).toBe('Bearer ' + env.JUMPSERVER_JOB_TOKEN);
     expect(new Headers(init?.headers).has('private-token')).toBe(false);
   }
+  reply(['@SPEC', 'ops-first', 'root']);
   fetch.mockResolvedValueOnce(new Response(Uint8Array.from(zipSync(files))));
   await expect(client.runAnsibleJob({ ...request, playbookPath: 'other.yml' })).rejects.toThrow('missing');
-  expect(fetch).toHaveBeenCalledTimes(5);
+  expect(fetch).toHaveBeenCalledTimes(7);
 });
 
 it('redacts GitLab and JumpServer credentials when the playbook archive fetch fails', async () => {
-  const { fetch } = http();
+  const { fetch, reply } = http();
   const gitlabToken = 'git-token"/+';
   const client = new HttpJumpServerClient(loadDeliveryConfig(env), { gitlabBaseUrl: 'https://git.test', gitlabToken });
   const credentials = [gitlabToken, JSON.stringify(gitlabToken), encodeURIComponent(gitlabToken), env.JUMPSERVER_JOB_TOKEN];
+  reply(['ops-first']);
   fetch.mockRejectedValueOnce(Error('Archive fetch failed: ' + credentials.join(' / ')));
   await expect(client.runAnsibleJob(request)).rejects.toMatchObject({ message: 'Archive fetch failed: *** / "***" / *** / ***' });
 });
@@ -255,7 +259,7 @@ it.each(['plan', 'default'] as const)('gates readonly inspection and lists asset
   await expect(gate.invokeExtension(asTool('readonly_inspect'), { asset_ids: ['RESTRICTED'], command: 'uptime' })).rejects.toThrow('黑名单');
   expect(client.runReadonlyInspect).toHaveBeenCalledTimes(safeCommands.length);
   await gate.invokeExtension(asTool('readonly_inspect'), { asset_ids: ['web01'], command: '  systemctl\t status  nginx ' });
-  expect(client.runReadonlyInspect).toHaveBeenLastCalledWith({ assetIds: ['web01'], account: 'readonly', command: 'systemctl status nginx' });
+  expect(client.runReadonlyInspect).toHaveBeenLastCalledWith({ assetIds: ['web01'], account: undefined, command: 'systemctl status nginx' });
   const schema = z.object(tools.find(tool => tool.name === 'jms_readonly_inspect')!.schema);
   expect(schema.safeParse({ asset_ids: ['web01'], command: 'uptime\n' }).success).toBe(false);
   expect(gitlab.createIssueNote).not.toHaveBeenCalled();
@@ -382,7 +386,7 @@ it('evaluates eligible remote diagnostics once, preserves quoted arguments and c
     "ps aux | grep 'two  words'", 'curl -sI http://127.0.0.1/healthz']) {
     await gate.invokeExtension(tool, { asset_ids: ['web01'], command });
     expect(decide.mock.lastCall?.[0]).toEqual({ surface: 'remote_jumpserver_readonly_inspect', command });
-    expect(client.runReadonlyInspect).toHaveBeenLastCalledWith({ assetIds: ['web01'], account: 'readonly', command });
+    expect(client.runReadonlyInspect).toHaveBeenLastCalledWith({ assetIds: ['web01'], account: undefined, command });
   }
   expect(decide).toHaveBeenCalledTimes(5);
   await expect(gate.invokeExtension(tool, { asset_ids: ['restricted'], command: 'ss -lntp' })).rejects.toThrow('黑名单');
@@ -393,4 +397,74 @@ it('evaluates eligible remote diagnostics once, preserves quoted arguments and c
   decide.mockRejectedValueOnce(Error('provider timeout'));
   await expect(gate.invokeExtension(tool, { asset_ids: ['web01'], command: 'ss -lntp' })).rejects.toThrow('delivery::env-change');
   expect(client.runReadonlyInspect).toHaveBeenCalledTimes(6);
+});
+
+it('lists real, active accounts in server order and falls back to asset detail only on 404', async () => {
+  const { reply, fetch } = http();
+  const client = new HttpJumpServerClient(loadDeliveryConfig(env));
+  reply({ results: ['@SPEC', { username: '@INPUT', alias: 'input' }, { username: 'disabled', is_active: false },
+    { username: ' ops ' }, 'root', 'ops', { name: 'backup' }, { alias: 'worker' }] });
+  expect(await client.listAssetAccounts('host/id')).toEqual(['ops', 'root', 'backup', 'worker']);
+  expect(String(fetch.mock.calls[0][0])).toBe(base + '/api/v1/perms/users/self/assets/host%2Fid/accounts/');
+  for (const key of ['permed_accounts', 'accounts']) {
+    reply({}, 404);
+    reply({ [key]: ['@USER', 'ubuntu'] });
+    expect(await client.listAssetAccounts('host')).toEqual(['ubuntu']);
+    expect(String(fetch.mock.lastCall?.[0])).toBe(base + '/api/v1/perms/users/self/assets/host/');
+  }
+  reply({}, 403);
+  await expect(client.listAssetAccounts('host')).rejects.toThrow('403');
+  expect(fetch).toHaveBeenCalledTimes(6);
+});
+
+it('rejects unauthorized explicit accounts before any job is submitted', async () => {
+  const { reply, fetch } = http();
+  const client = new HttpJumpServerClient(loadDeliveryConfig(env));
+  for (const call of [() => client.runReadonlyInspect({ ...inspect, account: 'ghost' }),
+    () => client.runAnsibleJob({ ...request, account: 'ghost' })]) {
+    reply(['@INPUT', 'ops-hub', 'audit-ro']);
+    await expect(call()).rejects.toThrow('资产 web01 未授权账号 ghost；可用授权账号：ops-hub、audit-ro');
+  }
+  expect(fetch.mock.calls.every(([, init]) => init?.method === 'GET')).toBe(true);
+});
+
+it('groups inspection by the first active real account and reports every group’s terminal status', async () => {
+  const { reply, fetch } = http();
+  const client = new HttpJumpServerClient(loadDeliveryConfig(env));
+  reply(['@SPEC', { username: 'inactive', is_active: false }, 'ops-first', 'root']);
+  reply(['@INPUT', 'ops-second', 'root']);
+  reply(['ops-first']);
+  for (const [id, status] of [['first', 'success'], ['second', 'failed']]) {
+    reply({ task_id: id });
+    reply({ status, summary: {} });
+    reply({ result: { stdout: id + '-output' } });
+  }
+  const grouped = await client.runReadonlyInspect({ assetIds: ['a', 'b', 'c'], command: 'uptime' });
+  const jobs = fetch.mock.calls.filter(([, init]) => init?.method === 'POST').map(([, init]) => JSON.parse(String(init?.body)));
+  expect(jobs).toEqual([
+    expect.objectContaining({ assets: ['a', 'c'], runas: 'ops-first', runas_policy: 'skip' }),
+    expect.objectContaining({ assets: ['b'], runas: 'ops-second', runas_policy: 'skip' }),
+  ]);
+  expect(grouped).toMatchObject({ status: 'FAILED', groups: [
+    { assetIds: ['a', 'c'], account: 'ops-first', jobId: 'first', status: 'SUCCESS' },
+    { assetIds: ['b'], account: 'ops-second', jobId: 'second', status: 'FAILED' },
+  ], outputSummary: expect.stringMatching(/first-output[\s\S]*second-output/) });
+});
+
+it('requires a common account for playbooks and rejects empty authorizations before submitting any group', async () => {
+  const { reply, fetch } = http();
+  const client = new HttpJumpServerClient(loadDeliveryConfig(env));
+  const assetIds = ['web01', 'web02'];
+  reply(['@SPEC', 'ops-first', 'root']);
+  reply(['@INPUT', 'ops-second', 'root']);
+  await expect(client.runAnsibleJob({ ...request, assetIds })).rejects.toThrow(/共同的 account.*分组执行/);
+  for (const account of [undefined, 'root']) {
+    for (const invoke of [() => client.runReadonlyInspect({ ...inspect, account, assetIds }),
+      () => client.runAnsibleJob({ ...request, account, assetIds })]) {
+      reply(['root']);
+      reply(['@USER', '@ANON', { username: 'root', is_active: false }]);
+      await expect(invoke()).rejects.toThrow('资产 web02 没有可用的真实授权账号');
+    }
+  }
+  expect(fetch.mock.calls.every(([url, init]) => String(url).endsWith('/accounts/') && init?.method === 'GET')).toBe(true);
 });

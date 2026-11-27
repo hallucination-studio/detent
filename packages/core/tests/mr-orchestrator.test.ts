@@ -281,7 +281,7 @@ it('honors first matching ignore, notify, run and semantic rules, including bran
   policy({ branch: 'main', action: 'run' });
   await send({ ...main, object_attributes: { ...main.object_attributes, id: 12 } });
   expect(await repo.getSessionByIssue(config.gitlabHubProjectId, 12)).toMatchObject({ status: 'WAITING_PLAN' });
-  expect(gitlab.getRepositoryFile).toHaveBeenCalledTimes(6);
+  expect(vi.mocked(gitlab.getRepositoryFile).mock.calls.filter(call => (call as unknown[])[1] === 'events.json')).toHaveLength(6);
 });
 
 it('checks fork write permission and uses read-only suggestions while retaining the diff and pipeline tools', async () => {

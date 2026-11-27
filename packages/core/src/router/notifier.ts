@@ -1,3 +1,4 @@
+import { configuredSecrets } from '../gitlab/redact.js';
 import type { AppConfig } from '../config.js';
 import type { DetentExtensions, EventNotification } from '../extensions.js';
 import type { GitLabClient } from '../gitlab/client.js';
@@ -9,7 +10,7 @@ export async function sendEventNotification(gitlab: Pick<GitLabClient, 'createMe
   'createMergeRequestDiscussionNote' | 'updateMergeRequestDiscussionNote' | 'createIssueNote' | 'createCommitComment' | 'createIssue'>, config: AppConfig, notification: EventNotification,
   onNotify?: DetentExtensions['onNotify']) {
   const { target, projectId, issueIid, mrIid, sha, hubIssueLabel } = notification;
-  const body = renderNote(notification.body, config.jevApiKey);
+  const body = renderNote(notification.body, configuredSecrets(config));
   if (target === 'resource' && projectId && mrIid) await createMrChannel(gitlab, projectId, mrIid).createNote(body);
   else if (target === 'resource' && projectId && issueIid) await gitlab.createIssueNote(projectId, issueIid, body);
   else if (target !== 'hub_issue' && projectId && sha) await gitlab.createCommitComment(projectId, sha, body);
@@ -17,5 +18,5 @@ export async function sendEventNotification(gitlab: Pick<GitLabClient, 'createMe
   else await gitlab.createIssue(config.gitlabHubProjectId, {
     title: body.split('\n')[0].slice(0, 255), description: body, labels: hubIssueLabel ? [hubIssueLabel] : [],
   });
-  if (onNotify) await notifyHook(() => onNotify({ ...notification, body }), config.jevApiKey);
+  if (onNotify) await notifyHook(() => onNotify({ ...notification, body }), configuredSecrets(config));
 }

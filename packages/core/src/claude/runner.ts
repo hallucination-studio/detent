@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { ToolStep } from '../gitlab/note-streamer.js';
 import { ToolTrace } from './tool-trace.js';
 import buffer from 'node:buffer';
-import { configuredSecrets, redactGitUrl } from '../gitlab/redact.js';
+import { configuredSecrets, redactGitUrl, scrubJson } from '../gitlab/redact.js';
 import { openModelTransport } from './model-transport.js';
 import type { AppConfig } from '../config.js';
 import { formatInboxMessages } from '../orchestrator/turn-runtime.js';
@@ -63,7 +63,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
       trace.pending(step);
       try {
         const output = await operation(step);
-        const text = JSON.stringify(output, (_key, value) => typeof value === 'string' ? redact(value) : value);
+        const text = JSON.stringify(scrubJson(output, redact));
         trace.update(step, output);
         return { content: [{ type: 'text' as const, text: redact(text ?? '') }] };
       } catch (error) {
@@ -125,8 +125,8 @@ export class SdkClaudeRunner implements ClaudeRunner {
     try {
       let resultText: string | undefined;
       t.controller.signal.throwIfAborted();
-      if (this.config.anthropicApiKey) {
-        model = await openModelTransport(this.config.anthropicBaseUrl ?? 'https://api.anthropic.com', this.config.anthropicApiKey);
+      if (this.config.anthropicApiKey || Object.keys(this.config.secrets).length) {
+        model = await openModelTransport(this.config.anthropicBaseUrl ?? 'https://api.anthropic.com', this.config.anthropicApiKey, secrets);
         env.ANTHROPIC_BASE_URL = model.url;
         env.ANTHROPIC_AUTH_TOKEN = 'detent-local';
       }
@@ -147,7 +147,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
               }
               const items = await drainInbox?.();
               return items?.length ? { hookSpecificOutput: {
-                hookEventName: 'PostToolUse', additionalContext: redact(formatInboxMessages(items, this.config.jevApiKey)),
+                hookEventName: 'PostToolUse', additionalContext: formatInboxMessages(items, secrets),
               } } : {};
             }] }],
           },
@@ -232,7 +232,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
       }
       t.controller.signal.throwIfAborted();
       if (resultText === undefined) throw Error('Claude ended without a result');
-      return resultText;
+      return redact(resultText);
     } catch (error) {
       const original = error instanceof Error ? error.message : String(error);
       const detail = t.controller.signal.aborted ? original : diagnostic.trim() || original;

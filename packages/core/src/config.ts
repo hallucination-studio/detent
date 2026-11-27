@@ -9,6 +9,7 @@ const serviceUrl = z.string().url().refine(value => {
 }, 'Expected an HTTP(S) service URL without credentials, query or fragment');
 
 const ConfigSchema = z.object({
+  secrets: z.record(z.string()),
   port: z.coerce.number().default(3000),
   host: z.string().default('0.0.0.0'),
   podId: z
@@ -63,7 +64,13 @@ const ConfigSchema = z.object({
 export type AppConfig = z.infer<typeof ConfigSchema> & { additionalSecrets?: readonly string[] };
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  const secrets = Object.fromEntries(Object.entries(env).flatMap(([key, raw]) => {
+    const name = /^DETENT_SECRET_([A-Z0-9_]+)$/.exec(key)?.[1];
+    const value = raw?.trim();
+    return name && value ? [[name, value]] : [];
+  }));
   const config = ConfigSchema.parse({
+    secrets,
     port: env.PORT,
     host: env.HOST,
     podId: env.POD_ID,

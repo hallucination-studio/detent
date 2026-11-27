@@ -64,7 +64,7 @@ export function readHubFrontmatter(raw: string, keys: ReadonlySet<string>, stric
       while (i + 1 < end && (!lines[i + 1].trim() || /^ +/.test(lines[i + 1]))) i++;
       value = blockScalar(lines.slice(start, i + 1), style);
     } else {
-      value = key === 'requires' || key === 'shared_skills' ? rawValue : scalar(rawValue, strict);
+      value = ['requires', 'shared_skills', 'allow_prefixes'].includes(key) ? rawValue : scalar(rawValue, strict);
     }
     if (value === undefined) return null;
     fields.set(key, value);

@@ -1,3 +1,4 @@
+import { runHubCapabilities } from './suites/phase5-hub-capabilities.js';
 import assert from 'node:assert/strict';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -113,7 +114,8 @@ async function main() {
     const jms = offlineJumpServer({ ansibleRepo });
     const jmsServer = await serve(jms.handle);
     cleanup.push(jmsServer.close);
-    const { securityReport } = jms;
+    const vaultCanary = randomUUID();
+    const securityReport = jms.securityReport + '\n' + vaultCanary;
     const anthropic = createOfflineAnthropic({ webRepo, apiRepo, ansibleRepo, securityReport });
     const mock = await serve(anthropic.handle);
     cleanup.push(mock.close);
@@ -125,7 +127,7 @@ async function main() {
     cleanup.push(mcpServer.close);
     const capabilitiesFile = join(tmp, 'mcp-capabilities.json');
     await writeFile(capabilitiesFile, JSON.stringify({ capabilities: [{
-      name: 'harbor-sync', approverTier: 'prod', toolPolicies: { check_image_exists: 'readonly' },
+      name: 'static-registry', approverTier: 'prod', toolPolicies: { check_image_exists: 'readonly' },
       transport: { type: 'streamable-http', url: mcpServer.baseUrl + '/mcp', headers: { Authorization: 'Bearer ${HARBOR_SYNC_TOKEN}' } },
     }] }));
     const external = env.E2E_MYSQL_HOST;
@@ -193,7 +195,7 @@ async function main() {
     const releasePath = 'agents/release/AGENT.md';
     const imagePath = 'agents/image-sync/AGENT.md';
     const hubFile = (path: string) => gitlab.getFile(hub, path);
-    const templates = ['README.md', 'CLAUDE.md', 'events.json', imagePath, 'agents/image-sync/skills/mirror-to-harbor/SKILL.md', 'skills/gitlab-mr-conventions/SKILL.md'];
+    const templates = ['README.md', 'CLAUDE.md', 'events.json', 'capabilities.json', imagePath, 'agents/image-sync/skills/mirror-to-harbor/SKILL.md', 'skills/gitlab-mr-conventions/SKILL.md'];
     for (const name of ['audit', 'code-delivery', 'env-change', 'release', 'onboarding'])
       templates.push('agents/' + name + '/AGENT.md', '.gitlab/issue_templates/' + name + '.md');
     for (const path of templates)
@@ -233,7 +235,7 @@ async function main() {
     }
     const observeGet = (path: string, act: () => Promise<unknown>) => observe('/api/v4' + path, act);
     const secrets = [gitlab.adminToken, config.GITLAB_TOKEN, config.GITLAB_WEBHOOK_SECRET, config.ANTHROPIC_API_KEY,
-      'offline-jev-key', mcp.token, jms.readonly, jms.job];
+      vaultCanary, 'offline-jev-key', mcp.token, mcp.hubToken, jms.readonly, jms.job, jms.accessKeyId, jms.accessKeySecret];
     if (password) secrets.push(password);
     function checkSecrets(value: unknown) {
       const body = JSON.stringify(value);
@@ -245,7 +247,8 @@ async function main() {
       assert.equal(config.ANTHROPIC_BASE_URL, mock.baseUrl, 'Claude Code requires the loopback mock');
       const pod = spawn(process.execPath, ['--env-file=' + file, '--import', './scripts/e2e/observe-gitlab.mjs', 'packages/' + service + '/dist/server.js'], {
         env: { ...localEnv, ...settings, POD_ID: id, JEV_PROVIDER: 'bailian',
-          JEV_BASE_URL: jevServer.baseUrl + '/compatible-mode/v1/systemone', JEV_API_KEY: 'offline-jev-key', HARBOR_SYNC_TOKEN: mcp.token },
+          JEV_BASE_URL: jevServer.baseUrl + '/compatible-mode/v1/systemone', JEV_API_KEY: 'offline-jev-key', HARBOR_SYNC_TOKEN: mcp.token, DETENT_SECRET_CUSTOM_MCP_TOKEN: mcp.hubToken,
+          DETENT_SECRET_CANARY: vaultCanary },
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'], detached: true,
       });
       pods.add(pod);
@@ -366,7 +369,9 @@ async function main() {
       await protectedHubInstall(shared, localEnv, tmp, publicUrl);
       await brownfieldOnboarding(shared, localEnv, tmp, publicUrl);
     }
-    await startPod('detent-issue-lifecycles', {}, 'delivery', envFile);
+    await startPod('detent-issue-lifecycles', { DETENT_SECRET_JMS_AUDIT_TOKEN: jms.readonly }, 'delivery', envFile);
+    const hubTemplate = await hubFile('capabilities.json');
+    await runHubCapabilities(shared, jms, jmsServer.baseUrl, hubTemplate);
     await runIssueScenarios({ ...shared, observeWebhook: act => observe('webhook-accepted', act), startPod: id => startPod(id, {}, 'delivery', envFile) });
     await stopPod(true);
     await startPod('detent-post-upgrade');
@@ -378,12 +383,16 @@ async function main() {
     assert.equal(anthropic.getRequests(), requestsBeforeMissing);
     const guidance = (await notes(missing)).map(n => n.body).join('\n');
     assert.match(guidance, /### ⚪ 当前能力尚未开通/);
-    assert.match(guidance, /jumpserver：.*JUMPSERVER_BASE_URL/);
+    assert.match(guidance, /jumpserver：.*jumpserver.base_url/);
     const alternatives = guidance.split('<details>')[0];
     for (const label of ['delivery::release', 'delivery::code', 'agent::image-sync']) assert.ok(alternatives.includes(label));
     assert.deepEqual(jev.routingRequests, []);
     console.log('Missing-capability guidance posted with zero Anthropic requests.');
 
+    await gitlab.upsertFile(hub, 'capabilities.json', JSON.stringify({ 'harbor-sync': {
+      type: 'mcp', transport: 'http', url: mcpServer.baseUrl + '/hub/mcp', approver_tier: 'prod',
+      readonly_tools: ['check_image_exists'], headers: { Authorization: 'Bearer ${secret:CUSTOM_MCP_TOKEN}' },
+    } }), 'Connect Hub-defined MCP pack');
     const imageAgent = await hubFile(imagePath);
     assert.match(imageAgent, /^requires: \[\]$/m);
     assert.match(imageAgent, /^approver_tier: standard$/m);
@@ -436,6 +445,12 @@ async function main() {
     assert.ok(mirrorNotes.some(n => n.body.includes('镜像同步完成，目标为 ' + target_image)));
     assert.ok(mirrorNotes.every(n => !n.body.includes(mcp.token)), 'The MCP Bearer token appeared in an Issue note');
     assert.deepEqual(await readdir(sandbox), []);
+    assert.ok((observed.get('isolated-claude-env') ?? 0) > 0, 'Expected observed SDK subprocess environment');
+    assert.equal(mcp.sessions.size, 0);
+    assert.ok(mcp.closedSessions() >= 3);
+    checkSecrets(mirrorNotes);
+    checkSecrets(await records(mirrored.id, 'session_messages'));
+    console.log('Stage 15 branch 7 passed: Hub MCP bearer, tool results, traces, transcripts and production approval.');
     console.log('Triage clarified and routed image-sync. The scoped Skill and MCP tools ran with production approval.');
 
     const code = await openIssue('Deliver hello.txt', 'Update ' + webRepo + ' and ' + apiRepo, 'delivery::code');
@@ -627,11 +642,21 @@ async function main() {
       console.log('Verified live ' + workflow + ' SOP, production approvals and closed Issue.');
     }
     await stopPod();
-    await startPod('detent-pod-1', {}, 'delivery', envFile);
+    const sharedKeyEnv = { DETENT_SECRET_JMS_AK_ID: jms.accessKeyId, DETENT_SECRET_JMS_AK_SECRET: jms.accessKeySecret };
+    const sharedCapabilities = JSON.parse(hubTemplate);
+    sharedCapabilities.jumpserver.base_url = jmsServer.baseUrl;
+    assert.equal(sharedCapabilities.jumpserver.default_account, '');
+    for (const agent of ['audit', 'env-change']) assert.doesNotMatch(await hubFile('agents/' + agent + '/AGENT.md'), /^account:/m);
+    await gitlab.upsertFile(hub, 'capabilities.json', JSON.stringify(sharedCapabilities), 'Configure single-key JumpServer');
+    const baseline = jms.runAs.length;
+    await startPod('detent-pod-1', sharedKeyEnv);
     const inspection = await openIssue('Diagnose nginx on web01', '', 'delivery::audit');
     const inspected = await done(inspection);
     assert.deepEqual(await records(inspected.id, 'approval_requests'), []);
-    assert.deepEqual(jms.inspections, ['ss -lntp']);
+    assert.deepEqual(jms.runAs.slice(baseline), [
+      { assets: ['web01'], account: 'ops-first', command: 'ss -lntp', principal: 'shared' },
+      { assets: ['web02'], account: 'ops-second', command: 'ss -lntp', principal: 'shared' },
+    ]);
     assert.ok(jev.requests.includes('ss -lntp') && jev.requests.length >= 2);
     assert.ok((await notes(inspection)).some(n => n.body.includes('Diagnostic report: nginx is active on web01.')));
 
@@ -644,11 +669,11 @@ async function main() {
     const [plan] = await records(id, 'approval_requests');
     assert.equal(plan.approval_type, 'PLAN');
     await pendingCard(change, 'Plan', ['### 📋 实施方案审批']);
-    assert.equal(jms.inspections.length, 2);
+    assert.equal(jms.inspections.length, 3);
     assert.deepEqual(await readdir(sandbox), []);
     console.log('Plan persisted. Restarting the delivery pod.');
     await stopPod();
-    await startPod('detent-pod-2', {}, 'delivery', envFile);
+    await startPod('detent-pod-2', sharedKeyEnv);
     await award(change, plan, 'dev');
     const coding = await state(change, 'IDLE');
     assert.equal(coding.claude_session_id, first.claude_session_id);
@@ -697,7 +722,8 @@ async function main() {
     assert.equal(decision.decided_by, gitlab.sreUsername);
     assert.equal(decision.status, 'APPROVED');
     assert.deepEqual(jms.uploads, [sha]);
-    assert.deepEqual(jms.inspections, ['ss -lntp', 'systemctl status nginx', 'systemctl status nginx']);
+    assert.deepEqual(jms.inspections, ['ss -lntp', 'ss -lntp', 'systemctl status nginx', 'systemctl status nginx']);
+    assert.deepEqual(jms.playbookRuns, [{ assets: ['web01'], account: 'ops-first', principal: 'shared' }]);
     const audits = await records(id, 'delivery_executions');
     assert.equal(audits.length, 1);
     const [audit] = audits;
@@ -718,9 +744,11 @@ async function main() {
     assert.ok(history.length > coding.last_message_seq);
     assert.ok(history.every((row, i) => row.seq === i + 1));
     assert.deepEqual(await readdir(sandbox), []);
+    console.log('Stage 15 branch 4 passed: signed multi-account inspection and approved Ansible execution with one AccessKey.');
     console.log('Verified production approval, execution audit, /status, transcript and sandbox cleanup.');
     await stopPod(true);
     if (gitlab.synthetic) {
+      await gitlab.removeFile(hub, 'capabilities.json', 'Verify legacy cluster configuration');
       const sockets = [createServer(), createServer()];
       const ports = await Promise.all(sockets.map(socket => listen(socket)));
       await Promise.all(sockets.map(close));
@@ -732,7 +760,7 @@ async function main() {
       cleanup.push(() => stopPod());
       const cluster = { ...proxy, sandboxes, stop: () => stopPod(true), async start(settings: NodeJS.ProcessEnv = {}) {
         await Promise.all(['a', 'b'].map((name, i) => startPod('detent-pod-' + name, {
-          PORT: String(ports[i]), EPHEMERAL_ROOT: sandboxes[i], WATCHDOG_INTERVAL_MS: '0',
+          ...sharedKeyEnv, PORT: String(ports[i]), EPHEMERAL_ROOT: sandboxes[i], WATCHDOG_INTERVAL_MS: '0',
           JUMPSERVER_BLOCKED_ASSETS: 'blocked-db-01', JUMPSERVER_BLOCK_FAILED_PIPELINE: 'true', ...settings,
         }, 'delivery', envFile)));
       } };
@@ -760,5 +788,5 @@ async function main() {
 
 main().then(() => {
   if (!process.env.E2E_GITLAB_URL)
-    console.log('Offline E2E passed: install/upgrade, Issues, MRs, self-service onboarding, concurrency and security/events.');
+    console.log('Offline E2E passed: Stage 15 (8/8 branches), install/upgrade, Issues, MRs, self-service onboarding, concurrency and security/events.');
 }).catch(error => { console.error(error); process.exitCode = 1; });

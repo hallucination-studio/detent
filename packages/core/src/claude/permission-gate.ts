@@ -161,7 +161,7 @@ export class PermissionGate {
       createNote: body => ctx.gitlab.createIssueNote(session.hubProjectId, session.hubIssueIid, body),
       syncStatusLabel: status => ctx.gitlab.syncIssueStatusLabel(session.hubProjectId, session.hubIssueIid, status),
     };
-    this.extensionContext = { session, repo, workspaceRoot, permissionMode: session.permissionMode };
+    this.extensionContext = { workflow: profile?.workflow, session, repo, workspaceRoot, permissionMode: session.permissionMode };
     this.readonly = profile?.readonly ?? false;
     if (profile?.name !== undefined) this.extensionContext.profileName = profile.name;
     this.disableBash = profile?.disableBash ?? false;
@@ -197,7 +197,7 @@ export class PermissionGate {
     const pending = this.pending;
     if (!pending) return false;
     const { repo, session, onApprovalResolved } = this.ctx;
-    if (!(await resolveApproval(repo, session, pending.id, status, user, comment, onApprovalResolved, this.ctx.config.jevApiKey))) return false;
+    if (!(await resolveApproval(repo, session, pending.id, status, user, comment, onApprovalResolved, this.secrets))) return false;
     pending.wake();
     return true;
   }
@@ -325,7 +325,7 @@ export class PermissionGate {
       const note = await this.channel.createNote(renderNote(card, this.secrets));
       await repo.updateApprovalNoteId(a.id, note.id);
     } catch (error) {
-      await resolveApproval(repo, s, a.id, 'EXPIRED', 'detent', '审批卡片发布失败', this.ctx.onApprovalResolved, config.jevApiKey);
+      await resolveApproval(repo, s, a.id, 'EXPIRED', 'detent', '审批卡片发布失败', this.ctx.onApprovalResolved, this.secrets);
       throw error;
     }
     await repo.updateSessionState(s.id, { status: 'WAITING_TOOL' });

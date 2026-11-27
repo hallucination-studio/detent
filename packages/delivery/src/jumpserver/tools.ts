@@ -43,32 +43,36 @@ async function verifyMerge(input: JobInput, ctx: ExtensionToolContext, blockFail
   return { ok: true as const, mr };
 }
 
-export function createJumpServerTools({ client, config, tracker, decision }: {
-  client: JumpServerClient; config: DeliveryConfig; tracker?: DeliveryExecutionTracker; decision?: DecisionClient;
+export function createJumpServerTools({ client, config, tracker, decision, defaultAccount }: {
+  client: JumpServerClient; config: DeliveryConfig; tracker?: DeliveryExecutionTracker; decision?: DecisionClient; defaultAccount?: string;
 }): AnyDetentExtensionTool[] {
   const checkAssets = (ids: string[]) => findBlockedAssets(ids, config.blockedAssets).length
     ? deny('目标资产在黑名单中，禁止操作') : allow;
 
   return [
     defineExtensionTool({
-      name: 'jms_list_assets', description: '查询当前只读账号获授权的 JumpServer 资产', policy: 'readonly',
+      name: 'jms_list_assets', description: '查询当前凭证获授权的 JumpServer 资产', policy: 'readonly',
       schema: { search: text(128).optional(), node_id: text(128).optional(), limit: id.max(200).optional() },
       execute: input => client.listAssets({ search: input.search, nodeId: input.node_id, limit: input.limit }),
     }),
     defineExtensionTool({
-      name: 'jms_readonly_inspect', description: '使用只读账号在目标资产执行白名单巡检命令', policy: 'readonly',
+      name: 'jms_readonly_inspect', description: '在授权资产上执行通过只读校验的巡检命令', policy: 'readonly',
       // Validate raw characters/length before trim can discard a newline or an oversized suffix.
       schema: { asset_ids: assets(50), command: z.string().max(512).regex(/^[^\r\n\0]+$/).trim().min(1) },
-      async guard(input) {
-        const command = validateReadonlyInspectCommand(input.command, config.inspectAllowPrefixes);
-        if (!decision) return command.ok ? checkAssets(input.asset_ids) : command;
+      async guard(input, ctx) {
+        const prefixes = [...config.inspectAllowPrefixes, ...(ctx.workflow?.allowPrefixes ?? [])];
+        const command = validateReadonlyInspectCommand(input.command, prefixes);
+        if (!decision) {
+          if (!command.ok) return command;
+          return isHardBlockedRemoteInspectCommand(input.command) ? deny('巡检命令不在只读白名单') : checkAssets(input.asset_ids);
+        }
         if (!isHardBlockedRemoteInspectCommand(input.command) &&
             (command.ok || await evaluateRemoteInspectCommand(decision, input.command))) return checkAssets(input.asset_ids);
         return deny('未通过只读巡检风控。变更操作请使用 delivery::env-change 提交 Ansible MR 并审批。');
       },
-      execute(input) {
+      execute(input, ctx) {
         return client.runReadonlyInspect({
-          assetIds: input.asset_ids, command: decision ? input.command.trim() : normalizeInspectCommand(input.command), account: config.jumpserverReadonlyAccount,
+          assetIds: input.asset_ids, command: decision ? input.command.trim() : normalizeInspectCommand(input.command), account: ctx.workflow?.account ?? defaultAccount ?? config.jumpserverReadonlyAccount,
         });
       },
     }),
@@ -114,7 +118,7 @@ export function createJumpServerTools({ client, config, tracker, decision }: {
         if (!verified.ok) throw Error(verified.reason);
         const { mr } = verified;
         const job = await client.runAnsibleJob({
-          assetIds: input.asset_ids, repository: mr.targetProjectPath, playbookPath: input.playbook_path,
+          account: ctx.workflow?.account ?? defaultAccount, assetIds: input.asset_ids, repository: mr.targetProjectPath, playbookPath: input.playbook_path,
           commitSha: input.commit_sha, extraVars: input.extra_vars,
           comment: `Detent ${ctx.session.id} / ${mr.targetProjectPath}!${mr.mrIid} / ${input.commit_sha} / ${approvalId}`,
         });

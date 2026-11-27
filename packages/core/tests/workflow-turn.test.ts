@@ -14,6 +14,7 @@ it('posts only redacted preflight guidance and preserves the stored permission m
   const session = await repo.getOrCreateSession(1, 2, 'issue');
   const config = loadConfig({});
   const client = new GitLabClient(config);
+  vi.spyOn(client, 'getRepositoryFile').mockResolvedValue(null);
   const note = vi.spyOn(client, 'createIssueNote').mockResolvedValue({ id: 1 });
   const sync = vi.spyOn(client, 'syncIssueStatusLabel').mockResolvedValue();
   const prepare = vi.spyOn(EphemeralSandbox.prototype, 'prepareTurnSandbox');
@@ -88,14 +89,14 @@ it('mounts Hub workflow files without symlinks and protects only root governance
       expect(await readdir(path.join(workspace, 'workflows'))).toEqual(['release.md']);
       expect(await readFile(path.join(workspace, 'workflows/release.md'), 'utf8')).toBe('# Procedure');
       await symlink('.', path.join(workspace, 'alias'));
-      for (const file_path of ['CLAUDE.md', 'events.json', 'workflows/release.md', 'WorkFlows/new.md', 'claude.MD', 'alias/WorkFlows/new.md']) {
+      for (const file_path of ['CLAUDE.md', 'events.json', 'capabilities.json', 'alias/CapAbilities.json', 'workflows/release.md', 'WorkFlows/new.md', 'claude.MD', 'alias/WorkFlows/new.md']) {
         for (const action of ['Edit', 'Write'])
           expect(await gate.preflight(action, { file_path }), file_path).toMatchObject({ behavior: 'deny' });
         expect(await gate.preflight('Read', { file_path }), file_path).toMatchObject({ behavior: 'allow' });
       }
-      for (const command of ['echo data > events.json', 'rm alias/events.json'])
+      for (const command of ['echo data > events.json', 'rm alias/events.json', 'echo data >capabilities.json', 'rm alias/capabilities.json'])
         expect(await gate.preflight('Bash', { command })).toMatchObject({ behavior: 'deny' });
-      for (const file_path of ['projects/app/CLAUDE.md', 'projects/app/workflows/ci.yml', 'projects/app/events.json'])
+      for (const file_path of ['projects/app/CLAUDE.md', 'projects/app/workflows/ci.yml', 'projects/app/events.json', 'projects/app/capabilities.json'])
         expect(await gate.preflight('Write', { file_path }), file_path).toMatchObject({ behavior: 'allow' });
       return 'verified';
     } };

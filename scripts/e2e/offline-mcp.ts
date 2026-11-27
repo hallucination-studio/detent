@@ -16,14 +16,23 @@ const tools = [
 ];
 
 export function offlineMcp() {
-  const token = randomUUID();
+  const token = randomUUID(), hubToken = randomUUID();
+  const sessions = new Set<string>();
+  let closedSessions = 0;
   const calls: { name: string; arguments: Record<string, string> }[] = [];
   const protocolVersion = '2025-03-26';
 
   async function handle(req: Request) {
-    if (new URL(req.url).pathname !== '/mcp') return new Response(null, { status: 404 });
+    const path = new URL(req.url).pathname;
+    const scoped = path === '/hub/mcp';
+    if (!scoped && path !== '/mcp') return new Response(null, { status: 404 });
     const authorization = req.headers.get('authorization');
-    if (authorization !== 'Bearer ' + token) return new Response(null, { status: 401 });
+    if (authorization !== 'Bearer ' + (scoped ? hubToken : token)) return new Response(null, { status: 401 });
+    const session = req.headers.get('mcp-session-id');
+    if (scoped && req.method === 'DELETE' && session && sessions.delete(session)) {
+      closedSessions++;
+      return new Response(null, { status: 204 });
+    }
     if (req.method !== 'POST') return new Response(null, { status: 405 });
 
     const { id, jsonrpc, method, params } = await req.json();
@@ -34,8 +43,15 @@ export function offlineMcp() {
     };
     if (method === 'initialize') {
       assert.equal(params.protocolVersion, protocolVersion);
-      return reply({ protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'harbor-sync', version: '1.0.0' } });
+      const response = reply({ protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'harbor-sync', version: '1.0.0' } });
+      if (scoped) {
+        const id = randomUUID();
+        sessions.add(id);
+        response.headers.set('mcp-session-id', id);
+      }
+      return response;
     }
+    if (scoped) assert.ok(session && sessions.has(session));
     assert.equal(req.headers.get('mcp-protocol-version'), protocolVersion);
     if (method === 'notifications/initialized') {
       assert.equal(id, undefined);
@@ -53,5 +69,5 @@ export function offlineMcp() {
     return Response.json({ jsonrpc, id, error: { code: -32601, message: 'Method not found' } });
   }
 
-  return { handle, token, calls };
+  return { handle, token, hubToken, calls, sessions, closedSessions: () => closedSessions };
 }

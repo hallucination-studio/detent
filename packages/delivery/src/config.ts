@@ -14,7 +14,7 @@ const schema = z.object({
   }, 'Expected an HTTP(S) service URL').optional(),
   jumpserverOrgId: z.string().trim().min(1).optional(),
   jumpserverTimeoutMs: z.coerce.number().int().positive().max(2147483647).default(30000),
-  jumpserverReadonlyAccount: z.string().trim().min(1).regex(/^[\w.@-]+$/).default('readonly'),
+  jumpserverReadonlyAccount: z.string().trim().min(1).regex(/^[\w.@-]+$/).optional(),
   jumpserverReadonlyAuth: auth.optional(),
   jumpserverJobAuth: auth.optional(),
   inspectAllowPrefixes: z.string().default('systemctl status,nginx -t,df -h,free -m,uptime,ss -tlnp,kubectl get,cat /etc/nginx').transform(list),
@@ -40,7 +40,7 @@ function credential(env: NodeJS.ProcessEnv, role: 'READONLY' | 'JOB'): JumpServe
 }
 
 export function loadDeliveryConfig(env: NodeJS.ProcessEnv = process.env): DeliveryConfig {
-  const config = schema.parse({
+  return schema.parse({
     jumpserverBaseUrl: env.JUMPSERVER_BASE_URL,
     jumpserverOrgId: env.JUMPSERVER_ORG_ID,
     jumpserverTimeoutMs: env.JUMPSERVER_TIMEOUT_MS,
@@ -54,19 +54,11 @@ export function loadDeliveryConfig(env: NodeJS.ProcessEnv = process.env): Delive
     blockFailedPipeline: env.JUMPSERVER_BLOCK_FAILED_PIPELINE,
     enableReleaseTools: env.DELIVERY_ENABLE_RELEASE_TOOLS,
   });
-  assertSeparateCredentials(config);
-  return config;
 }
 
 export function authSecrets(auth?: JumpServerAuth) {
   if (!auth) return [];
   return auth.kind === 'bearer' ? [auth.token] : [auth.accessKeyId, auth.accessKeySecret];
-}
-
-export function assertSeparateCredentials(config: DeliveryConfig) {
-  const readonly = authSecrets(config.jumpserverReadonlyAuth);
-  if (authSecrets(config.jumpserverJobAuth).some(secret => readonly.includes(secret)))
-    throw Error('JumpServer readonly and job-center credentials must be separate');
 }
 
 export function redactSecrets(value: string, config: DeliveryConfig, ...additionalSecrets: string[]) {

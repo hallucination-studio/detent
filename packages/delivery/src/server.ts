@@ -8,7 +8,7 @@ const jumpServerSecretKey = /^JUMPSERVER_(READONLY|JOB)_(TOKEN|ACCESS_KEY_ID|ACC
 function report(error: unknown) {
   // Also works for startup errors before the credentials have passed validation.
   const secrets = Object.entries(process.env).flatMap(([key, value]) =>
-    value && (coreSecretKeys.has(key) || jumpServerSecretKey.test(key)) ? [value, value.trim()] : [],
+    value && (coreSecretKeys.has(key) || /^DETENT_SECRET_[A-Z0-9_]+$/.test(key) || jumpServerSecretKey.test(key)) ? [value, value.trim()] : [],
   );
   console.error(redactValues(redactGitUrl(error instanceof Error ? error.message : String(error)), secrets));
   process.exitCode = 1;

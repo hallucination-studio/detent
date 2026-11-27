@@ -20,7 +20,7 @@
 | :--- | :--- | :--- | :--- |
 | **Stage 1** | **双包 Monorepo 拆分与 `@detent/core` 4 大扩展点抽象** | `packages/core` (`@detent/core`)<br/>`packages/delivery` (`@detent/delivery` 骨架)<br/>4 个标准扩展接口（`DetentExtensionTool` / `resumeSession` / `TurnProfileResolver` / `SessionLifecycleHooks`） | 1. `packages/core` 零业务词/零业务依赖<br/>2. 原有 25 项测试 100% 通过 + 新增扩展点单测<br/>3. `npm run check` (`tsc` + `knip` + `vitest`) 全绿 |
 | **Stage 2** | **GitLab `merge_request` 合并事件监听与会话自动续跑** | `session_merge_requests` 增加 `merge_commit_sha` / `merged_by` / `merged_at`<br/>`@detent/core` 暴露 `resumeSession`<br/>`@detent/delivery` 接入目标库 MR `merge` Webhook 自动唤醒原 Issue Session | 1. 端到端测试覆盖：`提 Ansible MR -> 人工 Merge -> MR Webhook 触发 -> 自动 --resume 原 Issue Session`<br/>2. 幂等校验（重复 Merge Webhook 不重复唤醒） |
-| **Stage 3** | **JumpServer 双凭证适配器（只读巡检 + 任务中心）与合规硬守卫** | `packages/delivery/src/jumpserver/client.ts`（只读 Token / 执行 Token 物理分离）<br/>4 个 JumpServer MCP 工具（`jms_list_assets` / `jms_readonly_inspect` / `jms_run_ansible_job` / `jms_get_job_result`）<br/>合规硬守卫（MR 未合入强拦截 + 强制人工审批卡片） | 1. 单测覆盖：MR 未合并或 SHA 不一致时 `jms_run_ansible_job` 被硬守卫直接拦截<br/>2. Plan 模式拒绝执行，Coding 模式仅在硬守卫通过后弹审批卡<br/>3. 只读巡检工具在 `plan` 阶段可用且禁止写命令 |
+| **Stage 3** | **JumpServer 适配器（只读巡检 + 任务中心）与合规硬守卫** | `packages/delivery/src/jumpserver/client.ts`（父进程按工具执行门禁）<br/>4 个 JumpServer MCP 工具（`jms_list_assets` / `jms_readonly_inspect` / `jms_run_ansible_job` / `jms_get_job_result`）<br/>合规硬守卫（MR 未合入强拦截 + 强制人工审批卡片） | 1. 单测覆盖：MR 未合并或 SHA 不一致时 `jms_run_ansible_job` 被硬守卫直接拦截<br/>2. Plan 模式拒绝执行，Coding 模式仅在硬守卫通过后弹审批卡<br/>3. 只读巡检工具在 `plan` 阶段可用且禁止写命令 |
 | **Stage 4** | **多交付 Agent 角色体系、执行审计表与 6 阶段全链路 E2E 验收** | `delivery_executions` MySQL 审计表与仓储<br/>`EnvChangeAgent` / `ReadonlyAuditAgent` / `CodeDeliveryAgent` 角色路由与审批人 RBAC 策略<br/>工作区仓库示例模板 (`examples/hub-workspace/`)<br/>6 阶段全链路端到端集成测试 | 1. 完整跑通：`开变更 Issue -> JumpServer 只读巡检 -> 方案审批 -> 写 Ansible 提 MR -> 人工合并 MR 自动唤醒 -> 执行前二次审批 -> JumpServer 任务中心执行 -> 变更后只读验收 -> 写审计表`<br/>2. 推送前通过 `ocr delegate` 100% 覆盖率审查 |
 
 ---
@@ -89,13 +89,13 @@ ALTER TABLE session_merge_requests
 
 ---
 
-## Stage 3：JumpServer 双凭证适配器与合规硬守卫
+## Stage 3：JumpServer 适配器与合规硬守卫
 
 ### 3.1 目标与实现内容
-1. **JumpServer 配置与双凭证客户端（`packages/delivery/src/jumpserver/client.ts`）**：
-   - 独立环境变量配置：
+1. **JumpServer 配置与签名客户端（`packages/delivery/src/jumpserver/client.ts`）**：
+   - 推荐在 Hub 配置 `base_url`，并通过 `$secret:JMS_AK_ID` 和 `$secret:JMS_AK_SECRET` 引用服务端的单把 AccessKey。兼容旧部署的环境变量如下：
      - `JUMPSERVER_BASE_URL`
-     - `JUMPSERVER_READONLY_ACCESS_KEY_ID` / `JUMPSERVER_READONLY_ACCESS_KEY_SECRET`（或 `JUMPSERVER_READONLY_TOKEN`），系统账号由 `JUMPSERVER_READONLY_ACCOUNT` 指定，默认 readonly
+     - `JUMPSERVER_READONLY_ACCESS_KEY_ID` / `JUMPSERVER_READONLY_ACCESS_KEY_SECRET`（或 `JUMPSERVER_READONLY_TOKEN`），可用 `JUMPSERVER_READONLY_ACCOUNT` 显式指定旧模式巡检账号
      - `JUMPSERVER_JOB_ACCESS_KEY_ID` / `JUMPSERVER_JOB_ACCESS_KEY_SECRET`（或 `JUMPSERVER_JOB_TOKEN`），仅供任务中心使用
      - `JUMPSERVER_INSPECT_ALLOW_PREFIXES`（只读巡检允许的命令白名单，默认如 `systemctl status,nginx -t,df -h,free -m,uptime,ss -tlnp,kubectl get,cat /etc/nginx` 等）
      - `JUMPSERVER_ORG_ID` 可选，`JUMPSERVER_TIMEOUT_MS` 默认 30000。
@@ -183,7 +183,7 @@ Stage 6 已实现。使用 `loadHubWorkflows` 和 `matchHubWorkflow` 解析当�
    - `DeliveryOptions` 支持注入自定义 `capabilities?: readonly DetentCapabilityPack[]`。
    - 内置注册两个标准能力包：
      - `gitlab-release`（默认启用，可通过 `DELIVERY_ENABLE_RELEASE_TOOLS=false` 关闭，`blockFailedPipeline` 复用配置）；
-     - `jumpserver`（**可空**：仅当 `jumpserverClient` 或 `JUMPSERVER_BASE_URL` 配置时 `enabled: true`，否则 `enabled: false` 且携带配置提示 `setupHint`）。
+     - `jumpserver`（**可空**：Hub 地址与凭证就绪、注入 `jumpserverClient` 或配置旧版 `JUMPSERVER_BASE_URL` 时 `enabled: true`，否则 `enabled: false` 且携带配置提示 `setupHint`）。
    - 注意：`createDeliveryApp` 需将 `GitLabClient` 实例传递给 `gitlab-release` 工具（或在 `createDetentApp` 支持工厂/注入，保持核心边界极简干净）。
 2. **去硬编码的 `profiles.ts`（`packages/delivery/src/agents/profiles.ts`）**：
    - 删除 `EnvChangeAgent` 中硬编码的 6 步业务提示词，改为使用 Core 的 Hub SOP 加载与匹配函数。
@@ -216,7 +216,7 @@ Stage 6 已实现。使用 `loadHubWorkflows` 和 `matchHubWorkflow` 解析当�
 
 ### Jev 风控验收
 
-使用回环百炼 Decision Model API 验证 Bash 静态放行、硬门禁、语义放行和失败回退。代码交付在计划获批后执行复合命令，MySQL 中 Bash 审批行数为零；审计通过只读账号执行 `ss -lntp`。单测覆盖超时、响应校验、置信度及密钥隔离。生产执行、发版、方案和审批关单继续验证人工身份。
+使用回环百炼 Decision Model API 验证 Bash 静态放行、硬门禁、语义放行和失败回退。代码交付在计划获批后执行复合命令，MySQL 中 Bash 审批行数为零；审计通过只读工具执行 `ss -lntp`。单测覆盖超时、响应校验、置信度及密钥隔离。生产执行、发版、方案和审批关单继续验证人工身份。
 
 ## Stage 10 · V6 控制面基础
 
@@ -251,3 +251,9 @@ Stage 6 已实现。使用 `loadHubWorkflows` 和 `matchHubWorkflow` 解析当�
 - 离线套件从引导首页、群组发现与欢迎工单开始，验证 Developer 无法批准、SRE 批准后新项目的签名 Webhook 能实际启动 MR Worker。质量门禁为 `npm run check && npm run build && npm run e2e:offline`。
 
 交互验收覆盖未开通能力零 Claude 调用、就绪场景的简短澄清、Issue 与 MR 的直接回答、生产审批拒绝提示去重与外部人员静默，以及状态、帮助和脱敏的业务执行记录。
+
+## Stage 15 · Hub 能力与密钥
+
+- 验收通用环境密钥、完整引用与请求头模板、默认分支能力热更新、外部 MCP 生产审批，以及 Agent 级账号与巡检前缀。
+- 离线驱动通过真实子进程启动边界、模型请求、GitLab 评论与工具轨迹、MySQL transcript 检查凭证隔离。在编码轮次验证 Hub 能力文件的写保护。
+- Branch 4 使用单把 AccessKey 验证巡检和生产执行签名。先使用流程 `account`，其次使用 Hub `default_account`。两者均未设置时，逐资产按 JumpServer 返回顺序选择首个有效授权账号，跳过停用账号和以 `@` 开头的虚拟账号。巡检按账号分组并汇总结果。单个 Ansible 任务要求所有目标使用同一账号，否则须指定共同的 `account` 或分组执行。缺少有效账号时，错误指出对应资产。 离线场景验证两组巡检，且合并 SHA 与生产审批通过后，Ansible 以首账号和 `runas_policy=skip` 执行。

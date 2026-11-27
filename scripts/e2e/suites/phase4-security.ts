@@ -54,7 +54,7 @@ export async function runSecurity(h: Harness, cluster: Cluster, web: number, ans
     h.checkSecrets(body);
   });
   const redaction = await h.openIssue('Verify note redaction', '', 'delivery::code');
-  const safe = ['\\/close', '\\/merge', '\\/label ~claude::done', 'https://oauth2:***@127.0.0.1/repo.git', '***', '***'].join('\n');
+  const safe = ['\\/close', '\\/merge', '\\/label ~claude::done', 'https://oauth2:***@127.0.0.1/repo.git', '***', '***', '***'].join('\n');
   const redactedCard = await h.pendingCard(redaction, 'Plan', [safe]);
   const redactedIssue = await h.state(redaction, 'WAITING_PLAN');
   await synthetic.failPipeline(api, mr.iid, bot.id, undefined, 'Missing ci/ready.txt: expected ready\n' + securityReport);
@@ -75,6 +75,7 @@ export async function runSecurity(h: Harness, cluster: Cluster, web: number, ans
   assert.equal((await gitlab.getIssue(hub, redaction)).state, 'opened');
   assert.ok(!(await gitlab.getIssue(hub, redaction)).labels.includes('claude::done'));
   assert.equal((await gitlab.getMr(api, mr.iid)).state, 'opened');
+  console.log('Stage 15 branch 8 passed: sandbox write refused, vault excluded from SDK child env and scrubbed from notes, tool traces and MySQL.');
   console.log('S-2 passed: model output and job trace were redacted in GitLab and the persisted SDK transcripts.');
 
   const policy = await gitlab.getFile(hub, 'events.json');

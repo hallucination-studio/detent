@@ -1,0 +1,19 @@
+{
+  "jumpserver": {
+    "type": "jumpserver",
+    "base_url": "",
+    "auth": {
+      "access_key_id": "$secret:JMS_AK_ID",
+      "access_key_secret": "$secret:JMS_AK_SECRET"
+    },
+    "default_account": "",
+    "inspect_allow_prefixes": ["systemctl status", "nginx -t", "df -h", "free -m", "uptime", "ss -tlnp", "kubectl get", "cat /etc/nginx", "docker ps", "jps"],
+    "blocked_assets": [],
+    "block_failed_pipeline": true
+  },
+  "gitlab-release": {
+    "type": "gitlab-release",
+    "enabled": true,
+    "block_failed_pipeline": true
+  }
+}

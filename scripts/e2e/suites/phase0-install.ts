@@ -21,7 +21,7 @@ export async function checkStartupFailures(h: Install, local: NodeJS.ProcessEnv,
   const base = { ...local, ...secrets, MYSQL_HOST: '127.0.0.1', MYSQL_PORT: '1' };
   const cases: [NodeJS.ProcessEnv, RegExp][] = [
     [{ GITLAB_WEBHOOK_SECRET: undefined }, /GITLAB_WEBHOOK_SECRET is required/],
-    [{ JUMPSERVER_JOB_TOKEN: secrets.JUMPSERVER_READONLY_TOKEN }, /credentials must be separate/],
+    [{ JUMPSERVER_JOB_ACCESS_KEY_ID: secrets.JUMPSERVER_JOB_TOKEN }, /requires both access key ID and secret/],
     [{ WATCHDOG_INTERVAL_MS: '1000' }, /watchdogIntervalMs/],
     [{}, /ECONNREFUSED/],
   ];

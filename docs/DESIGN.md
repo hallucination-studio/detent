@@ -36,7 +36,7 @@ detent/
 | 模块 | 职责定位 | 核心包含内容 | 边界红线 |
 | :--- | :--- | :--- | :--- |
 | **`@detent/core`** | 通用 GitLab Issue × Claude Code 无状态会话运行时 | • Webhook 网关（验签、防自环、内存队列）<br/>• MySQL 纯增量 `session_messages` 与分布式租约锁<br/>• 无状态 `/tmp` 沙箱（浅克隆 + `uncommitted_diff`）<br/>• 单评论节流流式渲染（`NoteStreamer`）<br/>• Claude SDK 运行器、通用双层审批引擎与基础 GitLab 工具<br/>• 4 个标准业务扩展钩子 | **绝不引入任何业务系统依赖**（不得出现 JumpServer、Ansible、特定 CMDB 等业务词汇或逻辑） |
-| **`@detent/delivery`** | 面向生产交付与基础设施变更的受治理 AI 变更中枢 | • **JumpServer 双凭证适配器**（只读巡检账号 vs 任务中心执行账号物理隔离）<br/>• **合规硬守卫（Policy Guards）**：强制校验目标 Ansible MR 已 `merged` 且 SHA 一致；禁止直连 SSH/Ansible<br/>• **GitOps 续跑联动**：监听目标仓库 `merge_request (merge)` 事件自动唤醒原 Issue Session<br/>• **多交付 Agent 角色路由**（环境变更、配置发布、只读排查等）与变更执行审计表 | 所有通用会话、沙箱、MySQL 增量消息与评论渲染均复用 `@detent/core`，不重复造轮子 |
+| **`@detent/delivery`** | 面向生产交付与基础设施变更的受治理 AI 变更中枢 | • **JumpServer 适配器**（单 AccessKey、父进程工具门禁）<br/>• **合规硬守卫（Policy Guards）**：强制校验目标 Ansible MR 已 `merged` 且 SHA 一致；禁止直连 SSH/Ansible<br/>• **GitOps 续跑联动**：监听目标仓库 `merge_request (merge)` 事件自动唤醒原 Issue Session<br/>• **多交付 Agent 角色路由**（环境变更、配置发布、只读排查等）与变更执行审计表 | 所有通用会话、沙箱、MySQL 增量消息与评论渲染均复用 `@detent/core`，不重复造轮子 |
 
 ---
 
@@ -56,7 +56,7 @@ flowchart TD
             Agent_Router["多 Agent 路由<br/>(显式标签、Jev 自动路由与 Triage)"]
             MR_Hook["MR 合并事件处理器<br/>(目标库 Merge -> 自动唤醒原 Issue Session)"]
             Policy_Guard["交付合规硬守卫<br/>(强校验 MR=merged & SHA 一致 / 禁裸连 SSH)"]
-            JMS_Tools["JumpServer MCP 工具集<br/>(只读巡检账号 | 任务中心执行账号)"]
+            JMS_Tools["JumpServer MCP 工具集<br/>(只读巡检 | 生产审批执行)"]
         end
 
         subgraph CorePkg["@detent/core (通用基础架构包)"]
@@ -70,8 +70,8 @@ flowchart TD
     end
 
     subgraph Infra["外部受控执行面与唯一持久化存储"]
-        JMS_RO["JumpServer 堡垒机 (只读账号)<br/>环境现状巡检 & 变更后核验"]
-        JMS_Job["JumpServer 任务中心 (执行账号)<br/>受控运行已合入的 Ansible Playbook + 录像审计"]
+        JMS_RO["JumpServer 堡垒机<br/>环境现状巡检 & 变更后核验"]
+        JMS_Job["JumpServer 任务中心<br/>受控运行已合入的 Ansible Playbook + 录像审计"]
         MySQL[("MySQL 8.0<br/>Core 6 张表 (会话 / 纯增量消息 / Worktree / MR / 审批 / 收件箱)<br/>+ delivery_executions (交付执行审计表)")]
     end
 
@@ -90,8 +90,8 @@ flowchart TD
     Sandbox <--> Hub_Repo
     Core_Tools --> GL_API
     Note_Streamer --> GL_API
-    JMS_Tools -->|只读巡检 Token| JMS_RO
-    JMS_Tools -->|任务中心 Token| JMS_Job
+    JMS_Tools -->|AccessKey| JMS_RO
+    JMS_Tools -->|AccessKey| JMS_Job
     JMS_Tools -->|审计留痕| MySQL
 ```
 
@@ -117,7 +117,7 @@ flowchart TD
 
 Core 的 `DecisionClient` 以一次 POST 提交 choice、noul、score 三问，兼容百炼 Decision Model API 和 TypeSafe System One。默认关闭。Bash 硬门禁优先，静态安全命令免网络请求。语义放行要求无外部影响概率达到阈值（默认 0.9），只读分类的影响分上限为 0.6，编码可接受工作区开发类且影响分不超过 1.4。其余结果和网络、协议错误在编码时发审批卡，在只读和 Plan 时拒绝。
 
-Delivery 共享同一实例。只读巡检可在静态白名单外评估诊断命令，要求纯只读、无副作用概率达标、影响分 ≤ 0.6；资产黑名单和只读账号始终生效。只读巡检失败直接拒绝。生产任务、发版、需审批的关单与 Plan 沿用人工审批和权限检查。服务端隔离 Jev 密钥，错误与评论脱敏。
+Delivery 共享同一实例。只读巡检可在静态白名单外评估诊断命令，要求纯只读、无副作用概率达标、影响分 ≤ 0.6；资产黑名单和账号授权校验始终生效。只读巡检失败直接拒绝。生产任务、发版、需审批的关单与 Plan 沿用人工审批和权限检查。服务端隔离 Jev 密钥，错误与评论脱敏。
 
 ### 2.2 `@detent/core` 暴露的 4 个极简扩展契约（供 `@detent/delivery` 及未来其他模块接入）
 
@@ -205,8 +205,8 @@ sequenceDiagram
     participant GL_Hub as GitLab 工作区仓库 (Issue)
     participant GL_Ans as GitLab Ansible 仓库 (MR)
     participant Detent as Detent (@detent/core + @detent/delivery)
-    participant JMS_RO as JumpServer (只读巡检账号)
-    participant JMS_Job as JumpServer 任务中心 (执行账号)
+    participant JMS_RO as JumpServer 巡检
+    participant JMS_Job as JumpServer 任务中心
 
     rect rgb(235, 245, 255)
         Note over Ops,JMS_RO: 阶段 1 & 2：发起变更工单 -> JumpServer 只读巡检 -> 产出变更方案
@@ -256,18 +256,18 @@ sequenceDiagram
 
 | 工具名 | 绑定凭证 | 治理级别 (`policy`) | 强制守卫 (`guard`) | 功能说明 |
 | :--- | :--- | :--- | :--- | :--- |
-| `jms_list_assets` | **只读 Token** | `readonly` | 仅限查询已授权节点/主机组 | 按搜索词或节点查询已授权资产的 ID、名称与地址 |
-| `jms_readonly_inspect` | **只读 Token** | `readonly` | 强制使用 JumpServer 只读系统用户 + 静态白名单或 Jev 只读判定（禁止写/改/删命令） | 通过 JumpServer 只读账号在目标环境执行只读巡检（如查配置、端口、进程、磁盘、健康检查） |
-| `jms_run_ansible_job` | **任务中心 Token** | **`always_approve`** | **1. 硬校验对应 Ansible MR 在 MySQL 中已 `merged` 且 `merge_commit_sha` 匹配**<br/>**2. 校验目标资产组不在黑名单**<br/>**3. 审批前与放行后双重校验** | 通过 JumpServer 任务中心（Ops Job Center）下发指定仓库、指定已合并 Commit 的 Ansible Playbook 任务，并通过注入的 tracker 记录实际执行 ID |
-| `jms_get_job_result` | **优先任务中心凭证，其次只读凭证** | `readonly` | 必须由 tracker 确认本 Session 拥有任务 ID；未配置则拒绝 | 轮询并拉取 JumpServer 任务中心执行状态、标准输出摘要及 JumpServer Web 审计链接 |
+| `jms_list_assets` | Hub AccessKey | `readonly` | 仅限查询已授权节点/主机组 | 按搜索词或节点查询已授权资产的 ID、名称与地址 |
+| `jms_readonly_inspect` | Hub AccessKey | `readonly` | 硬拒绝危险命令，校验允许前缀或通过 Jev 只读判定（禁止写/改/删命令） | 通过 JumpServer 授权账号在目标环境执行只读巡检（如查配置、端口、进程、磁盘、健康检查） |
+| `jms_run_ansible_job` | Hub AccessKey | **`always_approve`** | **1. 硬校验对应 Ansible MR 在 MySQL 中已 `merged` 且 `merge_commit_sha` 匹配**<br/>**2. 校验目标资产组不在黑名单**<br/>**3. 审批前与放行后双重校验** | 通过 JumpServer 任务中心（Ops Job Center）下发指定仓库、指定已合并 Commit 的 Ansible Playbook 任务，并通过注入的 tracker 记录实际执行 ID |
+| `jms_get_job_result` | Hub AccessKey | `readonly` | 必须由 tracker 确认本 Session 拥有任务 ID；未配置则拒绝 | 轮询并拉取 JumpServer 任务中心执行状态、标准输出摘要及 JumpServer Web 审计链接 |
 
-Stage 3 通过 `createDeliveryApp(config, options)` 装配。传入 `jumpserverClient` 或配置 `JUMPSERVER_BASE_URL` 时，四个工具加入当前扩展列表。每套凭证可使用 HMAC-SHA256 HTTP Signature 或 Bearer Token。列资产、巡检（包括读取巡检输出）全程使用只读凭证。巡检限制命令参数、路径和目标资产，使用指定系统账号并设置 `runas_policy=skip`。
+Stage 3 通过 `createDeliveryApp(config, options)` 装配。Hub 配置服务地址和 `auth` 后启用四个工具。默认使用同一 AccessKey 做 HMAC-SHA256 签名。未配置 Hub 条目的旧部署仍可使用环境变量为两个角色分别指定凭证。巡检与 Playbook 均校验资产账号，并发送 `runas` 和 `runas_policy=skip`。
 
 执行前重读当前会话的 MR，默认拦截失败流水线。HTTP 客户端按合并 SHA 下载 GitLab ZIP，将指定相对路径作为私有 Playbook 的入口，保留同一提交中的角色、文件和相对引用。归档下载及解压各限 64 MiB。GitLab 凭证仅用于 GitLab 请求。任务变量遵循 Job Center 的 `jms_` 命名空间，例如参数 `version` 在 Playbook 中为 `jms_version`。审批卡渲染时从仓储重读 MR。默认追踪器使用共享 MySQL 连接池写入交付审计。
 
 > [!CAUTION]
 > **四重防绕过安全机制（Defence in Depth）**：
-> 1. **物理凭证隔离**：JumpServer 只读账号与任务中心执行账号的 API Key 均只存在 `@detent/delivery` 服务端内存，绝不注入 Claude Code 子进程环境变量。
+> 1. **父进程工具门禁**：JumpServer AccessKey 仅由服务端使用。只读流程隐藏执行工具，巡检命令通过硬拦截和只读判断后才能提交。生产执行须通过 prod 审批。
 > 2. **禁止裸连 SSH / 本地直跑 Ansible**：交付类 Agent（如 `EnvChangeAgent`）默认禁用或严格限制 `Bash`（禁止 `ssh`、`scp`、`ansible`、`ansible-playbook` 直连命令），所有环境触达必须走 JumpServer 工具。
 > 3. **代码硬校验 MR 已合并**：即使 Prompt 提示词被绕过，只要目标 Ansible MR 还没在 GitLab 上真实 `merged`，`jms_run_ansible_job.guard()` 会直接以硬代码拒绝执行。
 > 4. **三方审计闭环**：每一次生产变更在 MySQL `delivery_executions` 表中将 **GitLab Issue（工单与审批人） + GitLab MR（已合并的 Ansible Commit SHA） + JumpServer Job ID（执行日志与堡垒机审计记录）** 强关联存证。
@@ -408,7 +408,7 @@ description: 标准仓库发版流程
    - `gitlab-release`（`@detent/core` 内置可选能力包）：
      - `detent_list_tags`（`policy: 'readonly'`）：列出目标仓库已有 tag 与对应 commit SHA，辅助生成 Release Notes 与版本规划。
      - `detent_create_release`（`policy: 'always_approve'`）：支持创建 Git Tag + GitLab Release（或 `tag_only: true` 仅打 Tag）。**硬守卫**：校验 tag 名格式合法、目标 `commit_sha` 为完整 40 位有效提交且存在于目标仓库、该 tag 尚未存在、（可配置）对应提交最新流水线非 `failed`。审批卡明确锁定 **目标仓库、Tag 名、40 位 Commit SHA、模式与 Release Notes 摘要**，人工确认 👍 后执行。
-   - `jumpserver`（`@detent/delivery` 可选/可空能力包）：仅当配置 `JUMPSERVER_BASE_URL` 或注入 `jumpserverClient` 时 `enabled: true`；未配置时 `enabled: false` 并携带 `setupHint`，**零 JumpServer 配置即可完整运行 `start:delivery`、Release 与代码交付**。
+   - `jumpserver`（`@detent/delivery` 可选/可空能力包）：配置 Hub 服务地址和凭证、使用旧版 `JUMPSERVER_BASE_URL` 或注入 `jumpserverClient` 时 `enabled: true`；未配置时 `enabled: false` 并携带 `setupHint`，**零 JumpServer 配置即可完整运行 `start:delivery`、Release 与代码交付**。
    - 用户自有扩展：可通过 `createDetentApp / createDeliveryApp` 的 `capabilities` 注册自定义能力包（如 `{ name: 'argocd', enabled: true, tools: [...] }`），并在 Hub `workflows/*.md` 中通过 `requires: [argocd]` 引用。
 
 2. **轮次预检短路（`TurnProfile.blockedMessage`）**：
@@ -586,3 +586,11 @@ Hub Issue 的 `/help` 在成员检查后从默认分支加载 Agent，按当前�
 
 
 Issue 的 `/help` 按当前 Hub 定义列出场景、标签和就绪状态。Issue 与 MR 的 `/status` 显示中文状态和下一步操作。`WAITING_TOOL` 下的普通回复绑定当前 `ASK_USER` 审批记录，校验身份后按原热等待或冷恢复路径继续。其他工具仍需审批卡决定。审批解析器接收待审类型与工具名；已移出流程的操作无法通过更高权限放行。生产审批拒绝提示先核验普通成员权限，进程内按审批单和用户去重，最多保留 1024 条记录。
+
+### Stage 15 · Hub 配置与认证边界
+
+`loadConfig` 从进程环境读取形如 `DETENT_SECRET_NAME` 的非空值。全值引用使用 `$secret:NAME`，请求头模板使用 `${secret:NAME}`。模板展开一次，Hub 作者只能引用 vault。原有文件式 MCP 配置保留服务端变量解析规则。
+
+Issue 编排器在帮助、运行和审批时分别加载 Hub 默认分支的 `capabilities.json`。不存在时使用启动配置，文档损坏时关闭能力包。Core 解析通用 MCP，Delivery 通过 `resolveCapabilities` 解释业务配置；运行中的门禁与角色解析共享当前快照。代理发现和执行分别管理连接，SSE 消息端点须与握手地址同源。认证头和密钥只保留在服务端。Hub 的流程扩展字段随选中的 profile 进入工具上下文。
+
+Hub 的 `auth` 引用 `$secret:JMS_AK_ID` 和 `$secret:JMS_AK_SECRET`，供巡检与任务中心共用。先使用流程 `account`，其次使用 Hub `default_account`。两者均未设置时，逐资产按 JumpServer 返回顺序选择首个有效授权账号，跳过停用账号和以 `@` 开头的虚拟账号。巡检按账号分组并汇总结果。单个 Ansible 任务要求所有目标使用同一账号，否则须指定共同的 `account` 或分组执行。缺少有效账号时，错误指出对应资产。执行工具继续核对 MR 合并 SHA、最新流水线及审批记录。

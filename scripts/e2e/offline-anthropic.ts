@@ -185,6 +185,15 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
   const userText = body.messages.filter(m => m.role === 'user').flatMap(m =>
     typeof m.content === 'string' ? [m.content] : m.content.flatMap(b => b.type === 'text' ? [b.text] : []));
   const has = (phrase: string) => userText.some(t => t.includes(phrase));
+  if (/Stage 15 (?:Hub|workflow|denied) account/.test(system)) {
+    const status = result('jms_readonly_inspect');
+    if (!status) return use('jms_readonly_inspect', { asset_ids: ['web01'], command: system.includes('workflow account') ? 'kafka-topics.sh --list' : 'uptime' });
+    if (system.includes('denied account')) {
+      assert.ok(status.is_error);
+      assert.match(contents(status.content), /资产 web01 未授权账号 ghost.*可用授权账号：ops-first、root、ops-hub、audit-ro/);
+    } else assert.match(success(status), /nginx active/);
+    return text('Stage 15 inspection checked.');
+  }
   if (system.includes('Verify note redaction')) return text(securityReport);
   if (system.includes('Cluster plan decision')) {
     if (has('实施方案未获批准')) return text('Revised cluster plan.');
@@ -212,6 +221,10 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
   if (system.includes('Revise the public API')) {
     if (approved >= 0) {
       assert.ok(has('附加说明：Add inline comments'));
+      const write = result('Write');
+      if (!write) return use('Write', { file_path: join(workspaceRoot(), 'capabilities.json'), content: '{}' });
+      assert.ok(write.is_error);
+      assert.match(contents(write.content), /不允许文件操作/);
       const listed = result('detent_list_projects');
       if (!listed) return use('detent_list_projects', { search: apiRepo });
       success(listed);
@@ -428,9 +441,15 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
     if (!assets) return use('jms_list_assets', {});
     assert.match(success(assets), /web01/);
     const status = result('jms_readonly_inspect');
-    if (!status) return use('jms_readonly_inspect', audit ? { ...inspect, command: 'ss -lntp' } : inspect);
+    if (!status) return use('jms_readonly_inspect', audit ? { asset_ids: ['web01', 'web02'], command: 'ss -lntp' } : inspect);
     assert.match(success(status), /nginx active/);
-    if (audit) return closeIssue('Readonly audit complete; nginx active on web01.', 'Diagnostic report: nginx is active on web01.');
+    if (audit) {
+      const grouped = JSON.parse(success(status));
+      assert.equal(grouped.status, 'SUCCESS');
+      assert.match(grouped.outputSummary, /web01.*nginx active/s);
+      assert.match(grouped.outputSummary, /web02.*nginx active/s);
+      return closeIssue('Readonly audit complete; nginx active on web01.', 'Diagnostic report: nginx is active on web01.');
+    }
     return text(plan);
   }
 

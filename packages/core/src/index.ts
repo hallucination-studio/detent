@@ -1,3 +1,5 @@
+export { loadHubCapabilities, resolveSecretRef, resolveSecretTemplate, resolveHubMcpCapabilities,
+  type HubCapabilitiesDocument, type HubCapabilityEntry } from './workflows/hub-capabilities.js';
 export { createDetentApp } from './app.js';
 export { defineExtensionTool } from './extensions.js';
 export {

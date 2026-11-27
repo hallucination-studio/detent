@@ -1,5 +1,5 @@
 import * as fs from 'node:fs/promises';
-import { redactGitUrl } from '../gitlab/redact.js';
+import { redactGitUrl, scrubJson } from '../gitlab/redact.js';
 import path from 'node:path';
 import type { DetentRepository } from '../db/repository.js';
 import type { IssueSessionRow } from '../types.js';
@@ -11,13 +11,23 @@ export function transcriptPath(home: string, cwd: string, id: string) {
 }
 export class TranscriptHydrator {
   constructor(private repo: DetentRepository, private secrets: readonly string[] = []) {}
+  private scrubLine(raw: string) {
+    let changed = false;
+    const parsed = scrubJson(JSON.parse(raw), value => {
+      const safe = redactGitUrl(value, this.secrets);
+      if (safe !== value) changed = true;
+      return safe;
+    });
+    if (!parsed || typeof parsed !== 'object') throw Error('Invalid JSONL message');
+    return { parsed, rawJsonLine: changed ? JSON.stringify(parsed) : raw };
+  }
   async hydrateTranscriptToTmp(session: IssueSessionRow, home: string, cwd: string) {
     if (!session.claudeSessionId) return;
     const messages = await this.repo.getSessionMessages(session.id);
     if (!messages.length) return;
     const file = transcriptPath(home, cwd, session.claudeSessionId);
     await fs.mkdir(path.dirname(file), { recursive: true });
-    await fs.writeFile(file, messages.map((m) => m.rawJsonLine + '\n').join(''), { mode: 0o600 });
+    await fs.writeFile(file, messages.map((m) => this.scrubLine(m.rawJsonLine).rawJsonLine + '\n').join(''), { mode: 0o600 });
   }
   async flushIncrementalTranscriptToMySql(session: IssueSessionRow, home: string, cwd: string, id: string) {
     let raw: string;
@@ -31,18 +41,11 @@ export class TranscriptHydrator {
     if (lines.at(-1) === '') lines.pop();
     const offset = session.lastMessageSeq;
     if (lines.length < offset) throw Error('Claude transcript was truncated');
-    const batch = lines.slice(offset).map((rawJsonLine, i) => {
-      let changed = false;
-      const parsed: unknown = JSON.parse(rawJsonLine, (_key, value: unknown) => {
-        if (typeof value !== 'string') return value;
-        const safe = redactGitUrl(value, this.secrets);
-        if (safe !== value) changed = true;
-        return safe;
-      });
-      if (!parsed || typeof parsed !== 'object') throw Error('Invalid JSONL message');
+    const batch = lines.slice(offset).map((line, i) => {
+      const { parsed, rawJsonLine } = this.scrubLine(line);
       return {
         seq: session.lastMessageSeq + i + 1,
-        rawJsonLine: changed ? JSON.stringify(parsed) : rawJsonLine,
+        rawJsonLine,
         messageUuid: 'uuid' in parsed && typeof parsed.uuid === 'string' ? parsed.uuid : null,
         messageType: 'type' in parsed && typeof parsed.type === 'string' ? parsed.type : 'unknown',
       };

@@ -14,13 +14,16 @@ export class SessionBusy extends Error {}
 export class StopTurn extends Error {}
 export type Active = { owner: string; controller: AbortController; ownsLease: boolean; gate?: PermissionGate };
 
-export function formatInboxMessages(items: SessionInboxRow[], secret?: string) {
+export function formatInboxMessages(items: SessionInboxRow[], secret?: string | readonly string[]) {
   return redactGitUrl(items.map(item => `@${item.senderUsername ?? 'GitLab'}: ${item.content}`).join('\n\n'), secret);
 }
 
 export class TurnRuntime {
   protected active = new Map<string, Active>();
-  constructor(readonly config: AppConfig, readonly repo: DetentRepository, private hooks?: SessionLifecycleHooks) {}
+  protected readonly secrets: readonly string[];
+  constructor(readonly config: AppConfig, readonly repo: DetentRepository, private hooks?: SessionLifecycleHooks) {
+    this.secrets = configuredSecrets(config);
+  }
   protected drainInbox(id: string, active: Active, sourceKind?: string) {
     active.controller.signal.throwIfAborted();
     return this.repo.drainSessionInbox(id, active.owner, sourceKind);
@@ -83,9 +86,9 @@ export class TurnRuntime {
   protected async applyApproval(s: IssueSessionRow, pending: ApprovalRequestRow, intent: ParsedUserIntent,
     run: (session: IssueSessionRow, active: Active, prompt: string, previous?: ApprovalRequestRow) => Promise<void>) {
     const status = intent.type === 'APPROVE' ? 'APPROVED' : 'REJECTED';
-    const comment = intent.comment && redactGitUrl(intent.comment, configuredSecrets(this.config));
+    const comment = intent.comment && redactGitUrl(intent.comment, this.secrets);
     if (!(await resolveApproval(
-      this.repo, s, pending.id, status, intent.username, comment, this.hooks?.onApprovalResolved, this.config.jevApiKey,
+      this.repo, s, pending.id, status, intent.username, comment, this.hooks?.onApprovalResolved, this.secrets,
     ))) return;
     if (await this.active.get(s.id)?.gate?.notify(pending.id)) return;
     const expected = pending.approvalType === 'PLAN' ? 'WAITING_PLAN' : 'WAITING_TOOL';
@@ -108,7 +111,7 @@ export class TurnRuntime {
   }
   protected async expire(s: IssueSessionRow) {
     for (let pending = await this.repo.getLatestPendingApproval(s.id); pending; pending = await this.repo.getLatestPendingApproval(s.id)) {
-      await resolveApproval(this.repo, s, pending.id, 'EXPIRED', 'detent', '轮次已结束', this.hooks?.onApprovalResolved, this.config.jevApiKey);
+      await resolveApproval(this.repo, s, pending.id, 'EXPIRED', 'detent', '轮次已结束', this.hooks?.onApprovalResolved, this.secrets);
     }
   }
   protected async stop(s: IssueSessionRow) {

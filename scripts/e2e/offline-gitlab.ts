@@ -100,15 +100,18 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
     const message = annotated ? git(repo(p), 'tag', '--list', '--format=%(contents)', '--', name).toString().trimEnd() : null;
     return { name, message, commit: { id } };
   }
-  async function commitFile(p: Project, file: string, content: string | Buffer, message: string, branch = p.default_branch, start = branch, author?: User) {
+  async function commitFile(p: Project, file: string, content: string | Buffer | null, message: string, branch = p.default_branch, start = branch, author?: User) {
     assert.ok(safePath(file), 'Expected a relative repository file path');
     const work = await mkdtemp(join(root, 'seed-'));
     try {
       git(root, 'clone', '-c', 'core.symlinks=false', '--', repo(p), work);
       if (start !== p.default_branch) git(work, 'checkout', '--detach', 'refs/remotes/origin/' + start);
       git(work, 'check-ref-format', 'refs/heads/' + branch);
-      await mkdir(dirname(join(work, file)), { recursive: true });
-      await writeFile(join(work, file), content);
+      if (content === null) await rm(join(work, file));
+      else {
+        await mkdir(dirname(join(work, file)), { recursive: true });
+        await writeFile(join(work, file), content);
+      }
       git(work, '--literal-pathspecs', 'add', '--', file);
       git(work, 'commit', ...(author ? ['--author', author.username + ' <' + author.username + '@localhost>'] : []), '-m', message);
       git(work, 'push', 'origin', 'HEAD:refs/heads/' + branch);
@@ -190,7 +193,8 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
     if (!actor) return new Response(null, { status: 401 });
     const [resource, ref, section, item, sub, child, operation, noteId] = url.pathname.slice(8).split('/').map(decodeURIComponent);
     const get = req.method === 'GET', post = req.method === 'POST', put = req.method === 'PUT';
-    const body = get || req.method === 'DELETE' ? {} : await req.json();
+    const deleteFile = req.method === 'DELETE' && section === 'repository' && item === 'files';
+    const body = get || (req.method === 'DELETE' && !deleteFile) ? {} : await req.json();
     if (actor.id === noteCheck?.botId && ['issues', 'merge_requests'].includes(section) &&
         ['notes', 'discussions'].includes(sub) && typeof body.body === 'string') noteCheck.check(body.body);
     if (get && resource === 'user') return reply(actor);
@@ -311,13 +315,13 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
           return { id, name: posix.basename(rel), type, path: path ? path + '/' + rel : rel };
         }));
       }
-      if ((post || put) && item === 'files') {
+      if ((post || put || deleteFile) && item === 'files') {
         if (body.branch === 'main' && accessLevel(p, actor.id) < 40) return forbidden();
         const start = body.start_branch ?? body.branch;
         const exists = !!commitSha(p, start) && git(repo(p), 'ls-tree', '--name-only', 'refs/heads/' + start, '--', sub).length > 0;
-        if (exists !== put) return new Response(null, { status: exists ? 400 : 404 });
+        if (exists !== (put || deleteFile)) return new Response(null, { status: exists ? 400 : 404 });
         const content = body.encoding === 'base64' ? Buffer.from(body.content, 'base64') : body.content;
-        await commitFile(p, sub, content, body.commit_message, body.branch, start, actor);
+        await commitFile(p, sub, deleteFile ? null : content, body.commit_message, body.branch, start, actor);
         return reply({ file_path: sub, branch: body.branch });
       }
     }

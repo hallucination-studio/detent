@@ -50,6 +50,9 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
       const existing = await api.lookup(url + '?ref=' + encodeURIComponent(startBranch ?? branch));
       await api.request(url, existing ? 'PUT' : 'POST', { branch, start_branch: startBranch, content, commit_message: message });
     },
+    async removeFile(id: number, path: string, message: string) {
+      await api.request(file(id, path), 'DELETE', { branch: 'main', commit_message: message });
+    },
     async getFile(id: number, path: string, ref = 'main') {
       const data = await api.json<{ content: string }>(file(id, path) + '?ref=' + encodeURIComponent(ref));
       return Buffer.from(data.content, 'base64').toString('utf8');

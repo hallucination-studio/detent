@@ -11,7 +11,7 @@ Run this procedure from the repository root in Claude Code, Codex, Antigravity, 
 | Target repositories | Required | `DETENT_TARGET_GROUPS` or `DETENT_TARGET_PROJECTS`, or both. Each accepts comma-separated paths or numeric IDs. Groups must exist. Group discovery uses GitLab’s active project list, including subgroups and projects shared with the group. An explicit missing project path requests creation. |
 | Model access | Required | `ANTHROPIC_API_KEY`. Optionally set `ANTHROPIC_BASE_URL` for an Anthropic Messages-compatible gateway and `CLAUDE_MODEL` for a model available to this key. |
 | Jev risk assessment | Optional | `JEV_PROVIDER=bailian` with `JEV_BASE_URL` and `JEV_API_KEY`, or `JEV_PROVIDER=typesafe` with `JEV_API_KEY`. Set `JEV_MODEL` if needed. Default is off. |
-| JumpServer | Optional | `JUMPSERVER_BASE_URL` and distinct read-only and Job Center credentials. Set `JUMPSERVER_READONLY_TOKEN` and `JUMPSERVER_JOB_TOKEN`, or configure the corresponding access key ID/secret pairs. |
+| JumpServer | Optional | Set `jumpserver.base_url` in the Hub and `DETENT_SECRET_JMS_AK_ID` and `DETENT_SECRET_JMS_AK_SECRET` in the service environment. |
 
 Create a mode-0600 `.env` if absent (`umask 077 && touch .env && chmod 600 .env`). Populate it locally with the supplied **runtime** values from the table, plus `MYSQL_HOST=mysql`. For a fresh MySQL volume, generate a random hex `MYSQL_PASSWORD` and save it here before starting MySQL. On reruns reuse the existing file, database settings, bot PAT, Hub ID and webhook secret. Use Compose-compatible dotenv quoting for credentials. The example file documents supported keys and contains placeholder credentials. [Environment reference](./.env.example)
 
@@ -116,3 +116,11 @@ Give the user the verified Hub URL, bot `@username`, Welcome Issue link or skip 
 1. Open a Hub Issue, select a template, and name the target repository and task.
 2. Comment `/status` to see progress. React 👍 or 👎 on the approval card to approve or reject.
 3. Assign an open target MR to the bot for review and CI follow-up.
+
+### Hub capability configuration
+
+Bootstrap installs `capabilities.json` on the Hub default branch. Keep secret values in the service environment. For example, name an MCP credential `DETENT_SECRET_CUSTOM_MCP_TOKEN` and set the Hub header to `"Authorization": "Bearer ${secret:CUSTOM_MCP_TOKEN}"`. Bootstrap preserves named vault entries when it rewrites its private output file. Environment changes take effect when the service starts.
+
+Commit capability changes to the Hub default branch and send `/help` on a Hub Issue to check readiness. An empty `jumpserver.base_url` disables the capability. For inspection and Job Center execution, use one AccessKey in the Hub template’s `auth` object. Set `access_key_id` to `$secret:JMS_AK_ID` and `access_key_secret` to `$secret:JMS_AK_SECRET`. The parent process enforces read-only command checks and requires a matching merged MR SHA and production approval for Ansible. Legacy environment-only deployments may still configure role credentials separately.
+
+A workflow’s `account` takes precedence over the Hub’s `default_account`. With both unset or empty, Detent uses each asset’s first active authorized account in JumpServer order, skipping names that start with `@`. Inspection groups assets by account and combines the results. Ansible requires one account for the entire job. If the first accounts differ, specify a common `account` or submit one job per group. An asset with no eligible account stops the request before submission. Workflow `allow_prefixes` can extend the diagnostic command list.

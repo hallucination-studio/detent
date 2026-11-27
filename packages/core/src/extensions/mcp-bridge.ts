@@ -1,8 +1,9 @@
+import { createSseClient } from './mcp-sse.js';
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import { defineExtensionTool, type DetentCapabilityPack, type ToolGovernancePolicy } from '../extensions.js';
 import { escapeTableCell } from '../gitlab/note-streamer.js';
-import { redactGitUrl } from '../gitlab/redact.js';
+import { redactGitUrl, scrubJson } from '../gitlab/redact.js';
 import { normalizeHubValue } from '../workflows/hub-frontmatter.js';
 import type { WorkflowApproverTier } from '../workflows/hub-workflows.js';
 import { isHubPathSegment } from '../workspace/hub-paths.js';
@@ -11,7 +12,7 @@ export interface McpCapabilityConfig {
   name: string;
   setupHint?: string;
   transport: {
-    type: 'streamable-http';
+    type: 'streamable-http' | 'sse';
     url: string;
     headers?: Record<string, string>;
   };
@@ -31,7 +32,7 @@ const capabilitySchema = z.object({
   name: z.string().trim().refine(isHubPathSegment, 'Expected a capability identifier'),
   setupHint: z.string().optional(),
   transport: z.object({
-    type: z.literal('streamable-http'),
+    type: z.enum(['streamable-http', 'sse']),
     url: z.string().trim().refine(value => {
       if (!URL.canParse(value)) return false;
       const url = new URL(value);
@@ -94,7 +95,7 @@ function scrubSecrets(text: string, secrets: Set<string>) {
   return text;
 }
 
-function resolveHeaders(templates: Record<string, string>, env: NodeJS.ProcessEnv) {
+function resolveHeaders(templates: Record<string, string>, env: NodeJS.ProcessEnv, expand = true) {
   const missing = new Set<string>();
   const secrets = new Set<string>();
   const addSecret = (value: string) => {
@@ -102,7 +103,7 @@ function resolveHeaders(templates: Record<string, string>, env: NodeJS.ProcessEn
     if (value.trim()) secrets.add(value.trim());
   };
   const headers = Object.fromEntries(Object.entries(templates).map(([name, template]) => {
-    const value = template.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (placeholder, variable: string) => {
+    const value = expand ? template.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (placeholder, variable: string) => {
       const secret = Object.hasOwn(env, variable) ? env[variable] : undefined;
       if (!secret) {
         missing.add(variable);
@@ -110,7 +111,7 @@ function resolveHeaders(templates: Record<string, string>, env: NodeJS.ProcessEn
       }
       addSecret(secret);
       return secret;
-    });
+    }) : template;
     if (sensitiveHeader.test(name)) {
       addSecret(value);
       const bearer = /^Bearer\s+(.+)$/i.exec(value.trim());
@@ -125,17 +126,6 @@ type Scrub = (text: string) => string;
 
 function jsonObject(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
-
-function scrubJson(value: unknown, scrub: Scrub): unknown {
-  if (typeof value === 'string') return scrub(value);
-  if (Array.isArray(value)) return value.map(item => scrubJson(item, scrub));
-  const object = jsonObject(value);
-  if (object) return Object.fromEntries(Object.entries(object).map(([key, item]) => [scrub(key), scrubJson(item, scrub)]));
-  // A service can echo a numeric credential as a JSON number.
-  const literal = JSON.stringify(value);
-  const cleaned = literal === undefined ? literal : scrub(literal);
-  return cleaned === literal ? value : cleaned;
 }
 
 export function jsonSchemaToZodShape(schema: unknown, scrub: Scrub = redactGitUrl): z.ZodRawShape {
@@ -300,6 +290,15 @@ function createClient(url: string, resolvedHeaders: Record<string, string>, time
   }
 
   return {
+    async close() {
+      const session = await initialized?.catch(() => undefined);
+      if (!session?.sessionId) return;
+      const headers = new Headers(baseHeaders);
+      headers.set('Mcp-Session-Id', session.sessionId);
+      headers.set('MCP-Protocol-Version', session.protocolVersion);
+      const response = await http(url, { method: 'DELETE', redirect: 'error', headers, signal: AbortSignal.timeout(timeoutMs) });
+      await response.body?.cancel();
+    },
     async request(method: string, params?: object) {
       const current = initialize();
       const session = await current;
@@ -345,21 +344,38 @@ async function listTools(client: ReturnType<typeof createClient>) {
 interface ConnectOptions {
   env?: NodeJS.ProcessEnv;
   http?: typeof fetch;
+  resolvedHeaders?: boolean;
+  secrets?: readonly string[];
+  scoped?: boolean;
 }
 
-async function connect(cfg: McpCapabilityConfig, { env = process.env, http = fetch }: ConnectOptions): Promise<DetentCapabilityPack> {
-  const { headers, missing, secrets } = resolveHeaders(cfg.transport.headers ?? {}, env);
+async function connect(cfg: McpCapabilityConfig, options: ConnectOptions): Promise<DetentCapabilityPack> {
+  const { http = fetch } = options;
+  const templates = cfg.transport.headers ?? {};
+  const { headers, missing, secrets } = options.resolvedHeaders
+    ? resolveHeaders(templates, {}, false)
+    : resolveHeaders(templates, options.env ?? process.env);
+  if (options.resolvedHeaders) for (const value of Object.values(headers)) if (value) secrets.add(value);
+  for (const value of options.secrets ?? []) if (value) secrets.add(value);
   const scrub = (text: string) => scrubSecrets(text, secrets);
   const pack = { name: cfg.name, approverTier: cfg.approverTier };
   const disabled = (hint: string): DetentCapabilityPack => ({ ...pack, enabled: false, setupHint: scrub(cfg.setupHint ?? hint), tools: [] });
   if (missing.size) return disabled('缺少外部 MCP 环境变量：' + [...missing].join('、'));
 
   try {
-    const client = createClient(cfg.transport.url, headers, cfg.timeoutMs ?? 30_000, http, secrets);
+    const open = () => cfg.transport.type === 'sse'
+      ? createSseClient(cfg.transport.url, headers, cfg.timeoutMs ?? 30_000, http)
+      : createClient(cfg.transport.url, headers, cfg.timeoutMs ?? 30_000, http, secrets);
+    const shared = options.scoped || cfg.transport.type === 'sse' ? undefined : open();
+    async function withClient<T>(operation: (client: ReturnType<typeof open>) => Promise<T>) {
+      const client = shared ?? open();
+      try { return await operation(client); }
+      finally { if (!shared) await client.close().catch(() => {}); }
+    }
     const allowed = cfg.allowedTools && new Set(cfg.allowedTools);
     const prefix = sanitizeIdentifier(cfg.toolPrefix ?? cfg.name);
     const seen = new Set<string>();
-    const tools = (await listTools(client)).filter(remote => !allowed || allowed.has(remote.name)).map(remote => {
+    const tools = (await withClient(listTools)).filter(remote => !allowed || allowed.has(remote.name)).map(remote => {
       const toolName = sanitizeIdentifier(remote.name);
       const name = prefix + '__' + toolName;
       if (!prefix || !toolName || name.length > 64 || seen.has(name) || scrub(name) !== name || scrub(remote.name) !== remote.name)
@@ -386,7 +402,7 @@ async function connect(cfg: McpCapabilityConfig, { env = process.env, http = fet
         }),
         async execute(input) {
           try {
-            const result = toolResultSchema.parse(await client.request('tools/call', { name: remote.name, arguments: input }));
+            const result = toolResultSchema.parse(await withClient(client => client.request('tools/call', { name: remote.name, arguments: input })));
             if (result.isError) {
               const text = result.content?.map(jsonObject)
                 .flatMap(item => item?.type === 'text' && typeof item.text === 'string' ? [item.text] : []).join('\n');

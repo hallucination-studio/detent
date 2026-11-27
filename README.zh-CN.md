@@ -21,7 +21,7 @@
 
 Detent 采用 **双包分层架构**：
 - **`@detent/core`（通用基础架构包）**：将一个配置的 GitLab **工作区仓库（Workspace Hub Repository）** 转化为 100% 无状态、纯增量 MySQL 持久化的 Claude Code 会话中枢，实现 **`1 个 GitLab Issue = 1 个 Claude Code Session`**，自由编排跨项目 `0..N` 个 Worktree 与 `0..N` 个 Merge Request，并内置双层审批与单评论流式刷新。
-- **`@detent/delivery`（受治理 AI 变更交付中枢）**：基于 `@detent/core` 扩展构建，面向生产环境与基础设施交付，打通 **GitLab Issue 变更工单 → JumpServer 只读账号巡检 → Ansible 脚本提 MR 人工合并自动续跑 → 执行前人工二次审批 → JumpServer 任务中心下发执行与三方审计留痕** 的合规交付闭环。
+- **`@detent/delivery`（受治理 AI 变更交付中枢）**：基于 `@detent/core` 扩展构建，面向生产环境与基础设施交付，打通 **GitLab Issue 变更工单 → JumpServer 只读巡检 → Ansible 脚本提 MR 人工合并自动续跑 → 执行前人工二次审批 → JumpServer 任务中心下发执行与三方审计留痕** 的合规交付闭环。
 
 ## 相关文档
 
@@ -90,7 +90,7 @@ flowchart LR
 | 可选项 | 需要准备的参数 |
 | --- | --- |
 | Jev | `JEV_PROVIDER`（`bailian` 或 `typesafe`）和 `JEV_API_KEY`。百炼还需提供 `JEV_BASE_URL`。 |
-| JumpServer | `JUMPSERVER_BASE_URL`、独立的 `JUMPSERVER_READONLY_TOKEN` 与 `JUMPSERVER_JOB_TOKEN`，也可为两个角色分别配置访问密钥对 |
+| JumpServer | Hub 的 `jumpserver.base_url` 和一把 AccessKey，服务端设置 `DETENT_SECRET_JMS_AK_ID` 与 `DETENT_SECRET_JMS_AK_SECRET` |
 
 在仓库目录打开 AI 编程助手，复制以下提示词。
 
@@ -241,7 +241,7 @@ Webhook 返回 `202` 表示事件已进入当前进程的内存队列。正常�
 
 本地 Bash 先执行确定性硬门禁和静态白名单校验，再由 System One 评估符合条件的命令。只读或 Plan 模式仅放行高置信度的纯只读操作，编码模式还可放行仅影响临时工作区的开发命令。遇到超时、无效响应、低置信度或超出影响上限时，编码模式转人工审批，巡检和只读模式直接拒绝。放行记录写入 Issue 折叠轨迹。
 
-`JEV_PROVIDER` 默认为 `off`，支持阿里云百炼 Decision Model API、TypeSafe 和自托管兼容服务。百炼使用工作区端点和 API Key。密钥由服务端持有，Claude 子进程、日志和评论均隔离脱敏。Delivery 复用同一客户端评估只读巡检，并校验命令、资产和只读账号。方案、发布、生产任务和审批关单继续执行人工授权。[配置示例](./.env.example)
+`JEV_PROVIDER` 默认为 `off`，支持阿里云百炼 Decision Model API、TypeSafe 和自托管兼容服务。百炼使用工作区端点和 API Key。密钥由服务端持有，Claude 子进程、日志和评论均隔离脱敏。Delivery 复用同一客户端评估只读巡检，并校验命令、资产和账号授权。方案、发布、生产任务和审批关单继续执行人工授权。[配置示例](./.env.example)
 
 ### 启动交付服务
 
@@ -249,10 +249,10 @@ Webhook 返回 `202` 表示事件已进入当前进程的内存队列。正常�
 
 | 配置项 | 用途与默认值 |
 | --- | --- |
-| `JUMPSERVER_BASE_URL` / `JUMPSERVER_ORG_ID` | 服务地址启用 JumpServer 工具。组织 ID 可选。 |
-| `JUMPSERVER_READONLY_TOKEN` 或 `JUMPSERVER_READONLY_ACCESS_KEY_ID` + `JUMPSERVER_READONLY_ACCESS_KEY_SECRET` | 资产查询和巡检凭证。 |
-| `JUMPSERVER_JOB_TOKEN` 或 `JUMPSERVER_JOB_ACCESS_KEY_ID` + `JUMPSERVER_JOB_ACCESS_KEY_SECRET` | 独立的任务中心执行凭证。 |
-| `JUMPSERVER_READONLY_ACCOUNT` / `JUMPSERVER_TIMEOUT_MS` | 巡检系统账号默认为 `readonly`，请求超时默认为 30000 毫秒。 |
+| `JUMPSERVER_BASE_URL` / `JUMPSERVER_ORG_ID` | 旧环境配置的服务地址与可选组织 ID。 |
+| `JUMPSERVER_READONLY_TOKEN` 或 `JUMPSERVER_READONLY_ACCESS_KEY_ID` + `JUMPSERVER_READONLY_ACCESS_KEY_SECRET` | 旧环境配置的资产查询和巡检凭证。 |
+| `JUMPSERVER_JOB_TOKEN` 或 `JUMPSERVER_JOB_ACCESS_KEY_ID` + `JUMPSERVER_JOB_ACCESS_KEY_SECRET` | 旧环境配置的任务中心执行凭证。 |
+| `JUMPSERVER_READONLY_ACCOUNT` / `JUMPSERVER_TIMEOUT_MS` | 可显式指定旧模式巡检账号，请求超时默认为 30000 毫秒。 |
 | `JUMPSERVER_INSPECT_ALLOW_PREFIXES` | 逗号分隔的只读命令前缀，默认清单见 `.env.example`。命令参数仍须通过只读校验。 |
 | `JUMPSERVER_BLOCKED_ASSETS` / `JUMPSERVER_BLOCK_FAILED_PIPELINE` | 禁用资产 ID 列表默认空。失败流水线默认阻止执行，可用 `false` 或 `0` 关闭。 |
 | `DELIVERY_PROD_APPROVERS` | 逗号分隔的 GitLab 用户名，忽略大小写。配置名单时，生产审批人还须达到 Hub 项目的 `GITLAB_MIN_ACCESS_LEVEL`。 |
@@ -286,3 +286,11 @@ detent/
         ├── src/server.ts           # npm run start:delivery
         └── tests/
 ```
+
+### Hub 能力配置与服务端密钥
+
+管理员在 Hub 默认分支维护 `capabilities.json`。Issue 每轮执行、审批复核和 `/help` 都会读取当前配置。外部服务使用 `type: mcp`，传输方式为 `http` 或 `sse`。通过 `readonly_tools` 声明只读工具，其余工具需要审批。生产审批等级由 `approver_tier` 指定。
+
+服务端设置 `DETENT_SECRET_CUSTOM_MCP_TOKEN` 后，可在 MCP 请求头中引用 `${secret:CUSTOM_MCP_TOKEN}`。JumpServer 推荐由同一个 `auth` 对象通过 `$secret:JMS_AK_ID` 和 `$secret:JMS_AK_SECRET` 引用密钥，供巡检与 Ansible 共用。配置缺失时，帮助评论显示所需环境变量名。管理员负责确认接收凭证的目标地址。
+
+先使用流程 `account`，其次使用 Hub `default_account`。两者均未设置时，逐资产按 JumpServer 返回顺序选择首个有效授权账号，跳过停用账号和以 `@` 开头的虚拟账号。巡检按账号分组并汇总结果。单个 Ansible 任务要求所有目标使用同一账号，否则须指定共同的 `account` 或分组执行。缺少有效账号时，错误指出对应资产。[Hub 模板](examples/hub-workspace/capabilities.json)

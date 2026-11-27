@@ -14,12 +14,14 @@ export interface HubWorkflow {
   approverTier: WorkflowApproverTier;
   closePolicy: IssueClosePolicy;
   allowBash?: boolean;
+  account?: string;
+  allowPrefixes?: string[];
   isDefault: boolean;
   description: string;
   body: string;
 }
 
-export const workflowKeys = new Set(['label', 'mode', 'requires', 'approver_tier', 'close_policy', 'allow_bash', 'default', 'description']);
+export const workflowKeys = new Set(['label', 'mode', 'requires', 'approver_tier', 'close_policy', 'allow_bash', 'account', 'allow_prefixes', 'default', 'description']);
 
 export function parseHubWorkflowMarkdown(file: string, raw: string): HubWorkflow | null {
   const frontmatter = readHubFrontmatter(raw, workflowKeys, false);
@@ -40,9 +42,13 @@ export function parseWorkflowFields(file: string, { fields, body }: HubFrontmatt
 
   // Legacy workflow files also accepted lists with empty slots.
   const requires = readHubList(fields.get('requires'), defaultLabel === undefined);
-  if (!requires) return null;
+  const allowPrefixes = readHubList(fields.get('allow_prefixes'));
+  if (!requires || !allowPrefixes) return null;
+  const account = fields.get('account')?.trim();
   return {
     file, label, mode, approverTier, closePolicy, requires: [...new Set(requires.map(normalize))],
+    ...(account && { account }),
+    ...(fields.has('allow_prefixes') && { allowPrefixes }),
     ...(allowBash !== undefined && { allowBash: allowBash === 'true' }),
     isDefault: byDefault === 'true', description: fields.get('description') || file, body,
   };

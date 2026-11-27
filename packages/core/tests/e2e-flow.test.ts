@@ -524,7 +524,7 @@ it('renders live Hub help before session creation and preserves pending approval
   const reply = vi.spyOn(client, 'createIssueNote').mockResolvedValue({ id: 99 });
   const agent = (id: string) => ({ id, path: 'agents/' + id + '/AGENT.md', name: 'AGENT.md', type: 'blob' as const });
   vi.spyOn(client, 'listRepositoryTree').mockImplementation(async (_, dir) => dir === 'agents' ? [agent('code'), agent('setup')] : []);
-  vi.spyOn(client, 'getRepositoryFile').mockImplementation(async (_, file) =>
+  vi.spyOn(client, 'getRepositoryFile').mockImplementation(async (_, file) => file === 'capabilities.json' ? null :
     '---\nrequires: [' + (file.includes('/setup/') ? 'missing' : 'gitlab-onboarding') + ']\ndescription: 示例任务\n---\n操作步骤');
   const worker = new SessionOrchestrator(config, repo, client, { run }, {
     capabilities: [{ name: 'gitlab-onboarding', enabled: true, tools: [] }],

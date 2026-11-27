@@ -152,7 +152,7 @@ it('opens a human approval card with a redacted risk note on errors, low safety 
 
 it('isolates service credentials from the SDK child, prompt, stderr and GitLab notes', async () => {
   const credentials = { GITLAB_TOKEN: 'gitlab-pat-1', GITLAB_WEBHOOK_SECRET: 'webhook-secret-2',
-    ANTHROPIC_API_KEY: 'model-key-3', JEV_API_KEY: secret };
+    ANTHROPIC_API_KEY: 'model-key-3', DETENT_SECRET_CUSTOM: 'vault-entry-4', JEV_API_KEY: secret };
   const config = loadConfig({ ...bailian, ...credentials });
   const http = vi.fn<typeof fetch>(async () => Response.json({ id: 1 }));
   const gitlab = new GitLabClient(config, http);
@@ -171,7 +171,7 @@ it('isolates service credentials from the SDK child, prompt, stderr and GitLab n
     options?.stderr?.('diagnostic ' + secret);
     throw Error(secret);
   });
-  vi.stubEnv('JEV_API_KEY', secret);
+  for (const [key, value] of Object.entries(credentials)) vi.stubEnv(key, value);
   try {
     const progress = vi.fn();
     const turn = { gate, session, sandbox, tools, controller: new AbortController(), progress, resume: false, prompt: Object.values(credentials).join(' '), systemPrompt: secret };

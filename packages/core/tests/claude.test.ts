@@ -52,14 +52,14 @@ it('scrubs credentials from nested transcript values before checkpoint and resum
   const { repo, root, session } = await setup();
   try {
     session.claudeSessionId = 'session-2';
-    const hydrator = new TranscriptHydrator(repo, ['value"with-quotes', 'extension-token']);
+    const hydrator = new TranscriptHydrator(repo, ['value"with-quotes', 'extension-token', '12345']);
     const file = transcriptPath(root, root, session.claudeSessionId);
     await mkdir(path.dirname(file), { recursive: true });
-    const line = { uuid: 'u1', message: { content: [{ text: 'value"with-quotes extension-token https://oauth2:private@host/repo' }] } };
+    const line = { uuid: 'u1', message: { 'value"with-quotes': 12345, content: [{ text: 'value"with-quotes extension-token https://oauth2:private@host/repo' }] } };
     await writeFile(file, JSON.stringify(line) + '\n');
     await hydrator.flushIncrementalTranscriptToMySql(session, root, root, session.claudeSessionId);
     const [record] = await repo.getSessionMessages(session.id);
-    expect(JSON.parse(record.rawJsonLine)).toEqual({ uuid: 'u1', message: { content: [{ text: '*** *** https://oauth2:***@host/repo' }] } });
+    expect(JSON.parse(record.rawJsonLine)).toEqual({ uuid: 'u1', message: { '***': '***', content: [{ text: '*** *** https://oauth2:***@host/repo' }] } });
     await hydrator.hydrateTranscriptToTmp(session, root, root);
     expect(await readFile(file, 'utf8')).toBe(record.rawJsonLine + '\n');
   } finally { await rm(root, { recursive: true, force: true }); }

@@ -1,3 +1,4 @@
+import { configuredSecrets } from '../gitlab/redact.js';
 import { defineExtensionTool } from '../extensions.js';
 import { redactGitUrl, type GitLabClient, type LiveMr } from '../gitlab/client.js';
 import type { SessionWorktreeRow } from '../types.js';
@@ -6,7 +7,7 @@ import { EphemeralSandbox, git, type TurnSandbox } from './ephemeral-sandbox.js'
 export function createMrTools(gitlab: Pick<GitLabClient, 'listMergeRequestDiffs' | 'listMergeRequestDiscussions'>,
   mr: LiveMr, host: EphemeralSandbox, sandbox: TurnSandbox, tree: SessionWorktreeRow) {
   const project = mr.target_project_id;
-  const redact = (text: string) => redactGitUrl(text, host.config.jevApiKey);
+  const redact = (text: string) => redactGitUrl(text, configuredSecrets(host.config));
   return [
     defineExtensionTool({
       name: 'detent_get_mr_diff', description: 'Read the current merge request diff', policy: 'readonly', schema: {},

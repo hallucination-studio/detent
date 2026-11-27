@@ -1,3 +1,5 @@
+import type { AppConfig } from './config.js';
+import type { HubCapabilitiesDocument } from './workflows/hub-capabilities.js';
 import type { DecisionClient } from './decision/jev-client.js';
 import type { z } from 'zod';
 import type { Pool } from 'mysql2/promise';
@@ -10,7 +12,13 @@ import type { ApprovalRequestRow, ApprovalType, IssueSessionRow, PermissionMode 
 
 export type ToolGovernancePolicy = 'readonly' | 'coding_auto' | 'always_approve';
 
+export interface WorkflowToolConfig {
+  account?: string;
+  allowPrefixes?: readonly string[];
+}
+
 export interface ExtensionToolContext {
+  workflow?: WorkflowToolConfig;
   session: IssueSessionRow;
   repo: DetentRepository;
   workspaceRoot: string;
@@ -53,6 +61,7 @@ export interface SandboxScope {
 }
 
 export interface TurnProfile {
+  workflow?: WorkflowToolConfig;
   closePolicy?: IssueClosePolicy;
   canCloseIssue?(ctx: { session: IssueSessionRow; repo: DetentRepository }): Promise<{ ok: true } | { ok: false; reason: string }>;
   blockedMessage?: string;
@@ -107,6 +116,13 @@ export interface EventNotification {
 }
 
 export interface DetentExtensions {
+  resolveCapabilities?(ctx: {
+    gitlab: Partial<Pick<GitLabClient, 'getRepositoryFile'>>;
+    hubProjectId: number;
+    hubDefaultBranch: string;
+    config: AppConfig;
+    document: HubCapabilitiesDocument;
+  }): Promise<readonly DetentCapabilityPack[]>;
   onNotify?(notification: EventNotification): void | Promise<void>;
   decisionClient?: DecisionClient;
   tools?: readonly AnyDetentExtensionTool[];

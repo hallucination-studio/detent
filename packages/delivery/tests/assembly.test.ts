@@ -76,7 +76,7 @@ it.each(['injected', 'http', 'disabled'] as const)('assembles %s tools alongside
     expect(onboarding).toMatchObject({ name: 'gitlab-onboarding', enabled: true, approverTier: 'prod' });
     expect(release).toMatchObject({ name: 'gitlab-release', enabled: true });
     expect(release.tools.map(tool => tool.name)).toEqual(['detent_list_tags', 'detent_create_release']);
-    expect(jumpserver).toMatchObject({ name: 'jumpserver', enabled: mode !== 'disabled', setupHint: expect.stringContaining('JUMPSERVER_BASE_URL') });
+    expect(jumpserver).toMatchObject({ name: 'jumpserver', enabled: mode !== 'disabled', setupHint: expect.stringContaining('jumpserver.base_url') });
     expect(jumpserver.tools.map(tool => tool.name)).toEqual(mode === 'disabled' ? [] :
       ['jms_list_assets', 'jms_readonly_inspect', 'jms_run_ansible_job', 'jms_get_job_result']);
   } finally {
@@ -218,7 +218,7 @@ it('enforces the live MCP pack production tier for an Agent with standard SOP ap
     dir === 'agents' ? [{ id: 'agent', name: 'AGENT.md', path: 'agents/image-sync/AGENT.md', type: 'blob' }] : [],
   );
   let markdown = '---\nrequires: [harbor-sync]\napprover_tier: standard\n---\nMirror the requested image.';
-  vi.spyOn(GitLabClient.prototype, 'getRepositoryFile').mockImplementation(async () => markdown);
+  vi.spyOn(GitLabClient.prototype, 'getRepositoryFile').mockImplementation(async (_, file) => file === 'capabilities.json' ? null : markdown);
   const permission = vi.spyOn(GitLabClient.prototype, 'hasApprovalPermission')
     .mockImplementation(async (_project, access, minimum = 30) => access >= minimum);
   let capture!: (orchestrator: SessionOrchestrator) => void;
@@ -279,4 +279,26 @@ it('enforces the live MCP pack production tier for an Agent with standard SOP ap
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   }
+});
+
+it('rebuilds single-key capability packs from successive Hub revisions', async () => {
+  const config = loadConfig({ GITLAB_WEBHOOK_SECRET: 'test', DETENT_SECRET_JMS_AK_ID: 'access-id', DETENT_SECRET_JMS_AK_SECRET: 'access-secret' });
+  const settings = loadDeliveryConfig({});
+  const app = createDeliveryApp(config, { deliveryConfig: settings });
+  try {
+    const resolver = vi.mocked(createDetentApp).mock.lastCall![1]!.resolveCapabilities!;
+    const ctx = { gitlab: {}, hubProjectId: 1, hubDefaultBranch: 'main', config };
+    const entry = { type: 'jumpserver', base_url: '', auth: { access_key_id: '$secret:JMS_AK_ID', access_key_secret: '$secret:JMS_AK_SECRET' } };
+    const resolve = (entries: Parameters<typeof resolver>[0]['document']['entries']) =>
+      resolver({ ...ctx, document: { present: true, invalid: false, entries } });
+    expect((await resolve({ jumpserver: entry }))[0]).toMatchObject({ enabled: false, setupHint: expect.stringContaining('jumpserver.base_url') });
+    entry.base_url = 'https://jms.test';
+    expect((await resolve({ jumpserver: entry }))[0]).toMatchObject({ enabled: true, tools: expect.arrayContaining([expect.objectContaining({ name: 'jms_readonly_inspect' })]) });
+    expect((await resolve({ jumpserver: { ...entry, auth: { token: '$secret:MISSING' } } }))[0].setupHint).toBe('服务端缺少密钥 DETENT_SECRET_MISSING');
+    for (const override of [{ enabled: false }, { base_url: 'https://user:pass@jms.test' }, { block_failed_pipeline: 'false' }])
+      expect((await resolve({ jumpserver: { ...entry, ...override } }))[0]).toMatchObject({ enabled: false, tools: [] });
+    const release = { type: 'gitlab-release' };
+    expect((await resolve({ release }))[0]).toMatchObject({ name: 'release', enabled: true });
+    expect((await resolve({ release: { ...release, enabled: false } }))[0]).toMatchObject({ enabled: false, tools: [] });
+  } finally { await app.close(); }
 });

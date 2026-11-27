@@ -6,7 +6,6 @@ import type { DetentExtensions } from '../extensions.js';
 import { PermissionGate, ColdHold } from '../claude/permission-gate.js';
 import { buildMrSystemPrompt, inlinePosition } from '../claude/prompts.js';
 import type { ClaudeRunner } from '../claude/runner.js';
-import { configuredSecrets } from '../gitlab/redact.js';
 import { TranscriptHydrator } from '../claude/transcript-hydrator.js';
 import { redactGitUrl, type GitLabClient } from '../gitlab/client.js';
 import { hasBotMention, parseNoteIntent, parseEmojiIntent } from '../gitlab/command-parser.js';
@@ -45,7 +44,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
   private wake(s: IssueSessionRow, reason: 'inbox' | 'note' = 'inbox') {
     // The durable inbox outlives this task. Keep webhook lanes free for interrupts and approvals.
     const task = this.wakeSession(s, reason).catch(error => {
-      if (!(error instanceof SessionBusy)) console.error(redactGitUrl(String(error), this.config.jevApiKey));
+      if (!(error instanceof SessionBusy)) console.error(redactGitUrl(String(error), this.secrets));
     }).finally(() => this.turns.delete(task));
     this.turns.add(task);
   }
@@ -125,7 +124,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
     if (s.status === 'DONE') await this.reopen(s);
     const added = await this.repo.enqueueSessionInbox({ sessionId: s.id, eventId, sourceKind: 'note', discussionId: discussion,
       senderUsername: event.user.username, content: redactGitUrl(inlinePosition({ type: a.type, position: a.position ?? undefined }) +
-        (intent.comment || a.note), this.config.jevApiKey) });
+        (intent.comment || a.note), this.secrets) });
     if (added) await this.repo.updateSessionState(s.id, { autoFixAttempts: 0 });
     this.wake(s, 'note');
   }
@@ -178,7 +177,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
       const items = await this.drainInbox(s.id, active, s.status === 'WAITING_PLAN' ? 'note' : undefined);
       if (!items.length && reason !== 'expired') return;
       if (s.status === 'WAITING_PLAN') await this.expire(s);
-      await this.run(s, active, formatInboxMessages(items, this.config.jevApiKey) || '上轮执行中断，请检查已保存进度并继续。', threads(items));
+      await this.run(s, active, formatInboxMessages(items, this.secrets) || '上轮执行中断，请检查已保存进度并继续。', threads(items));
     }, undefined, reason === 'expired' ? candidate.lockExpiresAt! : undefined);
   }
   private async run(s: IssueSessionRow, active: Active, prompt: string, discussions: string[], previous?: ApprovalRequestRow) {
@@ -192,7 +191,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
       const late = await this.drainInbox(s.id, active, s.status === 'WAITING_PLAN' ? 'note' : undefined);
       if (!late.length) return;
       if (s.status === 'WAITING_PLAN') await this.expire(s);
-      prompt = formatInboxMessages(late, this.config.jevApiKey);
+      prompt = formatInboxMessages(late, this.secrets);
       discussions = threads(late);
       previous = undefined;
     }
@@ -201,7 +200,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
     const channel = this.channel(s, discussions[0]);
     const { controller } = active;
     const host = new EphemeralSandbox(this.config, this.repo, this.gitlab);
-    const secrets = configuredSecrets(this.config);
+    const secrets = this.secrets;
     const redact = (text: string) => redactGitUrl(text, secrets);
     let sandbox: TurnSandbox | undefined;
     let streamer: NoteStreamer | undefined;
@@ -229,7 +228,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
       streamer = new NoteStreamer(this.config.noteStreamThrottleMs, body => channel.updateNote(note.id, body + footer), async () => '', secrets);
       sandbox = await host.prepareTurnSandbox(s);
       const tree = await host.ensureMrWorktree(sandbox, s.id, { sourceProjectId: mr.source_project_id, sourceBranch: mr.source_branch, targetBranch: mr.target_branch });
-      const transcript = new TranscriptHydrator(this.repo, configuredSecrets(this.config));
+      const transcript = new TranscriptHydrator(this.repo, this.secrets);
       const { workspaceRoot, claudeHome } = sandbox;
       await transcript.hydrateTranscriptToTmp(s, claudeHome, workspaceRoot);
       const flush = () => transcript.flushIncrementalTranscriptToMySql(s, claudeHome, workspaceRoot, s.claudeSessionId!);
@@ -323,14 +322,14 @@ export class MergeRequestOrchestrator extends TurnRuntime {
       if (mr && (mr.state !== 'opened' || (mr.sha && p.sha && mr.sha !== p.sha))) continue;
       const context = {
         ...normalized, ref: mr?.source_branch ?? normalized.ref,
-        summary: redactGitUrl([normalized.summary, mr?.title].filter(Boolean).join(' · '), this.config.jevApiKey),
+        summary: redactGitUrl([normalized.summary, mr?.title].filter(Boolean).join(' · '), this.secrets),
         mr: mr ? { iid: mr.iid, title: mr.title, description: mr.description ?? undefined, assignees: mr.assignees ?? [] } : undefined,
       };
       const { rule, action } = await evaluateEventPolicy(policy, context, options);
       const assigned = mr?.assignees?.some(a => this.gitlab.isBotUser(a.id, a.username));
       const route = rule ? action : assigned ? 'run' : 'ignore';
       const resource = mr?.web_url ?? `${event.project.path_with_namespace ?? project}@${p.ref}`;
-      let body = redactGitUrl([`Pipeline #${p.id} failed · ${resource}`, p.url].filter(Boolean).join('\n'), this.config.jevApiKey);
+      let body = redactGitUrl([`Pipeline #${p.id} failed · ${resource}`, p.url].filter(Boolean).join('\n'), this.secrets);
       if (route === 'notify') {
         await sendEventNotification(this.gitlab, this.config, { eventId, target: rule?.notifyTarget ?? 'resource',
           projectId: project, mrIid: mr?.iid, sha: p.sha, body, hubIssueLabel: rule?.hubIssueLabel }, this.options.onNotify);

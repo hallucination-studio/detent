@@ -16,7 +16,6 @@ import type { WebhookEvent } from '../gitlab/webhook.js';
 import { escapeTableCell, NoteStreamer, recoveryHint, renderPlanApprovalCard, renderStatus, renderSummary, waitingToolGuidance } from '../gitlab/note-streamer.js';
 import { EphemeralSandbox, type TurnSandbox, type WorkspaceGitLab } from '../workspace/ephemeral-sandbox.js';
 import { WorkspaceTools } from '../workspace/mcp-tools.js';
-import { configuredSecrets } from '../gitlab/redact.js';
 import { TranscriptHydrator } from '../claude/transcript-hydrator.js';
 import { ColdHold, PermissionGate } from '../claude/permission-gate.js';
 import { buildSystemPrompt } from '../claude/prompts.js';
@@ -24,8 +23,9 @@ import type { ClaudeRunner } from '../claude/runner.js';
 import { missingHubCapabilities } from '../workflows/hub-workflows.js';
 import { loadHubAgents } from '../workflows/hub-agents.js';
 import { normalizeHubValue } from '../workflows/hub-frontmatter.js';
-
-import type { DetentExtensions } from '../extensions.js';
+import { connectMcpCapabilityPack } from '../extensions/mcp-bridge.js';
+import { loadHubCapabilities, resolveHubMcpCapabilities } from '../workflows/hub-capabilities.js';
+import type { DetentCapabilityPack, DetentExtensions } from '../extensions.js';
 import { checkIssueClosure, createCloseIssueTool } from './close-issue.js';
 import { notifyHook } from './lifecycle.js';
 
@@ -49,13 +49,30 @@ export class SessionOrchestrator extends TurnRuntime {
     super(config, repo, extensions.hooks);
     this.decision = extensions.decisionClient ?? createDecisionClient(config);
   }
-  private getCapabilities() {
-    return this.extensions.capabilities ?? [];
+  private async getCapabilities(): Promise<readonly DetentCapabilityPack[]> {
+    const { config, gitlab } = this;
+    const { gitlabHubProjectId: hubProjectId, gitlabHubDefaultBranch: hubDefaultBranch } = config;
+    const document = await loadHubCapabilities(gitlab, hubProjectId, hubDefaultBranch);
+    const fixed = this.extensions.capabilities ?? [];
+    if (document.invalid) return fixed.map(pack => ({ ...pack, enabled: false, tools: [], setupHint: document.error }));
+    const [dynamic, mcp] = await Promise.all([
+      this.extensions.resolveCapabilities?.({ config, gitlab, document, hubProjectId, hubDefaultBranch }),
+      resolveHubMcpCapabilities(document, config.secrets, (cfg, options) => connectMcpCapabilityPack(cfg, { ...options, secrets: this.secrets })),
+    ]);
+    const live = [...(dynamic ?? []), ...mcp];
+    const packs = new Map<string, DetentCapabilityPack>();
+    for (const pack of fixed) {
+      const name = normalizeHubValue(pack.name);
+      const overridden = Object.keys(document.entries).some(key => normalizeHubValue(key) === name);
+      packs.set(name, overridden ? { ...pack, enabled: false, tools: [], setupHint: '请检查 Hub capabilities.json 中的能力类型' } : pack);
+    }
+    for (const pack of live) packs.set(normalizeHubValue(pack.name), pack);
+    return [...packs.values()];
   }
-  private resolveTurnProfile(session: IssueSessionRow, context: { purpose: 'turn'; prompt: string } |
-    { purpose: 'approval'; approval: Pick<ApprovalRequestRow, 'approvalType' | 'toolName'> }) {
+  private resolveTurnProfile(session: IssueSessionRow, capabilities: readonly DetentCapabilityPack[],
+    context: { purpose: 'turn'; prompt: string } | { purpose: 'approval'; approval: Pick<ApprovalRequestRow, 'approvalType' | 'toolName'> }) {
     return this.extensions.resolveTurnProfile?.({
-      session, repo: this.repo, gitlab: this.gitlab, decision: this.decision, capabilities: this.getCapabilities(), ...context,
+      session, repo: this.repo, gitlab: this.gitlab, decision: this.decision, capabilities, ...context,
     });
   }
   async resumeSession(id: string, prompt: string, options?: {
@@ -81,7 +98,7 @@ export class SessionOrchestrator extends TurnRuntime {
       if (reason === 'expired' && !await this.recover(s, this.channel(s))) return;
       const items = await this.drainInbox(s.id, active);
       if (!items.length && reason === 'inbox') return;
-      await this.run(s, active, formatInboxMessages(items, this.config.jevApiKey) || '上轮执行中断，请检查已保存的进度并继续。');
+      await this.run(s, active, formatInboxMessages(items, this.secrets) || '上轮执行中断，请检查已保存的进度并继续。');
     }, undefined, reason === 'expired' ? candidate.lockExpiresAt! : undefined);
   }
   async handleIssueOpened(event: Extract<WebhookEvent, { object_kind: 'issue' }>) {
@@ -128,7 +145,7 @@ export class SessionOrchestrator extends TurnRuntime {
         const late = await this.drainInbox(s.id, active);
         if (late.length) {
           if (s.status === 'WAITING_PLAN') await this.expire(s);
-          next = formatInboxMessages(late, this.config.jevApiKey);
+          next = formatInboxMessages(late, this.secrets);
         }
       }
     }
@@ -137,21 +154,22 @@ export class SessionOrchestrator extends TurnRuntime {
     const channel = this.channel(s);
     const drainInbox = () => this.drainInbox(s.id, active);
     const host = new EphemeralSandbox(this.config, this.repo, this.gitlab);
-    const transcripts = new TranscriptHydrator(this.repo, configuredSecrets(this.config));
+    const transcripts = new TranscriptHydrator(this.repo, this.secrets);
     const { controller } = active;
     let sandbox: TurnSandbox | undefined;
     let streamer: NoteStreamer | undefined;
     let issueClosed = false;
     try {
-      const profile = await this.resolveTurnProfile(s, { purpose: 'turn', prompt });
+      const capabilities = await this.getCapabilities();
+      const profile = await this.resolveTurnProfile(s, capabilities, { purpose: 'turn', prompt });
       controller.signal.throwIfAborted();
       if (profile?.blockedMessage?.trim()) {
-        await channel.createNote(redactGitUrl(profile.blockedMessage + '\n\n' + helpHint, configuredSecrets(this.config)));
+        await channel.createNote(redactGitUrl(profile.blockedMessage + '\n\n' + helpHint, this.secrets));
         await this.state(s, 'IDLE');
         return;
       }
       const plan = s.permissionMode === 'plan';
-      const routingPrefix = profile?.routingNotice ? redactGitUrl(profile.routingNotice, configuredSecrets(this.config)) + '\n\n' : '';
+      const routingPrefix = profile?.routingNotice ? redactGitUrl(profile.routingNotice, this.secrets) + '\n\n' : '';
       await this.state(s, plan ? 'PLANNING' : 'CODING', s.permissionMode);
       const note = await channel.createNote(
         plan ? '正在分析需求…' : '正在执行已审批方案…',
@@ -174,7 +192,7 @@ export class SessionOrchestrator extends TurnRuntime {
       const closeTool = profile && createCloseIssueTool(profile, request => { closeRequested = request; });
       const gate = new PermissionGate({
         decision: this.decision,
-        capabilities: this.getCapabilities(),
+        capabilities,
         extensionTools: closeTool ? [...(this.extensions.tools ?? []), closeTool] : this.extensions.tools,
         profile: closeTool && profile?.enabledExtensionTools
           ? { ...profile, enabledExtensionTools: [...profile.enabledExtensionTools, closeTool.name] }
@@ -194,7 +212,7 @@ export class SessionOrchestrator extends TurnRuntime {
         this.config.noteStreamThrottleMs,
         (body) => channel.updateNote(note.id, body),
         () => this.summary(s.id),
-        configuredSecrets(this.config),
+        this.secrets,
       );
       const systemPrompt = buildSystemPrompt(
         s,
@@ -256,8 +274,8 @@ export class SessionOrchestrator extends TurnRuntime {
         s.recoveryAttempts = 0;
       }
       const completed = this.extensions.hooks?.onTurnCompleted;
-      if (completed) await notifyHook(async () => completed((await this.repo.getSession(s.id))!, result), this.config.jevApiKey);
-      if (pending.length) return formatInboxMessages(pending, this.config.jevApiKey);
+      if (completed) await notifyHook(async () => completed((await this.repo.getSession(s.id))!, result), this.secrets);
+      if (pending.length) return formatInboxMessages(pending, this.secrets);
     } catch (error) {
       const cause = controller.signal.reason ?? error;
       // A status-sync failure after GitLab accepted the close cannot undo it.
@@ -274,7 +292,7 @@ export class SessionOrchestrator extends TurnRuntime {
         return;
       }
       await this.state(s, 'FAILED');
-      const message = redactGitUrl('本轮执行失败：' + (error instanceof Error ? error.message : '未知错误'), configuredSecrets(this.config)) + recoveryHint;
+      const message = redactGitUrl('本轮执行失败：' + (error instanceof Error ? error.message : '未知错误'), this.secrets) + recoveryHint;
       if (streamer) await streamer.flush(message);
       else await this.gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, message);
     } finally {
@@ -296,9 +314,13 @@ export class SessionOrchestrator extends TurnRuntime {
     if (intent.type === 'HELP') {
       if (!await this.gitlab.hasApprovalPermission(project, intent.userId)) return;
       const { agents } = await loadHubAgents(this.gitlab, project, this.config.gitlabHubDefaultBranch);
+      const capabilities = await this.getCapabilities();
       const menu = agents.map(agent => {
-        const missing = missingHubCapabilities(agent, this.getCapabilities());
-        const status = missing.length ? '⚪ 未开通（待配置 ' + escapeTableCell(missing.join('、')) + '）' : '✅ 已就绪';
+        const missing = missingHubCapabilities(agent, capabilities);
+        const status = missing.length ? '⚪ 未开通（待配置 ' + escapeTableCell(missing.map(name => {
+          const hint = capabilities.find(pack => normalizeHubValue(pack.name) === name)?.setupHint;
+          return hint ? name + '：' + hint : name;
+        }).join('、')) + '）' : '✅ 已就绪';
         return `| ${escapeTableCell(agent.description)} | ${escapeTableCell(agent.label, 'code')} | ${status} |`;
       });
       await this.gitlab.createIssueNote(project, iid, [
@@ -334,7 +356,7 @@ export class SessionOrchestrator extends TurnRuntime {
     if (s.status === 'DONE') return;
     // Insert before trying the lease. Either the current turn drains this event, or this delivery wakes it.
     await this.repo.enqueueSessionInbox({ sessionId: s.id, eventId: eventId ?? randomUUID(),
-      sourceKind: 'note', senderUsername: intent.username, content: intent.comment ?? s.issueTitle });
+      sourceKind: 'note', senderUsername: intent.username, content: redactGitUrl(intent.comment ?? s.issueTitle, this.secrets) });
     try {
       await this.withLease(s, async (session, active) => {
         if (session.status === 'WAITING_TOOL' || session.status === 'DONE') return;
@@ -342,8 +364,8 @@ export class SessionOrchestrator extends TurnRuntime {
         if (!pending.length) return;
         await this.expire(session);
         if (session.status === 'WAITING_PLAN') session.permissionMode = 'plan';
-        const prompt = pending.length === 1 ? redactGitUrl(pending[0].content, this.config.jevApiKey)
-          : formatInboxMessages(pending, this.config.jevApiKey);
+        const prompt = pending.length === 1 ? redactGitUrl(pending[0].content, this.secrets)
+          : formatInboxMessages(pending, this.secrets);
         await this.run(session, active, prompt);
       });
     } catch (error) {
@@ -369,7 +391,7 @@ export class SessionOrchestrator extends TurnRuntime {
         : await this.repo.getLatestPendingApproval(s.id));
     if (pending?.status !== 'PENDING') return;
     const { approvalType, toolName } = pending;
-    const profile = await this.resolveTurnProfile(s, { purpose: 'approval', approval: { approvalType, toolName } });
+    const profile = await this.resolveTurnProfile(s, await this.getCapabilities(), { purpose: 'approval', approval: { approvalType, toolName } });
     if (profile?.blockedMessage?.trim()) return;
     const { approvalProjectId } = this.channel(s);
     const permitted = profile?.canApprove
@@ -407,7 +429,7 @@ export class SessionOrchestrator extends TurnRuntime {
         '未找到指定的 Agent。可用 Agent：',
         ...agents.map(agent => `- ${escapeTableCell(agent.id, 'code')}（标签 ${escapeTableCell(agent.label, 'code')}）`),
       ].join('\n') : 'Hub 仓库尚未配置可用 Agent。';
-      await this.gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, redactGitUrl(message, this.config.jevApiKey));
+      await this.gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, redactGitUrl(message, this.secrets));
       return;
     }
     if (!this.gitlab.updateIssueLabels) {

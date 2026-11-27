@@ -101,6 +101,7 @@ function blockedStage(segment: string) {
   const [program, ...args] = words.map(word => word.replace(/['"]/g, ''));
   const [subcommand, ...rest] = args;
   const literal = [program, ...args].join(' ');
+  if (program === 'kafka-topics.sh') return args.length !== 1 || !['--list', '--describe'].includes(subcommand);
   if (!program || !/^[\w-]+$/.test(program) || blockedPrograms.has(program)) return true;
   if (/\bsecrets?\b/i.test(literal) && /^(?:cat|grep|rg|awk|sed|head|tail)$/.test(program)) return true;
   switch (program) {

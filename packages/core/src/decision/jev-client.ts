@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { configuredSecrets, redactGitUrl } from '../gitlab/redact.js';
+import { configuredSecrets, redactGitUrl, scrubJson } from '../gitlab/redact.js';
 import type { AppConfig } from '../config.js';
 
 export type JevProvider = AppConfig['jevProvider'];
@@ -62,8 +62,7 @@ class HttpJevDecisionClient implements DecisionClient {
       const res = await this.http(this.endpoint, {
         method: 'POST', redirect: 'error', signal: AbortSignal.timeout(this.timeoutMs),
         headers: { 'Content-Type': 'application/json', ...(this.#apiKey && { Authorization: 'Bearer ' + this.#apiKey }) },
-        body: JSON.stringify({ model: this.model, state, questions }, (_key, value) =>
-          typeof value === 'string' ? redactGitUrl(value, this.#secrets) : value),
+        body: JSON.stringify(scrubJson({ model: this.model, state, questions }, value => redactGitUrl(value, this.#secrets))),
       });
       if (!res.ok) throw Error();
       const { answers } = response.parse(await res.json());

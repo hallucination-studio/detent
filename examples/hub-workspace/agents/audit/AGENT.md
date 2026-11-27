@@ -1,5 +1,6 @@
 ---
 label: delivery::audit
+# 可选 account 指定授权账号，allow_prefixes 可追加只读诊断命令。
 mode: readonly
 requires: [jumpserver]
 close_policy: auto

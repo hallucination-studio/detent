@@ -463,6 +463,7 @@ it('wires onReady packs into profile resolution and permits an MCP mutation only
     return repo as unknown as database.MySqlDetentRepository;
   });
   vi.spyOn(GitLabClient.prototype, 'initBotIdentity').mockResolvedValue();
+  vi.spyOn(GitLabClient.prototype, 'getRepositoryFile').mockResolvedValue(null);
   vi.spyOn(GitLabClient.prototype, 'getProject').mockImplementation(git.getProject);
   vi.spyOn(GitLabClient.prototype, 'buildAuthenticatedCloneUrl').mockImplementation(git.buildAuthenticatedCloneUrl);
   vi.spyOn(GitLabClient.prototype, 'hasApprovalPermission').mockImplementation(async (_project, user) => user === 40);

@@ -1,3 +1,4 @@
+import { resolveJumpServerSettings } from './hub-config.js';
 import {
   createDecisionClient, createDetentApp, createGitLabOnboardingCapability, createGitLabReleaseCapability, GitLabClient, loadConfig,
   type AppConfig, type DetentCapabilityPack, type DetentExtensions, type ReleaseGitLab, type OnboardingGitLab,
@@ -49,7 +50,7 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
     : { name: 'gitlab-release', enabled: false, setupHint: '服务端已禁用 gitlab-release（DELIVERY_ENABLE_RELEASE_TOOLS=false）', tools: [] };
   const jumpserver: DetentCapabilityPack = {
     name: 'jumpserver', enabled: !!client,
-    setupHint: '请配置 JUMPSERVER_BASE_URL 及独立的只读/任务中心凭证（JUMPSERVER_READONLY_* 与 JUMPSERVER_JOB_*）',
+    setupHint: '请在 Hub capabilities.json 配置 jumpserver.base_url 和 auth，并在服务端提供 DETENT_SECRET_JMS_AK_ID 与 DETENT_SECRET_JMS_AK_SECRET',
     tools: client ? createJumpServerTools({ client, config: deliveryConfig, tracker, decision }) : [],
   };
   const packs = new Map<string, DetentCapabilityPack>();
@@ -57,6 +58,24 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
   const capabilities = [...packs.values()];
   return createDetentApp(config, {
     ...extensions, capabilities, decisionClient: decision,
+    async resolveCapabilities(ctx) {
+      const dynamic: DetentCapabilityPack[] = [];
+      for (const [name, entry] of Object.entries(ctx.document.entries)) {
+        if (entry.type === 'jumpserver') {
+          const resolved = resolveJumpServerSettings(entry, ctx.config.secrets, deliveryConfig);
+          dynamic.push('setupHint' in resolved ? { name, enabled: false, tools: [], setupHint: resolved.setupHint } : {
+            name, enabled: true, tools: createJumpServerTools({ config: resolved.config, tracker, decision, defaultAccount: resolved.defaultAccount,
+              client: new HttpJumpServerClient(resolved.config, ctx.config) }),
+          });
+        } else if (entry.type === 'gitlab-release') {
+          const flag = entry.block_failed_pipeline;
+          dynamic.push(entry.enabled === false || (flag !== undefined && typeof flag !== 'boolean')
+            ? { name, enabled: false, tools: [], setupHint: '请检查 Hub capabilities.json 中的 gitlab-release 配置' }
+            : { ...createGitLabReleaseCapability({ gitlab: api, blockFailedPipeline: flag ?? deliveryConfig.blockFailedPipeline }), name });
+        }
+      }
+      return [...dynamic, ...(await extensions.resolveCapabilities?.(ctx) ?? [])];
+    },
     resolveTurnProfile: createDeliveryTurnProfileResolver(deliveryConfig, {
       async canCloseIssue({ session }) {
         const rows = await tracker?.listSessionExecutions?.(session.id);
@@ -65,7 +84,7 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
           return { ok: false, reason: '最新交付执行记录状态为 ' + latest.status + '，未成功前禁止关闭工单' };
         return { ok: true };
       },
-      hubDefaultBranch: config.gitlabHubDefaultBranch, capabilities, resolveTurnProfile: extensions.resolveTurnProfile,
+      hubDefaultBranch: config.gitlabHubDefaultBranch, resolveTurnProfile: extensions.resolveTurnProfile,
     }),
     async onInitSchema(pool) {
       await auditRepo?.init(pool);

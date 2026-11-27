@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import type { DetentExtensions } from './extensions.js';
+import { configuredSecrets } from './gitlab/redact.js';
 import type { AppConfig } from './config.js';
 import { createMySqlPool, initMySqlSchema } from './db/mysql.js';
 import { MySqlDetentRepository } from './db/repository.js';
@@ -27,7 +28,7 @@ export function createDetentApp(config: AppConfig, extensions: DetentExtensions 
   const runner = new SdkClaudeRunner(config);
   const orchestrator = new SessionOrchestrator(config, repo, client, runner, { ...extensions, capabilities, decisionClient: decision });
   const report = (error: unknown) =>
-    console.error(redactGitUrl(error instanceof Error ? error.message : String(error), config.jevApiKey));
+    console.error(redactGitUrl(error instanceof Error ? error.message : String(error), configuredSecrets(config)));
   const mrs = new MergeRequestOrchestrator(config, repo, client, runner, { decision, onNotify: extensions.onNotify,
     runHubEvent: (event, body, label) => runHubEvent(client, config, event, body, orchestrator, label) });
   const watchdog = new Watchdog(orchestrator, report, mrs);
@@ -51,7 +52,7 @@ export function createDetentApp(config: AppConfig, extensions: DetentExtensions 
       const reservedToolNames = new Set([
         ...(extensions.tools ?? []), ...capabilities.filter(pack => pack.enabled).flatMap(pack => pack.tools),
       ].map(tool => tool.name));
-      capabilities.push(...await loadMcpCapabilityPacks(configs, { reservedToolNames }));
+      capabilities.push(...await loadMcpCapabilityPacks(configs, { reservedToolNames, secrets: configuredSecrets(config) }));
     }
     await initMySqlSchema(pool);
     await extensions.onInitSchema?.(pool);

@@ -210,6 +210,9 @@ async function main() {
     const value = key === 'DETENT_PUBLIC_URL' ? publicUrl : env[key] ?? previous[key] ?? defaults[key];
     if (value !== undefined) output[key] = value;
   }
+  for (const [key, value] of Object.entries({ ...previous, ...env })) {
+    if (/^DETENT_SECRET_[A-Z0-9_]+$/.test(key) && value?.trim()) output[key] = value;
+  }
   Object.assign(output, { GITLAB_BASE_URL: base, GITLAB_TOKEN: token, GITLAB_WEBHOOK_SECRET: secret,
     GITLAB_HUB_PROJECT_ID: String(hub.id), GITLAB_HUB_DEFAULT_BRANCH: hub.default_branch });
   const lines = Object.entries(output).map(([key, value]) => {

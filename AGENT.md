@@ -18,10 +18,10 @@
 4. **MySQL 会话消息必须纯增量写入（Append-Only Incremental Messages）**
    - 严禁在主表存取并覆写整份 `.jsonl` 大字段；必须通过 `session_messages` 表按 `(session_id, seq)` 做批量 `INSERT IGNORE` 追加。
    - 严禁对普通只读 `SELECT` 套 `SELECT ... FOR UPDATE` 事务锁，严禁引入 MySQL 高频空转轮询表，租约心跳上限不低于 15s。
-5. **生产变更三道门禁与物理凭证隔离（`@detent/delivery` 合规铁律）**
-   - **第一道（Plan 方案审批）**：变更前必须先通过只读账号巡检现状并输出方案，未经审批不得进入实施阶段。
+5. **生产变更三道门禁与父进程权限隔离（`@detent/delivery` 合规铁律）**
+   - **第一道（Plan 方案审批）**：变更前必须先通过只读工具巡检现状并输出方案，未经审批不得进入实施阶段。
    - **第二道（MR 人工合并硬校验）**：调用 JumpServer 执行 Ansible 变更前，必须由硬代码 `guard()` 校验目标 MR 在 MySQL 中已是 `merged` 且 `merge_commit_sha` 与执行版本一致，绝不依赖 Prompt 软约束。
-   - **第三道（执行前人工二次审批 + 凭证隔离）**：`jms_run_ansible_job` 治理级别必须为 `always_approve`；JumpServer 只读账号与任务中心执行账号的凭证必须物理分离且严禁透传给 Claude 子进程环境变量；高敏感交付 Agent 禁用裸连 SSH / 本地直跑 Ansible。
+   - **第三道（执行前生产审批）**：`jms_run_ansible_job` 治理级别必须为 `always_approve`；父进程按 `mode: readonly` 隐藏执行工具，巡检先硬拒绝危险命令，再检查允许前缀或交 Jev 评估。生产执行要求 `prod` 审批。JumpServer 推荐共用一把 AccessKey，仅由父进程持有；高敏感交付 Agent 禁用裸连 SSH / 本地直跑 Ansible。
 6. **严格防止 GitLab Bot 无限自环（Loop Prevention）与脱敏**
    - 收到任何 GitLab Webhook 时，必须校验 `X-Gitlab-Token` 并第一时间通过 `isBotUser` 过滤 Bot 自身的人为操作事件。pipeline、build、deployment 保留 Bot 触发的状态变化；所有评论与错误日志必须经过 `redactGitUrl` 脱敏。
 
@@ -33,7 +33,7 @@ Stage 1 的装配入口为 `createDetentApp(config, extensions)`。工具按每�
 
 Stage 2 的 Delivery 合并事件处理器按目标项目 ID 和 MR IID 查找所有关联会话。在各自的 `resumeSession.beforeRun` 租约内原子记录合并 SHA、合并人和时间。仅首次更新写入 Hub Issue 通知。会话正在等待方案或工具审批时，回调返回 `false` 并保留待审单；已关闭的会话仅记录合并信息，其余会话用 `default` 权限模式续跑。
 
-Stage 3 的只读和自动工具在 `preflight` 执行守卫。生产任务在发卡前、批准后复核，提交前重读当前会话 MR。巡检与执行凭证分开配置，缺少所需凭证即拒绝。资产黑名单同时约束巡检和执行。结果查询必须由注入的 `DeliveryExecutionTracker` 验证会话归属。审批卡渲染、执行与归属判断均读取仓储。
+Stage 3 的只读和自动工具在 `preflight` 执行守卫。生产任务在发卡前、批准后复核，提交前重读当前会话 MR。Hub 的单个 `auth` 同时用于巡检和执行，旧环境可显式配置两套凭证。资产黑名单同时约束巡检和执行。结果查询必须由注入的 `DeliveryExecutionTracker` 验证会话归属。审批卡渲染、执行与归属判断均读取仓储。
 
 ### V3 兼容基线（Stage 5–7）
 
@@ -130,3 +130,9 @@ Issue 与 MR 的普通回复只可回答当前待审的 `ASK_USER`，沿用审�
 
 ### 2.3 活文档同步原则
 - 凡修改数据库表结构、状态机流转、扩展接口、审批权限边界或工具清单的变更，必须在同一次提交中同步更新 `AGENT.md`、[docs/DESIGN.md](docs/DESIGN.md)、[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) 与 [`.opencodereview/rule.json`](.opencodereview/rule.json)。
+
+### Stage 15 · 服务端密钥与 Hub 能力解析
+
+`DETENT_SECRET_*` 仅在父进程解析。新增输出路径必须使用完整配置密钥集合脱敏，包含 SDK 输入、代理元数据、工具参数与结果、审批、Jev、GitLab 和增量 transcript。沙箱保护 Hub 根目录的 `capabilities.json`，包含 Edit、Write、Bash 和符号链接路径。
+
+Issue 的 `/help`、轮次、审批分别读取 Hub 默认分支的能力配置。单轮解析所得的工具与流程授权使用同一份能力清单。MCP 请求头只在服务端展开；Hub 配置不能展开通用进程环境变量。临时连接在发现或调用结束时释放。Delivery 解释业务能力字段，Core 透传通用的流程 `account` 与 `allow_prefixes`。Hub 的 JumpServer `auth` 通过 `$secret:JMS_AK_ID` 和 `$secret:JMS_AK_SECRET` 引用父进程密钥。先使用流程 `account`，其次使用 Hub `default_account`。两者均未设置时，逐资产按 JumpServer 返回顺序选择首个有效授权账号，跳过停用账号和以 `@` 开头的虚拟账号。巡检按账号分组并汇总结果。单个 Ansible 任务要求所有目标使用同一账号，否则须指定共同的 `account` 或分组执行。缺少有效账号时，错误指出对应资产。

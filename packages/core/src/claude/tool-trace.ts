@@ -1,3 +1,4 @@
+import { scrubJson } from '../gitlab/redact.js';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { ToolStep } from '../gitlab/note-streamer.js';
@@ -6,7 +7,7 @@ function preview(value: unknown, redact: (text: string) => string) {
   // Compact JSON already fits on one line. Preserve whitespace inside its
   // string literals, including paths and the contents of file edits.
   const serialized = typeof value === 'string' ? redact(value).replace(/\s+/gu, ' ').trim()
-    : JSON.stringify(value, (_key, item) => typeof item === 'string' ? redact(item) : item);
+    : JSON.stringify(scrubJson(value, redact));
   const text = redact(serialized ?? '');
   return text.length <= 300 ? text : text.slice(0, 299).replace(/[\uD800-\uDBFF]$/u, '') + '…';
 }

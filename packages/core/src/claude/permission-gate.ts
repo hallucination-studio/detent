@@ -6,7 +6,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { PermissionResult } from '@anthropic-ai/claude-code';
 import type { AppConfig } from '../config.js';
 import type { DetentRepository } from '../db/repository.js';
-import type { AnyDetentExtensionTool, DetentCapabilityPack, ExtensionToolContext, SessionLifecycleHooks, TurnProfile } from '../extensions.js';
+import type { AnyDetentExtensionTool, DetentCapabilityPack, ExtensionToolContext, SessionLifecycleHooks, SubagentDefinition, TurnProfile } from '../extensions.js';
 import type { GitLabClient } from '../gitlab/client.js';
 import { configuredSecrets } from '../gitlab/redact.js';
 import { renderNote, renderStatus, renderToolApprovalCard } from '../gitlab/note-streamer.js';
@@ -95,7 +95,10 @@ async function resolveWorkspacePath(root: string, target: string) {
       await lstat(prefix);
       break;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return undefined;
+      const { code } = error as NodeJS.ErrnoException;
+      // A linked Git worktree has a .git file. Resolve that existing prefix
+      // as well when a descendant cannot exist beneath a regular file.
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') return undefined;
       prefix = path.dirname(prefix);
     }
   }
@@ -152,10 +155,29 @@ export class PermissionGate {
   readonly readonly: boolean;
   readonly disableBash: boolean;
   private readonly secrets: string[];
+  private subagents = new Map<string, SubagentDefinition>();
+  private activeSubagent?: SubagentDefinition;
+  readonly governedAgents = new Set<string>();
+  requestedMutation = false;
+
+  registerSubagents(agents: readonly SubagentDefinition[] = []) {
+    this.subagents = new Map(agents.map(agent => [agent.id, agent]));
+  }
+  setActiveSubagent(id: string) {
+    const agent = this.subagents.get(id);
+    if (!agent || this.activeSubagent) return false;
+    this.activeSubagent = agent;
+    if (!agent.readonly) this.governedAgents.add(id);
+    return true;
+  }
+  clearActiveSubagent(id: string) {
+    if (this.activeSubagent?.id === id) this.activeSubagent = undefined;
+  }
   private channel: GateChannel;
   private extensionContext: ExtensionToolContext;
   constructor(private ctx: GateContext) {
     const { session, repo, workspaceRoot, profile } = ctx;
+    this.registerSubagents(profile?.subagents);
     this.secrets = configuredSecrets(ctx.config);
     this.channel = 'channel' in ctx ? ctx.channel : {
       createNote: body => ctx.gitlab.createIssueNote(session.hubProjectId, session.hubIssueIid, body),
@@ -169,18 +191,37 @@ export class PermissionGate {
     for (const tool of [...(ctx.extensionTools ?? []), ...packTools]) {
       if (profile?.enabledExtensionTools && !profile.enabledExtensionTools.includes(tool.name)) continue;
       const id = 'mcp__detent__' + tool.name;
-      if (this.extensionTools.has(id) || isWorkspaceTool(tool.name) || ['Bash', 'AskUserQuestion'].includes(tool.name))
+      if (this.extensionTools.has(id) || isWorkspaceTool(tool.name) || ['Bash', 'Task', 'AskUserQuestion'].includes(tool.name))
         throw Error('Duplicate tool name: ' + tool.name);
       this.extensionTools.set(id, tool);
     }
+  }
+  get readonlyWorkspace() {
+    return this.readonly || this.activeSubagent?.readonly || (this.ctx.profile?.coordinator && !this.activeSubagent);
+  }
+  private toolContext(agent?: SubagentDefinition): ExtensionToolContext {
+    if (!agent) return { ...this.extensionContext };
+    return {
+      ...this.extensionContext, profileName: Array.from(agent.id).slice(0, 64).join(''),
+      permissionMode: agent.readonly ? 'plan' : this.extensionContext.permissionMode,
+      workflow: { ...this.extensionContext.workflow, account: agent.account ?? this.extensionContext.workflow?.account,
+        allowPrefixes: agent.allowPrefixes ?? this.extensionContext.workflow?.allowPrefixes },
+    };
+  }
+  private approvalInput(input: Input, agent?: SubagentDefinition) {
+    if (!this.ctx.profile?.coordinator) return input;
+    const agents = [...this.subagents.values()].filter(candidate => !candidate.readonly).map(candidate => candidate.id);
+    return { ...input, __detentCoordinator: { agents, ...(agent && { issuer: agent.id }), ...(agent?.account && { account: agent.account }) } };
   }
   // MCP supplies schema-validated input. Both hot and replayed approvals pass through this handler.
   async invokeExtension(id: string, input: Input) {
     const tool = this.extensionTools.get(id);
     if (!tool) throw Error('未启用此工具');
+    const agent = this.activeSubagent;
     const decision = await this.canUseTool(id, input);
     if (decision.behavior === 'deny') throw new ToolDenied(decision.message);
-    const ctx = decision.approvalId ? { ...this.extensionContext, approvalId: decision.approvalId } : this.extensionContext;
+    const ctx = this.toolContext(agent);
+    if (decision.approvalId) ctx.approvalId = decision.approvalId;
     if (tool.policy === 'always_approve') {
       const checked = await tool.guard?.(decision.updatedInput, ctx);
       if (checked && !checked.ok) throw new ToolDenied(checked.reason);
@@ -189,7 +230,8 @@ export class PermissionGate {
     return tool.execute(decision.updatedInput, ctx);
   }
   canUseTool(name: string, input: Input): Promise<GateResult> {
-    const next = this.queue.then(() => this.decide(name, input));
+    const agent = this.activeSubagent;
+    const next = this.queue.then(() => this.decide(name, input, agent));
     this.queue = next.catch(() => {});
     return next;
   }
@@ -219,27 +261,40 @@ export class PermissionGate {
     }
     return { behavior: 'allow', updatedInput: input };
   }
-  async preflight(name: string, input: Input): Promise<GateResult | 'ask' | { riskNote: string }> {
+  preflight(name: string, input: Input) {
+    return this.check(name, input, this.activeSubagent);
+  }
+  private async check(name: string, input: Input, agent?: SubagentDefinition): Promise<GateResult | 'ask' | { riskNote: string }> {
     const { session: s, config, workspaceRoot, controller } = this.ctx;
     controller.signal.throwIfAborted();
     // Prevent credential-bearing tool arguments from reaching an extension or an approval record.
     const argumentsJson = JSON.stringify(input);
     if (this.secrets.some(secret => argumentsJson.includes(JSON.stringify(secret).slice(1, -1))))
       return deny('工具参数中含有服务端凭证，请移除后再试。');
-    const effectiveReadOnly = s.permissionMode === 'plan' || this.readonly;
+    if (Object.hasOwn(input, '__detentCoordinator')) return deny('无效的工具参数');
+    const coordinatorOnly = this.ctx.profile?.coordinator && !agent;
+    const effectiveReadOnly = coordinatorOnly || agent?.readonly || s.permissionMode === 'plan' || this.readonly;
     const allow: PermissionResult = { behavior: 'allow', updatedInput: input };
+    if (name === 'Task') {
+      const target = typeof input.subagent_type === 'string' && this.subagents.get(input.subagent_type);
+      return target && (!this.readonly || target.readonly) && (!agent || target.id === agent.id) ? allow : deny('未启用此 Agent');
+    }
     const extension = this.extensionTools.get(name);
     if (extension) {
+      if (extension.policy !== 'readonly') this.requestedMutation = true;
+      if (coordinatorOnly || (agent && !agent.enabledExtensionTools?.includes(extension.name))) {
+        return deny('请委派给已启用此工具的 Agent');
+      }
       const closeApproval = extension.name === 'detent_close_issue' && this.ctx.profile?.closePolicy === 'approve';
       if (effectiveReadOnly && extension.policy !== 'readonly' && !closeApproval) return deny('当前模式仅允许只读操作');
       if (extension.policy === 'readonly' || extension.policy === 'coding_auto') {
-        const checked = await extension.guard?.(input, this.extensionContext);
+        const checked = await extension.guard?.(input, this.toolContext(agent));
         return checked && !checked.ok ? deny(checked.reason) : allow;
       }
       if (extension.policy !== 'always_approve') return deny('未知工具策略');
       // Cold replay already has a card. invokeExtension checks its guard at execution.
-      if (this.previousDecision(extension.name, input)) return 'ask';
-      const checked = await extension.guard?.(input, this.extensionContext);
+      if (this.previousDecision(extension.name, input, agent)) return 'ask';
+      const checked = await extension.guard?.(input, this.toolContext(agent));
       return checked && !checked.ok ? deny(checked.reason) : 'ask';
     }
     if (name.startsWith('mcp__detent__')) {
@@ -247,7 +302,9 @@ export class PermissionGate {
       if (!isWorkspaceTool(name) && name !== 'AskUserQuestion') return deny('未启用此工具');
     }
     if (isWorkspaceTool(name) && this.ctx.allowedWorkspaceTools && !this.ctx.allowedWorkspaceTools.includes(name)) return deny('未启用此工具');
-    if (name === 'Bash' && this.disableBash) return deny('当前角色禁用 Bash');
+    if (name === 'Edit' || name === 'Write' || (isWorkspaceTool(name) && !allowedInPlan(name)))
+      this.requestedMutation = true;
+    if (name === 'Bash' && (this.disableBash || agent?.disableBash)) return deny('当前角色禁用 Bash');
     if (fileTools.has(name)) {
       const lookup = name === 'Glob' || name === 'Grep';
       if (
@@ -276,9 +333,11 @@ export class PermissionGate {
     }
     if (name === 'Bash') {
       const { command, description } = input;
-      if (typeof command === 'string' && await blockedBashWrite(command, workspaceRoot))
+      if (typeof command === 'string' && await blockedBashWrite(command, workspaceRoot)) {
+        this.requestedMutation = true;
         return deny('此路径不允许 Bash 写入');
-      if (!effectiveReadOnly && this.previousDecision(name, input)) return 'ask';
+      }
+      if (!effectiveReadOnly && this.previousDecision(name, input, agent)) return 'ask';
       if (typeof command === 'string' && !isHardGatedLocalBash(command, workspaceRoot)) {
         if (await safeCommand(command, config.safeBashPrefixes, effectiveReadOnly, workspaceRoot)) return allow;
         if (this.ctx.decision && await bashOperandsContained(command, workspaceRoot)) {
@@ -286,9 +345,11 @@ export class PermissionGate {
           controller.signal.throwIfAborted();
           if (evaluation.allowed) return { ...allow, jevConfidence: evaluation.confidence };
           if (!effectiveReadOnly) return { riskNote: evaluation.riskNote };
+          this.requestedMutation = true;
           return deny(evaluation.riskNote);
         }
       }
+      if (effectiveReadOnly) this.requestedMutation = true;
     }
     if (isWorkspaceTool(name) && (!effectiveReadOnly || allowedInPlan(name))) return allow;
     if (name === 'ExitPlanMode' && effectiveReadOnly) return deny('请直接输出方案，由 GitLab 用户审批。');
@@ -296,18 +357,18 @@ export class PermissionGate {
     if (name !== 'Bash' && name !== 'AskUserQuestion') return deny('未启用此工具');
     return 'ask';
   }
-  private previousDecision(name: string, input: Input) {
+  private previousDecision(name: string, input: Input, agent?: SubagentDefinition) {
     const previous = this.ctx.previousDecision;
-    return previous?.toolName === name && isDeepStrictEqual(previous.toolInput, input) ? previous : undefined;
+    return previous?.toolName === name && isDeepStrictEqual(previous.toolInput, this.approvalInput(input, agent)) ? previous : undefined;
   }
-  private async decide(name: string, input: Input): Promise<GateResult> {
-    const policy = await this.preflight(name, input);
+  private async decide(name: string, input: Input, agent?: SubagentDefinition): Promise<GateResult> {
+    const policy = await this.check(name, input, agent);
     if (policy !== 'ask' && !('riskNote' in policy)) return policy;
     const { session: s, config, repo, controller } = this.ctx;
     const plan = s.permissionMode === 'plan';
     const extension = this.extensionTools.get(name);
     name = name.replace(/^mcp__detent__/, '');
-    const previous = this.previousDecision(name, input);
+    const previous = this.previousDecision(name, input, agent);
     if (previous) {
       this.ctx.previousDecision = undefined;
       return this.result(previous, input, extension);
@@ -317,11 +378,11 @@ export class PermissionGate {
       s.id,
       name === 'AskUserQuestion' ? 'ASK_USER' : 'TOOL_USE',
       name,
-      input,
+      this.approvalInput(input, agent),
     );
     try {
-      const card = await extension?.renderApprovalCard?.(a.id, input, this.extensionContext)
-        ?? renderToolApprovalCard(a, this.ctx.workspaceRoot, policy === 'ask' ? undefined : policy.riskNote);
+      const card = await extension?.renderApprovalCard?.(a.id, input, this.toolContext(agent))
+        ?? renderToolApprovalCard({ ...a, toolInput: input }, this.ctx.workspaceRoot, policy === 'ask' ? undefined : policy.riskNote);
       const note = await this.channel.createNote(renderNote(card, this.secrets));
       await repo.updateApprovalNoteId(a.id, note.id);
     } catch (error) {

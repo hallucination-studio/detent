@@ -60,7 +60,22 @@ export interface SandboxScope {
   sharedSkills?: readonly string[];
 }
 
+export interface SubagentDefinition {
+  id: string;
+  description: string;
+  prompt: string;
+  readonly?: boolean;
+  disableBash?: boolean;
+  enabledExtensionTools?: readonly string[];
+  account?: string;
+  allowPrefixes?: readonly string[];
+  approverTier?: WorkflowApproverTier;
+  closePolicy?: IssueClosePolicy;
+}
+
 export interface TurnProfile {
+  subagents?: readonly SubagentDefinition[];
+  coordinator?: boolean;
   workflow?: WorkflowToolConfig;
   closePolicy?: IssueClosePolicy;
   canCloseIssue?(ctx: { session: IssueSessionRow; repo: DetentRepository }): Promise<{ ok: true } | { ok: false; reason: string }>;
@@ -88,6 +103,8 @@ export type TurnProfileResolver = (ctx: {
     Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile' | 'listIssueNotes' | 'updateIssueLabels' | 'isBotUser'>>;
   capabilities?: readonly DetentCapabilityPack[];
   purpose?: 'turn' | 'approval';
+  // Present when rechecking or resuming a card issued by the coordinator.
+  coordinatorAgents?: readonly string[];
   approval?: Pick<ApprovalRequestRow, 'approvalType' | 'toolName'>;
   prompt?: string;
   decision?: DecisionClient;

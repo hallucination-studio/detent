@@ -5,6 +5,7 @@ import { ToolTrace } from './tool-trace.js';
 import buffer from 'node:buffer';
 import { configuredSecrets, redactGitUrl, scrubJson } from '../gitlab/redact.js';
 import { openModelTransport } from './model-transport.js';
+import type { SubagentDefinition } from '../extensions.js';
 import type { AppConfig } from '../config.js';
 import { formatInboxMessages } from '../orchestrator/turn-runtime.js';
 import type { IssueSessionRow, SessionInboxRow } from '../types.js';
@@ -18,6 +19,7 @@ const textDelta = z.object({
 });
 export interface TurnInput {
   session: IssueSessionRow;
+  subagents?: readonly SubagentDefinition[];
   allowedWorkspaceTools?: readonly ToolName[];
   drainInbox?: () => Promise<SessionInboxRow[]>;
   sandbox: TurnSandbox;
@@ -27,6 +29,7 @@ export interface TurnInput {
   controller: AbortController;
   gate: PermissionGate;
   tools: WorkspaceTools;
+  readonlyTools?: WorkspaceTools;
   progress: (step: ToolStep) => void;
   appendText?: (delta: string) => void;
 }
@@ -47,6 +50,21 @@ export class SdkClaudeRunner implements ClaudeRunner {
     const id = session.claudeSessionId!;
     const trace = new ToolTrace(t.progress, redact);
     const failed = new Set<string>();
+    const agents = t.subagents ?? [];
+    gate.registerSubagents(agents);
+    // SDK 1.x permission callbacks have no parent ID. Admit one foreground Task
+    // at a time and release its scope only on the matching invocation's result.
+    // The message stream also reports validation errors that never reach hooks.
+    const calls = new Map<string, { name: string; input: unknown; parent: string | null }>();
+    const rootCalls = new Set<string>();
+    let activeTask: { toolUseID: string; agent: string } | undefined;
+    const finishCall = (toolUseID?: string) => {
+      if (toolUseID) rootCalls.delete(toolUseID);
+      if (activeTask && activeTask.toolUseID === toolUseID) {
+        gate.clearActiveSubagent(activeTask.agent);
+        activeTask = undefined;
+      }
+    };
     const canUseTool = async (name: string, input: Record<string, unknown>, step = trace.handler(name, input)) => {
       const { jevConfidence: _confidence, ...decision } = await gate.canUseTool(name, input);
       if (decision.behavior === 'deny') {
@@ -79,10 +97,11 @@ export class SdkClaudeRunner implements ClaudeRunner {
         ...(t.allowedWorkspaceTools ?? Object.keys(schemas) as ToolName[]).map(name =>
           tool(name, 'GitLab workspace: ' + name, schemas[name], (input, extra) =>
             invoke(name, input, extra, async step => {
+              const tools = gate.readonlyWorkspace ? t.readonlyTools ?? t.tools : t.tools;
               const decision = await canUseTool(name, input, step);
               if (decision.behavior === 'deny') throw Error(decision.message);
               t.controller.signal.throwIfAborted();
-              return t.tools.invoke(name, decision.updatedInput);
+              return tools.invoke(name, decision.updatedInput);
             })),
         ),
         ...Array.from(gate.extensionTools, ([id, extension]) =>
@@ -137,11 +156,27 @@ export class SdkClaudeRunner implements ClaudeRunner {
             PreToolUse: [{ hooks: [async (input, toolUseID) => {
               if (input.hook_event_name === 'PreToolUse') {
                 trace.sdkCall(toolUseID, input.tool_name, input.tool_input, true);
+                if (input.tool_name === 'Task') {
+                  const target = z.object({ subagent_type: z.string() }).safeParse(input.tool_input);
+                  if (!toolUseID || rootCalls.size || !target.success || !gate.setActiveSubagent(target.data.subagent_type))
+                    return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny',
+                      permissionDecisionReason: '请按顺序委派给已注册的 Agent。' } };
+                  activeTask = { toolUseID, agent: target.data.subagent_type };
+                } else if (agents.length) {
+                  // Streamed assistant messages carry the parent ID missing from
+                  // permission callbacks. Never lend a sibling the active account.
+                  const parent = toolUseID && calls.get(toolUseID)?.parent;
+                  if (!toolUseID || (parent ?? null) !== (activeTask?.toolUseID ?? null))
+                    return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny',
+                      permissionDecisionReason: '请等待当前委派完成。' } };
+                  if (!activeTask) rootCalls.add(toolUseID);
+                }
               }
               return {};
             }] }],
             PostToolUse: [{ hooks: [async (input, toolUseID) => {
               if (input.hook_event_name === 'PostToolUse') {
+                finishCall(toolUseID);
                 const step = trace.sdkCall(toolUseID, input.tool_name, input.tool_input);
                 if (!failed.has(step.id)) trace.update(step, input.tool_response);
               }
@@ -170,14 +205,16 @@ export class SdkClaudeRunner implements ClaudeRunner {
           resume: t.resume ? id : undefined,
           extraArgs: {
             'setting-sources': 'user',
+            ...(agents.length > 0 && { agents: JSON.stringify(Object.fromEntries(agents.map(agent =>
+              [agent.id, { description: redact(agent.description), prompt: redact(agent.prompt) }]))) }),
             // Route even SDK-default read permissions through Detent's workspace checks.
-            settings: JSON.stringify({ permissions: { ask: ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash'] } }),
+            settings: JSON.stringify({ permissions: { ask: ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash', ...(agents.length ? ['Task'] : [])] } }),
             ...(!t.resume ? { 'session-id': id } : {}),
           },
           disallowedTools: [
             ...(gate.readonly ? ['Edit', 'Write'] : []),
             ...(gate.disableBash ? ['Bash'] : []),
-            'Task', 'MultiEdit', 'NotebookEdit', 'ExitPlanMode', 'BashOutput', 'KillShell',
+            ...(agents.length ? [] : ['Task']), 'MultiEdit', 'NotebookEdit', 'ExitPlanMode', 'BashOutput', 'KillShell',
             'SlashCommand', 'TodoWrite', 'WebFetch', 'WebSearch', 'ListMcpResourcesTool', 'ReadMcpResourceTool',
           ],
           // Each registered Detent handler calls canUseTool itself, including AskUserQuestion.
@@ -202,19 +239,18 @@ export class SdkClaudeRunner implements ClaudeRunner {
       };
       t.controller.signal.addEventListener('abort', interrupt, { once: true });
       if (t.controller.signal.aborted) interrupt();
-      // Validation can fail before either hook or the permission callback fires.
-      const calls = new Map<string, { name: string; input: unknown }>();
       for await (const message of messages) {
         if (message.session_id !== id) throw Error('Claude session identity changed');
         if (message.type === 'assistant') {
           for (const block of message.message.content)
-            if (block.type === 'tool_use') calls.set(block.id, { name: block.name, input: block.input });
+            if (block.type === 'tool_use') calls.set(block.id, { name: block.name, input: block.input, parent: message.parent_tool_use_id });
         }
         if (message.type === 'user' && Array.isArray(message.message.content)) {
           for (const block of message.message.content) {
             if (block.type !== 'tool_result') continue;
             const call = calls.get(block.tool_use_id);
             calls.delete(block.tool_use_id);
+            finishCall(block.tool_use_id);
             if (!block.is_error) continue;
             const step = trace.lookup(block.tool_use_id) ?? (call && trace.sdkCall(block.tool_use_id, call.name, call.input));
             if (step && !failed.has(step.id)) trace.update(step, block.content, '❌ ');
@@ -238,6 +274,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
       const detail = t.controller.signal.aborted ? original : diagnostic.trim() || original;
       throw Error(redact(detail));
     } finally {
+      finishCall(activeTask?.toolUseID);
       model?.close();
       clearTimeout(shutdown);
       if (interrupt) t.controller.signal.removeEventListener('abort', interrupt);

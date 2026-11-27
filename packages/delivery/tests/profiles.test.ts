@@ -189,6 +189,13 @@ it('resolves an Agent with local and shared Skills and enforces its production a
   ].join('\n'));
   expect(gitlab.listRepositoryTree.mock.calls).toEqual([[1, 'agents', 'stable', true], [1, 'skills', 'stable', true], [1, 'workflows', 'stable']]);
   expect(gitlab.getRepositoryFile).not.toHaveBeenCalledWith(1, 'workflows/review.md', 'stable');
+  gitlab.getIssue.mockResolvedValueOnce({ ...issue, labels: [] });
+  const coordinator = await resolveProfile({ session, repo, gitlab });
+  const review = coordinator.subagents?.find(agent => agent.id === 'review');
+  expect(review).toMatchObject({ closePolicy: 'approve', approverTier: 'prod', disableBash: true, enabledExtensionTools: ['confirm_review'] });
+  expect(review?.prompt).toContain('Review the changes.');
+  expect(review?.prompt).toContain('Full local instructions.');
+  expect(review?.prompt).toContain('Full shared instructions.');
   const approval = { ...approve, toolName: 'confirm_review' };
   expect(await profile.canApprove!(approval)).toBe(false);
   expect(gitlab.hasApprovalPermission).toHaveBeenLastCalledWith(1, 30, 45);
@@ -203,9 +210,12 @@ it('lists available Hub routes and gives setup instructions and ready alternativ
   for (const text of ['jumpserver', disabled.setupHint, '### ⚪ 当前能力尚未开通', 'delivery::release', 'delivery::code', 'agent::image-sync'])
     expect(profile.blockedMessage).toContain(text);
   expect(await profile.canApprove!({ ...approve, userId: 50, toolName: 'jms_run_ansible_job' })).toBe(false);
-  const { profile: triage, currentProfile, gitlab } = await resolve([], {}, [release, disabled], agentTemplates);
-  expect(triage).toMatchObject({ name: 'triage', readonly: true, disableBash: true, closePolicy: 'manual', enabledExtensionTools: [], sandboxScope: {} });
-  expect(triage.blockedMessage).toBeUndefined();
+  const { profile: coordinator, currentProfile, gitlab } = await resolve([], {}, [release, disabled], agentTemplates);
+  expect(coordinator).toMatchObject({ name: 'coordinator', coordinator: true, readonly: false, disableBash: false,
+    enabledExtensionTools: ['detent_list_tags', 'detent_create_release'] });
+  expect(coordinator.subagents?.map(agent => agent.id)).toEqual(['code-delivery', 'image-sync', 'release']);
+  expect(coordinator.extraSystemPrompt).toContain(disabled.setupHint);
+  expect(coordinator.blockedMessage).toBeUndefined();
   const decision = routingDecision();
   const listIssueNotes = vi.fn();
   const updateIssueLabels = vi.fn();
@@ -213,7 +223,7 @@ it('lists available Hub routes and gives setup instructions and ready alternativ
   expect(approval).toMatchObject({ name: 'unmatched', readonly: true });
   expect(approval.extraSystemPrompt).toBeUndefined();
   for (const file of Object.keys(agentTemplates)) {
-    expect(triage.extraSystemPrompt).not.toContain(file);
+    expect(coordinator.extraSystemPrompt).not.toContain(file);
     expect(approval.blockedMessage).toContain(file);
   }
   expect(await approval.canApprove!({ ...approve, approvalType: 'PLAN', toolName: 'Plan', userId: 50 })).toBe(false);
@@ -221,6 +231,24 @@ it('lists available Hub routes and gives setup instructions and ready alternativ
   expect(listIssueNotes).not.toHaveBeenCalled();
   expect(decision.decide).not.toHaveBeenCalled();
   expect(updateIssueLabels).not.toHaveBeenCalled();
+});
+
+it('falls back to readonly triage when every registered agent lacks a capability', async () => {
+  const file = 'agents/audit/AGENT.md';
+  const { profile } = await resolve([], {}, [disabled], { [file]: agentTemplates[file] });
+  expect(profile).toMatchObject({ name: 'triage', readonly: true, disableBash: true, enabledExtensionTools: [] });
+  expect(profile.subagents).toBeUndefined();
+});
+
+it('rechecks an unlabeled tool card against its issuing agent and production membership', async () => {
+  const { currentProfile } = await resolve([], {}, [release, jumpserver], agentTemplates);
+  const approval = { approvalType: 'TOOL_USE' as const, toolName: 'detent_create_release' };
+  const context = { purpose: 'approval' as const, approval };
+  const issuing = await currentProfile({ ...context, coordinatorAgents: ['release'] });
+  expect(await issuing.canApprove!({ ...approve, ...approval })).toBe(false);
+  expect(await issuing.canApprove!({ ...approve, ...approval, userId: 40 })).toBe(true);
+  const audit = await currentProfile({ ...context, coordinatorAgents: ['audit'] });
+  expect(audit.blockedMessage).toBeTruthy();
 });
 
 it('keeps explicit labels, readonly precedence and label conflicts deterministic with Jev enabled', async () => {
@@ -240,11 +268,11 @@ it('keeps explicit labels, readonly precedence and label conflicts deterministic
   expect(updateIssueLabels).not.toHaveBeenCalled();
 });
 
-it('uses a unique default for approval and as a turn fallback, and blocks conflicting defaults', async () => {
+it('offers all ready workflows to unlabeled turns and preserves default selection for existing approvals', async () => {
   const file = 'workflows/fallback.md';
   const files = { [file]: '---\nlabel: fallback\ndefault: true\n---\nDefault procedure.' };
   const { profile, currentProfile, gitlab } = await resolve([], {}, [], files);
-  expect(profile).toMatchObject({ name: 'fallback', readonly: false });
+  expect(profile).toMatchObject({ name: 'coordinator', subagents: [{ id: 'fallback' }] });
   const decision = routingDecision();
   decision.decide.mockRejectedValue(Error('Jev unavailable'));
   const updateIssueLabels = vi.fn();
@@ -253,10 +281,10 @@ it('uses a unique default for approval and as a turn fallback, and blocks confli
   expect(approval.name).toBe('fallback');
   expect(await approval.canApprove!({ ...approve, approvalType: 'PLAN', toolName: 'Plan' })).toBe(true);
   expect(decision.decide).not.toHaveBeenCalled();
-  expect(await currentProfile(context)).toMatchObject({ name: 'fallback', readonly: false });
+  expect(await currentProfile(context)).toMatchObject({ name: 'coordinator', subagents: [{ id: 'fallback' }] });
   expect(decision.decide).toHaveBeenCalledTimes(1);
   const conflict = await resolve([], {}, [], { ...files, 'workflows/other.md': files[file].replace('label: fallback', 'label: other') });
-  expect(conflict.profile.blockedMessage).toContain('默认工作流');
+  expect(conflict.profile.subagents?.map(agent => agent.id)).toEqual(['fallback', 'other']);
   expect((await conflict.currentProfile({ purpose: 'approval' })).blockedMessage).toContain('默认工作流');
   expect(updateIssueLabels).not.toHaveBeenCalled();
 });
@@ -289,12 +317,12 @@ it.each([0.95, 0.55])('posts unavailable capability guidance without a Claude tu
   expect(run).not.toHaveBeenCalled();
 });
 
-it('keeps triage open when a ready candidate outranks the unavailable suggestion', async () => {
+it('offers coordination when a ready candidate outranks the unavailable suggestion', async () => {
   const { currentProfile } = await resolve([], {}, [release, disabled], agentTemplates);
   const decision = routingDecision();
   const answers = routingAnswers('env-change', 0.55);
   decision.decide.mockResolvedValue({ ...answers, agent: { ...answers.agent, probabilities: { 'env-change': 0.3, release: 0.6 } } });
-  expect(await currentProfile({ decision })).toMatchObject({ name: 'triage' });
+  expect(await currentProfile({ decision })).toMatchObject({ name: 'coordinator' });
 });
 
 it('notifies each project member once per denied production approval and stays silent for outsiders', async () => {
@@ -361,14 +389,13 @@ it('clarifies a vague Issue, routes the follow-up into a scoped Agent plan and f
   const decision = routingDecision();
   decision.decide.mockResolvedValueOnce(routingAnswers('image-sync', 0.56)).mockResolvedValueOnce(routingAnswers('image-sync'));
   const run = vi.fn<(turn: TurnInput) => Promise<string>>()
-    .mockImplementationOnce(async ({ gate, sandbox, session, systemPrompt }) => {
+    .mockImplementationOnce(async ({ gate, sandbox, session, systemPrompt, subagents }) => {
       expect(session.permissionMode).toBe('plan');
-      expect(gate).toMatchObject({ readonly: true, disableBash: true, extensionTools: new Map() });
+      expect(gate).toMatchObject({ readonly: false, disableBash: false, extensionTools: new Map() });
+      expect(subagents?.map(agent => agent.id)).toEqual(['audit', 'image-sync', 'release']);
       expect((await readdir(sandbox.workspaceRoot)).sort()).toEqual(['CLAUDE.md', 'projects']);
-      expect(await gate.preflight('Bash', { command: 'git status' })).toMatchObject({ behavior: 'deny' });
-      expect(await gate.preflight('Write', { file_path: 'file' })).toMatchObject({ behavior: 'deny' });
-      expect(systemPrompt).toContain('需求澄清与引导模式（只读）');
-      expect(systemPrompt).toContain('待核对的场景：Mirror container images');
+      expect(await gate.preflight('Task', { subagent_type: 'audit' })).toMatchObject({ behavior: 'allow' });
+      expect(systemPrompt).toContain('image-sync — Mirror container images');
       return '请提供源镜像的 Tag 和目标镜像仓库。';
     })
     .mockImplementationOnce(async ({ gate, sandbox, session, systemPrompt }) => {
@@ -425,12 +452,21 @@ it('clarifies a vague Issue, routes the follow-up into a scoped Agent plan and f
   expect(await readdir(config.ephemeralRoot)).toEqual([]);
 });
 
-it('requires a fresh plan when Jev routes a continuation after approval of a fallback Agent', async () => {
+it('resumes the approved coordinator delegation, then requires a fresh plan for a new Jev route', async () => {
   const files = { ...agentFiles, 'agents/release/AGENT.md': agentFiles['agents/release/AGENT.md'].replace('---\n', '---\ndefault: true\n') };
   const { repo, gitlab, config, deliveryConfig } = await routingFixture([], files);
   const decision = routingDecision();
   decision.decide.mockResolvedValueOnce(routingAnswers('__none__')).mockResolvedValueOnce(routingAnswers('image-sync'));
-  const run = vi.fn<(turn: TurnInput) => Promise<string>>().mockResolvedValueOnce('Release plan')
+  const run = vi.fn<(turn: TurnInput) => Promise<string>>()
+    .mockImplementationOnce(async ({ gate }) => {
+      gate.setActiveSubagent('release');
+      return 'Release plan';
+    })
+    .mockImplementationOnce(async ({ session, subagents }) => {
+      expect(session.permissionMode).toBe('default');
+      expect(subagents?.map(agent => agent.id)).toEqual(['audit', 'release']);
+      return 'Release complete';
+    })
     .mockImplementationOnce(async ({ session, sandbox }) => {
       expect(session.permissionMode).toBe('plan');
       expect(await readdir(path.join(sandbox.workspaceRoot, 'agents'))).toEqual(['image-sync']);
@@ -444,6 +480,8 @@ it('requires a fresh plan when Jev routes a continuation after approval of a fal
   const original = (await repo.getLatestPendingApproval(session.id))!;
   await dispatchWebhook(orchestrator, userNote('/approve'));
   expect(await repo.getApproval(original.id)).toMatchObject({ status: 'APPROVED' });
+  expect(await repo.getSession(session.id)).toMatchObject({ status: 'IDLE' });
+  await dispatchWebhook(orchestrator, userNote('Sync the image'));
   expect(await repo.getSession(session.id)).toMatchObject({ status: 'WAITING_PLAN', permissionMode: 'plan' });
   const next = await repo.getLatestPendingApproval(session.id);
   expect(next).toMatchObject({ approvalType: 'PLAN' });

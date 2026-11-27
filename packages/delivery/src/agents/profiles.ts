@@ -1,7 +1,7 @@
 import {
   buildTriageSystemPrompt, escapeMarkdownCell, findMatchingHubAgents, loadHubAgents, matchHubAgent, redactGitUrl,
   renderAgentSystemPrompt, resolveHubAgentCapabilities, routeHubAgent,
-  type AgentRouteResult, type DecisionClient, type DetentCapabilityPack, type TurnProfile, type TurnProfileResolver, type WorkflowApproverTier,
+  type AgentRouteResult, type HubAgent, type DecisionClient, type DetentCapabilityPack, type TurnProfile, type TurnProfileResolver, type WorkflowApproverTier,
 } from '@detent/core';
 import type { DeliveryConfig } from '../config.js';
 
@@ -41,12 +41,79 @@ function agentProfile(result: ReturnType<typeof matchHubAgent>): WorkflowProfile
   };
 }
 
+async function coordinatorProfile(ctx: ResolverContext, agents: HubAgent[], capabilities: readonly DetentCapabilityPack[],
+  branch: string): Promise<WorkflowProfile | undefined> {
+  const subagents: NonNullable<TurnProfile['subagents']>[number][] = [];
+  const unavailable: string[] = [];
+  const skills = new Map<string, Promise<string | null>>();
+  for (const agent of agents) {
+    const result = resolveHubAgentCapabilities(agent, agents, capabilities);
+    if (result.kind === 'blocked') {
+      const missing = agent.requires.filter(name => !capabilities.some(pack => pack.enabled && pack.name.trim().toLowerCase() === name));
+      unavailable.push(agent.id + '：' + missing.map(name => name + '（' +
+        (capabilities.find(pack => pack.name.trim().toLowerCase() === name)?.setupHint ?? '请在服务端配置并启用此能力') + '）').join('、'));
+      continue;
+    }
+    if (ctx.coordinatorAgents && ctx.session.permissionMode !== 'plan' && !ctx.coordinatorAgents.includes(agent.id) && agent.mode !== 'readonly') continue;
+    const profile = agentProfile(result);
+    // The single-agent sandbox projects one private Agent directory. Supply the
+    // selected skill bodies directly to each native agent in coordinator turns.
+    const instructions = await Promise.all(agent.skills.map(async skill => {
+      let read = skills.get(skill.path);
+      if (!read) {
+        read = ctx.gitlab.getRepositoryFile!(ctx.session.hubProjectId, skill.path, branch);
+        skills.set(skill.path, read);
+      }
+      const body = await read;
+      if (body === null) throw Error('无法加载 Skill：' + skill.path);
+      return skill.path + '\n' + body;
+    }));
+    subagents.push({
+      id: agent.id, description: agent.description,
+      prompt: [renderAgentSystemPrompt({ ...agent, skills: [] }), ...instructions,
+        '本轮由协调者委派，完成子任务后返回结果，保持 Issue 开放以便后续交接。'].join('\n\n'),
+      readonly: profile.readonly, disableBash: profile.disableBash, enabledExtensionTools: result.enabledToolNames,
+      account: agent.account, allowPrefixes: agent.allowPrefixes, approverTier: agent.approverTier, closePolicy: agent.closePolicy,
+    });
+  }
+  if (ctx.coordinatorAgents?.some(id => !subagents.some(agent => agent.id === id)))
+    return blocked('coordinator', '本次委派的 Agent 已不可用，请重新规划。');
+  if (!subagents.length) return;
+  return {
+    name: 'coordinator', coordinator: true, readonly: false, disableBash: false, closePolicy: 'manual', sandboxScope: {}, subagents,
+    enabledExtensionTools: [...new Set(subagents.flatMap(agent => agent.enabledExtensionTools ?? []))],
+    extraSystemPrompt: [
+      '你负责协调当前 Issue。按用户需求依次调用 Task，每次等待上一位 Agent 完成。同一 Issue 可先巡检、再修复、再变更或发布。',
+      '只读问答直接回答。Kafka、主机、日志等巡检立即委派给已就绪的 audit（Task 的 subagent_type 为 audit），根据证据简短汇报。',
+      '修改代码、环境变更、发版和仓库接入分别委派给匹配的 code-delivery、env-change、release、onboarding。方案阶段由受治理 Agent 制订实施方案，交用户审批。',
+      '仅从已就绪名单中选择；按 Agent 描述处理自定义流程。缺少关键信息时简短提问。能力状态以下列清单为准。',
+      '已就绪：', ...subagents.map(agent => agent.id + ' — ' + agent.description),
+      ...(unavailable.length ? ['未开通：', ...unavailable] : []),
+    ].join('\n'),
+  };
+}
+
 async function hubProfile(ctx: ResolverContext, options: ProfileOptions, capabilities: readonly DetentCapabilityPack[]): Promise<WorkflowProfile> {
   const { session, gitlab, repo, purpose, prompt } = ctx;
   const issue = await gitlab.getIssue(session.hubProjectId, session.hubIssueIid);
   const { present, agents, invalidFiles } = await loadHubAgents(gitlab, session.hubProjectId, options.hubDefaultBranch ?? 'main');
   if (present) {
-    if (purpose === 'approval' || findMatchingHubAgents(agents, issue.labels).length)
+    const labeled = findMatchingHubAgents(agents, issue.labels).length > 0;
+    if (ctx.coordinatorAgents) {
+      if (labeled) return blocked('coordinator', '当前标签已变更，请重新规划。');
+      if (purpose === 'approval' && ctx.approval?.approvalType !== 'PLAN' && ctx.coordinatorAgents.length === 1) {
+        const agent = agents.find(agent => agent.id === ctx.coordinatorAgents![0]);
+        if (!agent) return blocked('coordinator', '本次委派的 Agent 已不可用。');
+        const profile = agentProfile(resolveHubAgentCapabilities(agent, agents, capabilities));
+        const name = ctx.approval?.toolName;
+        if (name !== 'AskUserQuestion' && !(name === 'Bash' && !profile.readonly && !profile.disableBash) &&
+            !profile.enabledExtensionTools?.includes(name ?? '')) return blocked('coordinator', '此 Agent 已不再授权使用该工具。');
+        return profile;
+      }
+      return await coordinatorProfile(ctx, agents, capabilities, options.hubDefaultBranch ?? 'main')
+        ?? blocked('coordinator', '没有可用的 Agent。');
+    }
+    if (purpose === 'approval' || labeled)
       return agentProfile(matchHubAgent(agents, issue.labels, capabilities, invalidFiles));
 
     const decision = ctx.decision ?? options.decisionClient;
@@ -78,7 +145,8 @@ async function hubProfile(ctx: ResolverContext, options: ProfileOptions, capabil
       const result = resolveHubAgentCapabilities(routed.suggestion.agent, agents, capabilities, invalidFiles);
       if (result.kind === 'blocked') return agentProfile(result);
     }
-    if (agents.some(agent => agent.isDefault)) return agentProfile(matchHubAgent(agents, [], capabilities, invalidFiles));
+    const coordinator = await coordinatorProfile(ctx, agents, capabilities, options.hubDefaultBranch ?? 'main');
+    if (coordinator) return coordinator;
 
     return {
       name: 'triage', readonly: true, disableBash: true, closePolicy: 'manual', enabledExtensionTools: [], sandboxScope: {},
@@ -86,6 +154,7 @@ async function hubProfile(ctx: ResolverContext, options: ProfileOptions, capabil
     };
   }
 
+  if (ctx.coordinatorAgents) return blocked('coordinator', '没有可用的 Agent。');
   const labels = issue.labels.map(label => label.trim().toLowerCase());
   const jumpserver = capabilities.find(pack => pack.name.trim().toLowerCase() === 'jumpserver');
   const jumpserverEnabled = jumpserver?.enabled ?? (options.capabilities === undefined);

@@ -195,6 +195,16 @@ export class GitLabClient {
   getProject(p: string | number) {
     return this.json<Project>(this.project(p));
   }
+  createProject(input: {
+    namespace_id: number; name: string; path: string; description?: string; visibility?: 'private' | 'internal';
+    initialize_with_readme?: boolean; default_branch?: string;
+  }) {
+    return this.json<Project & { web_url?: string }>('/projects', 'POST', {
+      ...input, description: input.description && renderNote(input.description, this.secrets),
+      visibility: input.visibility ?? 'private', initialize_with_readme: input.initialize_with_readme ?? true,
+      default_branch: input.default_branch ?? 'main',
+    });
+  }
   private async pages<T>(resource: string, params: Record<string, string> = {}) {
     const rows: T[] = [];
     let page = '1';
@@ -209,6 +219,10 @@ export class GitLabClient {
   }
   getGroup(ref: number | string) {
     return this.json<{ id: number; full_path: string }>('/groups/' + encodeURIComponent(ref));
+  }
+  async getGroupMemberAccess(group: number, user: number) {
+    const member = await onNotFound(this.json<{ access_level: number }>('/groups/' + group + '/members/all/' + user), null);
+    return member?.access_level ?? null;
   }
   listGroupProjects(groupId: number) {
     return this.pages<Project>('/groups/' + groupId + '/projects', { include_subgroups: 'true', archived: 'false', with_shared: 'false' });

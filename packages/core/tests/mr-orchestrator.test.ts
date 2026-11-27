@@ -107,7 +107,8 @@ it('checks out the assigned source, registers only MR tools, resolves a real sha
     const [tree] = await repo.listActiveWorktrees(t.session.id);
     expect(tree).toMatchObject({ branchName: 'feature', baseBranch: 'main', status: 'ACTIVE' });
     const dir = path.join(t.sandbox.workspaceRoot, 'projects', tree.directoryName);
-    expect(await readdir(t.sandbox.workspaceRoot)).toEqual(['projects']);
+    expect((await readdir(t.sandbox.workspaceRoot)).sort()).toEqual(['CLAUDE.md', 'projects']);
+    expect(t.systemPrompt).toContain('If CLAUDE.md or skills/ exist in the workspace root, read relevant conventions before reviewing or modifying code.');
     for (const text of ['GitLab MR org/project2 (#2)!1 · Review me', 'project: 2', 'Read/Glob/Grep inside projects/' + tree.directoryName, mr.title, mr.description!, 'feature -> main', 'draft=true', 'has_conflicts=true', 'lint', 'tracked:7', tree.directoryName])
       expect(t.systemPrompt).toContain(text);
     expect(t.systemPrompt).not.toContain('test-secret');

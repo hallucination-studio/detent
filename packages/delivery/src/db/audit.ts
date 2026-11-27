@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { escapeMarkdownCell } from '@detent/core';
 import type { Pool, ResultSetHeader, RowDataPacket } from 'mysql2/promise';
 import { z } from 'zod';
 import type { DeliveryExecutionRecord, DeliveryExecutionTracker } from '../jumpserver/tools.js';
@@ -122,6 +123,6 @@ export class MySqlDeliveryAuditRepository implements DeliveryAuditRepository {
 export function formatDeliveryExecutionsStatus(rows: DeliveryExecutionRow[]): string | null {
   if (!rows.length) return null;
   return ['### 交付执行记录', ...rows.map(r =>
-    `- ${r.agentProfile} · \`${r.playbookPath}\` @ \`${r.commitSha.slice(0, 8)}\` · ${r.status} · [JumpServer](<${r.jumpserverJobUrl}>) · 审批单 \`${r.approvalId}\``,
+    `- ${r.agentProfile} · ${escapeMarkdownCell(r.playbookPath, 'code')} @ \`${r.commitSha.slice(0, 8)}\` · ${r.status} · [JumpServer](<${r.jumpserverJobUrl}>) · 审批单 \`${r.approvalId}\``,
   )].join('\n');
 }

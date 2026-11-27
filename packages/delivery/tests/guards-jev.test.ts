@@ -22,6 +22,20 @@ async function inspectGuard(choice = 'pure_readonly', noul = 0.79, score = 0.76,
 
 const pipeline = 'ps -ef | grep -i kafka | grep -v grep';
 
+it('limits configured Helm prefixes to read-only subcommands, flags and output formats', async () => {
+  const prefixes = ['helm list', 'helm status', 'helm history', 'helm version'];
+  for (const cmd of ['helm list -A --deployed --failed --pending --all', 'helm list --all-namespaces --filter ^api --max 15',
+    'helm status api --namespace=prod --revision 2 --show-resources -o yaml', 'helm history api -n prod --max=10 --output=json',
+    'helm list --output table', 'helm version --short']) {
+    expect(await validateShellCommands([cmd], prefixes), cmd).toMatchObject({ ok: true });
+  }
+  for (const cmd of ['helm upgrade api .', 'helm status api --kubeconfig /tmp/config', 'helm history api --max -1',
+    'helm list -o template', 'helm list --output=json=x', 'helm list --namespace', 'helm status api --namespace --debug',
+    'helm list --filter=x --post-renderer=script', 'helm version --template=x']) {
+    expect(await validateShellCommands([cmd], prefixes), cmd).toMatchObject({ ok: false });
+  }
+});
+
 it('accepts a level-one Bailian decision with explicit no-side-effect criteria', async () => {
   const { decide, inspect } = await inspectGuard();
   expect(await inspect(pipeline)).toEqual({ ok: true });

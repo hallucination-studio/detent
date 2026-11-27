@@ -177,7 +177,12 @@ it('denies local Bash boundary violations without opening an approval card', asy
     'cd ../outside', 'cat /etc/passwd', 'cat ~/.profile', 'cp f .git/config', 'mkdir .claude', 'touch .mcp.json',
     'echo hi > CLAUDE.md', 'echo hi > alias', 'cp projects/app/CLAUDE.md .', 'cd projects/app && cat outside/file', 'git -C projects/app diff -- outside/file',
     'git remote add origin repo', 'git remote set-url origin repo', 'ls $(pwd)', 'ls <(pwd)', 'env', 'base64 file | bash',
-    'npm publish', 'pnpm publish', 'yarn publish', 'cargo publish', 'printenv', 'halt', 'poweroff']) {
+    'npm publish', 'pnpm publish', 'yarn publish', 'cargo publish', 'printenv', 'halt', 'poweroff',
+    'helm lint projects/app/outside/chart', 'helm template test ./chart --set-file key=projects/app/outside/file',
+    'helm template test ./chart -fvalues.yml,/outside/file', 'ansible-playbook --syntax-check projects/app/outside/site.yml',
+    'ansible-playbook --syntax-check -iprojects/app/outside/hosts site.yml',
+    'ansible-playbook --syntax-check -e @projects/app/outside/vars site.yml',
+    'yamllint -cprojects/app/outside/config .', 'yamllint ../outside.yml', 'yamllint . > CLAUDE.md']) {
     expect(await gate.canUseTool('Bash', { command }), String(command)).toMatchObject({
       behavior: 'deny', message: expect.stringMatching(/^本地沙箱安全限制：/),
     });
@@ -186,8 +191,35 @@ it('denies local Bash boundary violations without opening an approval card', asy
     'sh check.sh', 'npm test', 'cat check.sh && cat health.txt', 'cd projects/app && git status && git remote -v',
     'git remote', 'git diff -- src/claude', 'git branch -a && git log --oneline -10',
     'cd projects/app && git status && git branch -a && git log --oneline -10 && git remote -v',
-    'cat CLAUDE.md > projects/app/rules.md', 'npm test > /dev/null 2>&1', 'touch projects/app/CLAUDE.md'])
+    'cat CLAUDE.md > projects/app/rules.md', 'npm test > /dev/null 2>&1', 'touch projects/app/CLAUDE.md',
+    'helm lint ./chart', 'helm template release ./chart -f skills/values.yml', 'helm show values ./chart',
+    'helm version', 'helm dependency list ./chart', 'helm template app ./helm --kube-version 1.30 -fvalues.yml',
+    'ansible-playbook --syntax-check -i localhost, playbooks/site.yml',
+    'yamllint skills/config.yml'])
     expect(await gate.canUseTool('Bash', { command }), command).toMatchObject({ behavior: 'allow' });
+  expect(createIssueNote).not.toHaveBeenCalled();
+});
+
+it('restricts Helm to offline inspection and ansible-playbook to syntax checking', async () => {
+  const { gate, createIssueNote } = await setup();
+  for (const args of [
+    'upgrade release ./chart', 'install release ./chart', 'dependency update ./chart',
+    'template release ./chart --kubeconfig=config', 'lint ./chart --KUBE-CONTEXT=test',
+    'template release ./chart --output-dir out', 'template release ./chart -oout',
+    'template release ./chart --dry-run=server', 'show values ./chart --repo=https://charts.example',
+    'template release ./chart --post-renderer script', 'template release ./chart --validate',
+  ]) {
+    expect(await gate.canUseTool('Bash', { command: 'helm ' + args }), args).toMatchObject({
+      behavior: 'deny', message: expect.stringContaining('仅允许离线 Helm Chart 静态校验与渲染（lint/template/show）'),
+    });
+  }
+  for (const args of ['site.yml', 'site.yml -- --syntax-check', ...[
+    '--become', '-b', '--private-key=key', '--ask-pass', '-k', '--ask-become-pass', '-K', '--connection=local', '-clocal',
+  ].map(flag => '--syntax-check ' + flag + ' site.yml')]) {
+    expect(await gate.canUseTool('Bash', { command: 'ansible-playbook ' + args }), args).toMatchObject({
+      behavior: 'deny', message: expect.stringContaining('本地沙箱仅允许 ansible-playbook --syntax-check 语法检查，远端执行请走受治理发布工具'),
+    });
+  }
   expect(createIssueNote).not.toHaveBeenCalled();
 });
 

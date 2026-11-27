@@ -39,7 +39,7 @@ export function readHubFrontmatter(raw: string, keys: ReadonlySet<string>): HubF
       // Older Agent manifests may include a multiline routing hint. Skip its body.
       if (lines.slice(start, i + 1).some(line => line.trim())) value = '';
     } else {
-      value = ['requires', 'shared_skills', 'allow_prefixes'].includes(key) ? rawValue : scalar(rawValue);
+      value = ['requires', 'uses', 'shared_skills', 'allow_prefixes'].includes(key) ? rawValue : scalar(rawValue);
     }
     if (value === undefined) return null;
     fields.set(key, value);

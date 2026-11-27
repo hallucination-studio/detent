@@ -139,6 +139,19 @@ it('reads a custom SOP from the configured branch on every resolution and applie
   expect((await currentProfile()).extraSystemPrompt).toContain('Verify the release branch.');
 });
 
+it('reports optional capability availability and attaches only enabled tools', async () => {
+  const { profile } = await resolve(['delivery::code'], {}, [release, disabled], agentTemplates);
+  expect(profile.enabledExtensionTools).toEqual(release.tools.map(tool => tool.name));
+  expect(profile.extraSystemPrompt?.split('\n').at(-1)).toBe('当前已启用扩展能力：gitlab-release；未启用：jumpserver');
+
+  const file = 'agents/custom/AGENT.md';
+  const { profile: explicit } = await resolve(['agent::custom'], {}, [release, jumpserver], {
+    [file]: '---\nuses: [jumpserver, missing]\n---\nUse available tools.',
+  });
+  expect(explicit.enabledExtensionTools).toEqual(jumpserver.tools.map(tool => tool.name));
+  expect(explicit.extraSystemPrompt?.split('\n').at(-1)).toBe('当前已启用扩展能力：jumpserver；未启用：missing');
+});
+
 it('resolves an Agent with local and shared Skills and enforces its production approval tier', async () => {
   const files: Record<string, string> = {
     'agents/Review/AGENT.md': '---\nrequires: [verification]\napprover_tier: prod\nclose_policy: approve\nshared_skills: [COMMON]\n---\nReview the changes.',
@@ -230,11 +243,13 @@ it('fits workflow display names into the execution audit column and retains the 
 });
 
 it.each([
-  ['agent::onboarding', 'detent_onboard_project'], ['delivery::release', 'detent_create_release'], ['delivery::env-change', 'jms_job'],
+  ['agent::onboarding', 'detent_onboard_project'], ['delivery::code', 'detent_create_project'],
+  ['delivery::release', 'detent_create_release'], ['delivery::env-change', 'jms_job'],
 ])('enforces the production gate and rechecks pending cards after a label switch for %s', async (label, toolName) => {
   const labels = [label];
   const files = Object.fromEntries(Object.entries(agentTemplates).map(([name, content]) => [name, content.replace('approver_tier: prod', 'approver_tier: standard')]));
-  const capabilities = [jumpserver, release, { name: 'gitlab-onboarding', enabled: true, tools: [tool('detent_onboard_project', 'always_approve')] }];
+  const capabilities = [jumpserver, release, { name: 'gitlab-onboarding', enabled: true,
+    tools: [tool('detent_onboard_project', 'always_approve'), tool('detent_create_project', 'always_approve')] }];
   const { profile } = await resolve(labels, { DELIVERY_PROD_APPROVERS: 'SRE' }, capabilities, files);
   expect(await profile.canApprove!({ ...approve, toolName, userId: 50 })).toBe(false);
   expect(await profile.canApprove!({ ...approve, toolName, username: 'Sre', userId: 20 })).toBe(false);
@@ -249,7 +264,7 @@ it.each([
   const orchestrator = new SessionOrchestrator(config, repo, { ...gitlab, ...hubTree(files) }, { run: vi.fn() }, {
     resolveTurnProfile: createDeliveryTurnProfileResolver(deliveryConfig, { capabilities }),
   });
-  for (const next of ['delivery::code', 'delivery::audit']) {
+  for (const next of ['agent::image-sync', 'delivery::audit']) {
     labels[0] = next;
     await orchestrator.handleUserIntent(1, issue.iid, { type: 'APPROVE', userId: 8, username: 'sre' });
     expect(await repo.getApproval(pending.id)).toMatchObject({ status: 'PENDING' });

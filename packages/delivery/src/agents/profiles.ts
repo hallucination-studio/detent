@@ -4,7 +4,7 @@ import {
 } from '@detent/core';
 import type { DeliveryConfig } from '../config.js';
 
-const prodTools = new Set(['jms_job', 'detent_create_release', 'detent_onboard_project']);
+const prodTools = new Set(['jms_job', 'detent_create_release', 'detent_onboard_project', 'detent_create_project']);
 
 type WorkflowProfile = TurnProfile & { approverTier?: WorkflowApproverTier };
 type ResolverContext = Parameters<TurnProfileResolver>[0];
@@ -19,18 +19,26 @@ function blocked(name: string, blockedMessage: string): WorkflowProfile {
   return { name, blockedMessage, readonly: true, disableBash: true, enabledExtensionTools: [] };
 }
 
-function agentProfile(result: NonNullable<ReturnType<typeof matchHubAgent>>): WorkflowProfile {
+function agentProfile(result: NonNullable<ReturnType<typeof matchHubAgent>>, capabilities: readonly DetentCapabilityPack[]): WorkflowProfile {
   if (result.kind === 'blocked')
     return blocked(result.agent?.id ?? 'unmatched', result.message);
   const { agent, enabledToolNames } = result;
   const readonly = agent.mode === 'readonly';
   // The audit table stores up to 64 characters. The prompt retains the full source path.
   const name = Array.from(agent.id).slice(0, 64).join('');
+  let extraSystemPrompt = renderAgentSystemPrompt(agent);
+  if (agent.uses?.length) {
+    const packs = new Map(capabilities.map(pack => [pack.name.trim().toLowerCase(), pack.enabled]));
+    const optional = new Set(agent.uses.flatMap(name => name === '*' ? [...packs.keys()] : [name]));
+    const enabled = [...optional].filter(name => packs.get(name));
+    const disabled = [...optional].filter(name => !packs.get(name));
+    extraSystemPrompt += '\n当前已启用扩展能力：' + (enabled.join('、') || '无') + '；未启用：' + (disabled.join('、') || '无');
+  }
   return {
     name, readonly, closePolicy: agent.closePolicy,
     workflow: { account: agent.account, allowPrefixes: agent.allowPrefixes },
     disableBash: readonly || !(agent.allowBash ?? (agent.approverTier === 'standard')),
-    enabledExtensionTools: enabledToolNames, extraSystemPrompt: renderAgentSystemPrompt(agent),
+    enabledExtensionTools: enabledToolNames, extraSystemPrompt,
     sandboxScope: { agentDir: agent.agentDir, sharedSkills: agent.sharedSkills },
     approverTier: agent.approverTier,
   };
@@ -42,7 +50,7 @@ async function hubProfile({ session, gitlab }: ResolverContext, options: Profile
     loadHubAgents(gitlab, session.hubProjectId, options.hubDefaultBranch ?? 'main'),
   ]);
   const matched = matchHubAgent(agents, issue.labels, capabilities);
-  if (matched) return agentProfile(matched);
+  if (matched) return agentProfile(matched, capabilities);
   const unknown = issue.labels.find(label => /^(delivery|agent)::/i.test(label.trim()));
   if (unknown) return blocked('unavailable', '未找到标签 ' + unknown + ' 对应的有效 Hub SOP，请检查 agents/<id>/AGENT.md。');
 

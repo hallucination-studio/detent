@@ -6,7 +6,7 @@ import { renderSummary } from '../gitlab/note-streamer.js';
 function permissionPrompt(readonly: boolean, mode: IssueSessionRow['permissionMode']) {
   if (readonly) return '本轮仅允许只读检查（不可修改文件或仓库）。完成检查后直接输出精炼结论，不要提及 plan 模式。';
   if (mode === 'plan') return '当前为方案阶段（只读）。只读问答直接报告证据；需要变更时调用 detent_submit_plan 提交精炼方案并结束本轮；严禁用 AskUserQuestion 询问“是否批准方案”。仅在缺少关键业务信息无法规划时才使用 AskUserQuestion。';
-  return '已获方案审批。检出仓库位于相对路径 projects/<directory_name>（每轮临时目录会重建，勿硬编码绝对路径）。读写与检索优先用 Read/Glob/Grep/Edit/Write，提交用 detent_commit_and_push，可在检出目录内运行测试和只读 git 查询。';
+  return '已获方案审批。仅在新特性分支上修改和推送代码，方案阶段检出的默认分支仅供只读检查。检出仓库位于相对路径 projects/<directory_name>（每轮临时目录会重建，勿硬编码绝对路径）。读写与检索优先用 Read/Glob/Grep/Edit/Write，提交用 detent_commit_and_push，可在检出目录内运行测试和只读 git 查询。';
 }
 
 export function buildSystemPrompt(
@@ -38,6 +38,7 @@ export function buildMrSystemPrompt(mr: LiveMr, tree: SessionWorktreeRow, readon
     `${mr.source_branch} -> ${mr.target_branch} · draft=${!!mr.draft} · has_conflicts=${mr.has_conflicts ?? 'unknown'} · ${mr.detailed_merge_status ?? ''}`,
     `When calling GitLab tools that take a project argument, pass project: ${mr.target_project_id}.`,
     `Prefer Read/Glob/Grep inside projects/${tree.directoryName} over shell cat/ls.`,
+    'If CLAUDE.md or skills/ exist in the workspace root, read relevant conventions before reviewing or modifying code.',
     pipeline ? `Pipeline #${pipeline.id} ${pipeline.status}. Failed jobs: ${failedJobs.join(', ') || 'none'}` : 'No pipeline.',
     ...discussions.flatMap(thread => thread.notes.filter(n => n.resolvable && !n.resolved && !n.system)
       .map(n => `Unresolved review: ${inlinePosition(n)}${n.body}`)),

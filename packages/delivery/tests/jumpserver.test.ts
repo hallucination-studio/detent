@@ -10,6 +10,7 @@ import { GitLabClient } from '../../core/src/gitlab/client.js';
 import { EphemeralSandbox } from '../../core/src/workspace/ephemeral-sandbox.js';
 import { WorkspaceTools } from '../../core/src/workspace/mcp-tools.js';
 import { InMemoryDetentRepository } from '../../core/tests/memory-repository.js';
+import { playbookUpload } from '../src/jumpserver/playbook.js';
 import {
   createJumpServerTools, HttpJumpServerClient, loadDeliveryConfig, validatePlaybookPath, validateReadonlyInspectCommand,
   type AnsibleJobRequest, type DeliveryConfig, type DeliveryExecutionTracker, type JumpServerClient,
@@ -126,7 +127,14 @@ it('fails before I/O if the required credential is missing, and never changes ro
 
 it.each([3, 4])('runs the SHA-pinned playbook with native job parameters on v%s', async version => {
   const { fetch, reply } = http();
-  const files = { 'site-sha/deploy/run.yml': strToU8('- hosts: all'), 'site-sha/roles/test/tasks/main.yml': strToU8('[]') };
+  const files = {
+    'site-sha/deploy/run.yml': strToU8('- hosts: all'),
+    'site-sha/roles/test/tasks/main.yml': strToU8('[]'),
+    'site-sha/roles/test/defaults/main.yml': strToU8('scope: root'),
+    'site-sha/deploy/roles/test/defaults/main.yml': strToU8('scope: local'),
+    'site-sha/group_vars/all.yml': strToU8('scope: group'),
+    'site-sha/host_vars/web.yml': strToU8('scope: host'),
+  };
   reply(['@SPEC', 'ops-first', 'root']);
   fetch.mockResolvedValueOnce(new Response(Uint8Array.from(zipSync(files))));
   reply({ id: 'playbook-id' }); reply({ id: 'definition', variable: version === 3 ? undefined : [] }); reply({ task_id: submission.jobId });
@@ -141,8 +149,10 @@ it.each([3, 4])('runs the SHA-pinned playbook with native job parameters on v%s'
   expect(String(upload[0])).toBe(base + '/api/v1/ops/playbooks/');
   const form = upload[1]?.body as FormData;
   const imported = unzipSync(new Uint8Array(await (form.get('path') as Blob).arrayBuffer()));
-  expect(JSON.parse(strFromU8(imported['main.yml']))).toEqual([{ import_playbook: 'site-sha/deploy/run.yml' }]);
-  expect(imported['site-sha/roles/test/tasks/main.yml']).toEqual(files['site-sha/roles/test/tasks/main.yml']);
+  expect(JSON.parse(strFromU8(imported['main.yml']))).toEqual([{ import_playbook: 'deploy/run.yml' }]);
+  for (const [name, bytes] of Object.entries(files)) expect(imported[name.slice('site-sha/'.length)]).toEqual(bytes);
+  for (const relative of ['roles/test/tasks/main.yml', 'group_vars/all.yml', 'host_vars/web.yml'])
+    expect(imported['deploy/' + relative]).toEqual(imported[relative]);
   expect(form.get('scope')).toBe('private');
   expect(String(job[0])).toBe(base + '/api/v1/ops/jobs/');
   expect(JSON.parse(String(job[1]?.body))).toEqual({ name: expect.stringMatching(/^detent-/), type: 'playbook', is_periodic: false, playbook: 'playbook-id', runas: 'ops-first', runas_policy: 'skip', assets: ['web01'], comment: 'approved' });
@@ -157,6 +167,57 @@ it.each([3, 4])('runs the SHA-pinned playbook with native job parameters on v%s'
   fetch.mockResolvedValueOnce(new Response(Uint8Array.from(zipSync(files))));
   await expect(client.runAnsibleJob({ ...request, playbookPath: 'other.yml' })).rejects.toThrow('missing');
   expect(fetch).toHaveBeenCalledTimes(6);
+});
+
+const gitlabArchive = { gitlabBaseUrl: 'https://git.test', gitlabToken: 'git-token' };
+
+async function packageArchive(mode: Pick<AnsibleJobRequest, 'playbookPath' | 'command'>) {
+  const { fetch } = http();
+  const files = { 'project/main.yml': strToU8('- hosts: all'), 'project/job.sh': strToU8('repo script'),
+    'project/group_vars/all.yml': strToU8('{}'), 'project/Chart.yaml': strToU8('apiVersion: v2'), 'project/__proto__': strToU8('tracked') };
+  fetch.mockResolvedValueOnce(new Response(Uint8Array.from(zipSync(files))));
+  const form = await playbookUpload({ ...request, playbookPath: undefined, ...mode }, gitlabArchive, new AbortController().signal);
+  return unzipSync(new Uint8Array(await (form.get('path') as Blob).arrayBuffer()));
+}
+
+it('uses a normalized root main.yml directly and preserves sibling repository files', async () => {
+  const bundle = await packageArchive({ playbookPath: './main.yml' });
+  expect(strFromU8(bundle['main.yml'])).toBe('- hosts: all');
+  expect(strFromU8(bundle['group_vars/all.yml'])).toBe('{}');
+  expect(strFromU8(bundle['__proto__'])).toBe('tracked');
+});
+
+it('stages the pinned checkout and runs the approved script literally inside it, with cleanup', async () => {
+  const command = "helm version --template '{{ .Version }}'\nhelm lint .";
+  const bundle = await packageArchive({ command });
+  expect(Object.keys(bundle).sort()).toEqual(['job.sh', 'main.yml', 'repo/Chart.yaml', 'repo/__proto__', 'repo/group_vars/all.yml', 'repo/job.sh', 'repo/main.yml']);
+  expect(strFromU8(bundle['repo/Chart.yaml'])).toBe('apiVersion: v2');
+  expect(strFromU8(bundle['repo/main.yml'])).toBe('- hosts: all');
+  expect(strFromU8(bundle['repo/job.sh'])).toBe('repo script');
+  expect(strFromU8(bundle['job.sh'])).toBe('#!/bin/sh\nset -eu\n' + command + '\n');
+  const main = strFromU8(bundle['main.yml']);
+  expect(main).not.toContain('.Version');
+  const dir = '{{ detent_job_dir.path }}';
+  expect(JSON.parse(main)).toEqual([expect.objectContaining({ hosts: 'all', tasks: [
+    { 'ansible.builtin.tempfile': { state: 'directory', prefix: 'detent-job-' }, register: 'detent_job_dir' },
+    { block: [
+      { 'ansible.builtin.file': { path: dir + '/repo', state: 'directory' } },
+      { 'ansible.builtin.copy': { src: 'repo/', dest: dir + '/repo/' } },
+      { 'ansible.builtin.copy': { src: 'job.sh', dest: dir + '/job.sh', mode: '0700' } },
+      { 'ansible.builtin.command': { argv: ['/bin/sh', dir + '/job.sh'], chdir: dir + '/repo' }, register: 'detent_job_exec' },
+      { 'ansible.builtin.debug': { var: 'detent_job_exec.stdout_lines' } },
+    ], always: [{ 'ansible.builtin.file': { path: dir, state: 'absent' }, when: 'detent_job_dir.path is defined' }] },
+  ] })]);
+});
+
+it('rejects missing, conflicting and invalid job modes before downloading the archive', async () => {
+  const { fetch } = http();
+  for (const mode of [{}, { playbookPath: 'main.yml', command: 'pwd' },
+    ...[' ', 'pwd\r', 'pwd\0', 'x'.repeat(1001)].map(command => ({ command }))]) {
+    await expect(playbookUpload({ ...request, playbookPath: undefined, ...mode }, gitlabArchive, new AbortController().signal))
+      .rejects.toThrow(/Exactly one|Invalid job command/);
+  }
+  expect(fetch).not.toHaveBeenCalled();
 });
 
 it('redacts GitLab and JumpServer credentials when the playbook archive fetch fails', async () => {
@@ -288,6 +349,8 @@ it.each([
   ['missing sha', { mergeCommitSha: null }, {}, 'SHA'],
   ['failed pipeline', { latestPipelineStatus: 'failed' }, {}, '流水线'],
   ['blocked asset', {}, { asset_ids: ['Restricted'] }, '黑名单'],
+  ['missing job mode', {}, { playbook_path: undefined }, '必须且只能提供一项'],
+  ['conflicting job modes', {}, { command: 'pwd' }, '必须且只能提供一项'],
   ...['../evil.yml', '/etc/playbook.yml', 'run.sh'].map(path => [path, {}, { playbook_path: path }, 'Playbook'] as const),
 ] as const)('hard-denies %s before posting a card or contacting JumpServer', async (_case, change, args, reason) => {
   const { gate, repo, mr, gitlab, session, client } = await setup();
@@ -307,6 +370,8 @@ it.each([true, false])('binds the approved execution and result to this session 
   expect(session.status).toBe('WAITING_TOOL');
   const approval = (await repo.getLatestPendingApproval(session.id))!;
   const card = gitlab.createIssueNote.mock.calls[0][2];
+  expect(card).toContain('| 目标仓库 | `ops/site` |');
+  expect(card).toContain('| Playbook | `deploy/run.yml` |');
   for (const value of [approval.id, 'web01', input.playbook_path, 'ops/site!8', mr.mrWebUrl, 'reviewer', sha, 'version', '上线', '/approve', '/reject'])
     expect(card).toContain(value);
   expect(card).toContain('| 变更原因 | 上线 \\| 验证 /approve /close *** |');
@@ -328,6 +393,25 @@ it.each([true, false])('binds the approved execution and result to this session 
   expect(await resumed.gate.invokeExtension(asTool('job_status'), { job_id: submission.jobId })).toEqual(result);
   expect(client.getJobResult).toHaveBeenCalledExactlyOnceWith(submission.jobId);
   expect(tracker.updateExecutionResult).toHaveBeenCalledExactlyOnceWith(session.id, submission.jobId, 'SUCCESS', result.outputSummary);
+});
+
+it('shows the full command for approval and tracks its bounded audit label', async () => {
+  const { gate, replay, client, repo, mr, gitlab, tracker, tools } = await setup();
+  await repo.upsertMergeRequest(mr);
+  const command = "helm version --template '{{ .Version }}'\n# " + 'x'.repeat(250);
+  const args = { ...input, playbook_path: undefined, command };
+  const schema = z.object(tools.find(tool => tool.name === 'jms_job')!.schema);
+  for (const invalid of [' ', 'pwd\0', 'pwd\r', 'x'.repeat(1001)])
+    expect(schema.safeParse({ ...args, command: invalid }).success).toBe(false);
+  await expect(gate.invokeExtension(asTool('job'), args)).rejects.toBeInstanceOf(ColdHold);
+  const card = gitlab.createIssueNote.mock.calls[0][2];
+  expect(card).toContain('| 目标仓库 | `ops/site` |');
+  expect(card).toContain("| 作业命令 | `helm version --template '{{ .Version }}'`<br>`# " + 'x'.repeat(250) + '` |');
+  expect(card).not.toContain('| Playbook |');
+  expect(client.runAnsibleJob).not.toHaveBeenCalled();
+  await replay(args);
+  expect(client.runAnsibleJob).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ command, playbookPath: undefined, commitSha: sha }));
+  expect(tracker.recordExecution).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ playbookPath: ('cmd: ' + command).slice(0, 255) }));
 });
 
 it.each(['reject', 'pipeline changes', 'merge changes at dispatch'])('aborts submission when %s', async scenario => {

@@ -186,7 +186,7 @@ async function main() {
   for (const ref of list(env.DETENT_TARGET_PROJECTS)) addTarget((await project(ref, true)).project);
   for (const id of groupIds) {
     const path = '/groups/' + id;
-    await member(path, bot, 30);
+    await member(path, bot, 40);
     for (const p of await all<Project>(path + '/projects?include_subgroups=true&archived=false'))
       addTarget(p);
   }

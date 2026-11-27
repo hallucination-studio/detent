@@ -6,7 +6,7 @@ import type { AppConfig } from '../config.js';
 import type { DetentRepository } from '../db/repository.js';
 import type { SandboxScope } from '../extensions.js';
 import type { GitLabClient } from '../gitlab/client.js';
-import { redactGitUrl } from '../gitlab/client.js';
+import { GitLabError, redactGitUrl } from '../gitlab/client.js';
 import type { IssueSessionRow, SessionWorktreeRow } from '../types.js';
 import { isHubPathSegment } from './hub-paths.js';
 
@@ -147,7 +147,8 @@ export class EphemeralSandbox {
     const exists = (
       await this.remote(s, s.workspaceRoot, url, ['ls-remote', '--heads', '--', url, 'refs/heads/' + branch])
     ).trim();
-    if (!exists && existingOnly) throw Error('Checkout requires an existing remote branch');
+    if (!exists && existingOnly)
+      throw Error(`当前为只读/方案阶段，仅允许检出现有远端分支（如 ${base}）阅读代码；创建新特性分支请先提交方案并等待审批。`);
     await fs.mkdir(dir); // Never remove an existing directory on a failed clone.
     try {
       await this.clone(s, url, exists ? branch : base, dir);
@@ -186,6 +187,8 @@ export class EphemeralSandbox {
       await fs.mkdir(s.claudeHome);
       await fs.mkdir(path.join(s.workspaceRoot, 'projects'), { recursive: true });
       if (session.sessionKind === 'issue') await this.copyHub(s, session.hubProjectId, scope);
+      if (session.sessionKind === 'mr' && this.config.gitlabHubProjectId > 0)
+        await this.copyHub(s, this.config.gitlabHubProjectId, { mrSharedOnly: true });
       for (const t of await this.repo.listActiveWorktrees(session.id)) {
         await this.restoreTree(s, t);
       }
@@ -195,8 +198,15 @@ export class EphemeralSandbox {
       throw error;
     }
   }
-  private async copyHub(s: TurnSandbox, project: number, scope?: SandboxScope) {
-    const hub = await this.gitlab.getProject(project);
+  private async copyHub(s: TurnSandbox, project: number, scope?: SandboxScope & { mrSharedOnly?: boolean }) {
+    let hub;
+    try {
+      hub = await this.gitlab.getProject(project);
+    } catch (error) {
+      if (scope?.mrSharedOnly && error instanceof GitLabError && [403, 404].includes(error.status)) return;
+      throw error;
+    }
+    if (scope?.mrSharedOnly && !hub) return;
     const dir = path.join(s.rootDir, 'hub');
     await this.clone(s, hub.http_url_to_repo, this.config.gitlabHubDefaultBranch, dir);
     const entries = await fs.readdir(dir, { withFileTypes: true });
@@ -204,7 +214,8 @@ export class EphemeralSandbox {
       recursive: true,
       filter: async (file) => !(await fs.lstat(file)).isSymbolicLink(),
     });
-    const common = !scope?.agentDir ? ['CLAUDE.md', '.claude', 'agents', 'skills'] : ['CLAUDE.md', '.claude'];
+    const common = scope?.mrSharedOnly ? ['CLAUDE.md', 'skills']
+      : scope?.agentDir ? ['CLAUDE.md', '.claude'] : ['CLAUDE.md', '.claude', 'agents', 'skills'];
     for (const entry of entries) {
       if (common.includes(entry.name)) await copy(entry.name);
     }

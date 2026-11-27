@@ -26,7 +26,8 @@ const text = (max: number) => z.string().trim().min(1).max(max);
 const assets = (max: number) => z.array(z.string().trim().min(1)).min(1).max(max);
 const id = z.number().int().positive();
 const jobSchema = {
-  target_project_id: id, mr_iid: id, commit_sha: text(64).min(7), playbook_path: text(255), asset_ids: assets(100),
+  target_project_id: id, mr_iid: id, commit_sha: text(64).min(7), asset_ids: assets(100),
+  playbook_path: text(255).optional(), command: z.string().max(1000).regex(/^[^\r\0]+$/).trim().min(1).optional(),
   extra_vars: z.record(z.unknown()).optional(), reason: text(500).optional(),
 };
 type JobInput = z.infer<z.ZodObject<typeof jobSchema>>;
@@ -79,12 +80,15 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
       },
     }),
     defineExtensionTool({
-      name: 'jms_job', description: '审批后异步执行当前会话已合并的 Ansible Playbook，终态自动唤醒本会话', policy: 'always_approve',
+      name: 'jms_job', description: '审批后在 JumpServer 异步执行当前会话已合并仓库的作业（Ansible 传 playbook_path，Helm 等仓库命令传 command），终态自动唤醒本会话', policy: 'always_approve',
       schema: jobSchema,
       async guard(input, ctx) {
         if (!tracker) return deny('未配置交付执行追踪仓储');
-        const path = validatePlaybookPath(input.playbook_path);
-        if (!path.ok) return path;
+        if (Boolean(input.playbook_path) === Boolean(input.command)) return deny('playbook_path 与 command 必须且只能提供一项');
+        if (input.playbook_path) {
+          const path = validatePlaybookPath(input.playbook_path);
+          if (!path.ok) return path;
+        }
         const targets = checkAssets(input.asset_ids);
         if (!targets.ok) return targets;
         return verifyMerge(input, ctx, config.blockFailedPipeline);
@@ -104,8 +108,9 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
           '| 已合并 MR | [' + ref + '](<' + url.href.replaceAll('|', '%7C') + '>)（由 ' + cell(mergedBy, 'code') + ' 合并） |',
           '| 提交 SHA | ' + cell(input.commit_sha, 'code') + ' |',
           '| 目标资产 | ' + cell(JSON.stringify(input.asset_ids), 'code') + ' |',
-          '| Ansible 仓库 | ' + cell(mr.targetProjectPath, 'code') + ' |',
-          '| Playbook | ' + cell(input.playbook_path, 'code') + ' |',
+          '| 目标仓库 | ' + cell(mr.targetProjectPath, 'code') + ' |',
+          input.playbook_path ? '| Playbook | ' + cell(input.playbook_path, 'code') + ' |'
+            : '| 作业命令 | ' + input.command!.split('\n').map(line => cell(line, 'code')).join('<br>') + ' |',
           input.extra_vars && '| 变更变量 | ' + cell(JSON.stringify(input.extra_vars), 'code') + ' |',
           '| 变更原因 | ' + cell(input.reason ?? '未提供') + ' |',
         ].filter(Boolean).join('\n');
@@ -123,14 +128,15 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
         const { mr } = verified;
         const job = await client.runAnsibleJob({
           account: ctx.workflow?.account ?? defaultAccount, assetIds: input.asset_ids, repository: mr.targetProjectPath, playbookPath: input.playbook_path,
-          commitSha: input.commit_sha, extraVars: input.extra_vars,
+          command: input.command, commitSha: input.commit_sha, extraVars: input.extra_vars,
           comment: `Detent ${ctx.session.id} / ${mr.targetProjectPath}!${mr.mrIid} / ${input.commit_sha} / ${approvalId}`,
         });
         try {
           await tracker.recordExecution({
             sessionId: ctx.session.id, mrId: mr.id, approvalId, agentProfile: ctx.profileName ?? 'unified',
             jumpserverJobId: job.jobId, jumpserverJobUrl: job.jobUrl,
-            playbookPath: input.playbook_path, commitSha: input.commit_sha, targetAssets: input.asset_ids,
+            playbookPath: input.playbook_path ?? ('cmd: ' + input.command!).slice(0, 255),
+            commitSha: input.commit_sha, targetAssets: input.asset_ids,
             status: job.status === 'PENDING' ? 'PENDING' : 'RUNNING',
           });
         } catch (error) {

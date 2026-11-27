@@ -19,7 +19,8 @@ export interface AnsibleJobRequest {
   account?: string;
   assetIds: string[];
   repository: string;
-  playbookPath: string;
+  playbookPath?: string;
+  command?: string;
   commitSha: string;
   extraVars?: Record<string, unknown>;
   comment: string;

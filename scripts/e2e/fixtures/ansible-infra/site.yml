@@ -1,0 +1,8 @@
+- name: Configure demo service
+  hosts: all
+  tasks:
+    - name: Configure connection limit
+      lineinfile:
+        path: /etc/detent-demo/app.conf
+        regexp: '^max_connections='
+        line: max_connections=128

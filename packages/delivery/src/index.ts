@@ -128,7 +128,7 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
           const scrub = (value: string) => redactDeliveryOutput(value, deliveryConfig, config);
           const message = scrub([
             `JumpServer 任务 ${row.jumpserverJobId} 已结束（${result.status}）`, row.jumpserverJobUrl,
-            `Playbook ${row.playbookPath} @ ${row.commitSha}`,
+            `作业 ${row.playbookPath} @ ${row.commitSha}`,
             '请依据任务状态继续核验。以下为远端输出摘要：',
           ].join('\n')) + '\n' + scrub(result.outputSummary).slice(0, 2000);
           await ctx.orchestrator.deliverSystemEvent(row.sessionId, 'jms-job:' + row.jumpserverJobId, message, { sender: 'jumpserver' });

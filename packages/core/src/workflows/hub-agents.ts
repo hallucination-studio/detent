@@ -16,6 +16,7 @@ export interface HubAgent {
   label: string;
   mode: WorkflowMode;
   requires: string[];
+  uses: string[];
   approverTier: WorkflowApproverTier;
   closePolicy: IssueClosePolicy;
   allowBash?: boolean;
@@ -32,7 +33,7 @@ export interface HubSkill {
   scope: 'agent' | 'shared';
 }
 
-const agentKeys = new Set(['label', 'mode', 'requires', 'approver_tier', 'close_policy', 'allow_bash', 'account',
+const agentKeys = new Set(['label', 'mode', 'requires', 'uses', 'approver_tier', 'close_policy', 'allow_bash', 'account',
   'allow_prefixes', 'description', 'shared_skills', 'default', 'routing_hint']);
 const skillKeys = new Set(['name', 'description']);
 const agentDefinition = /^agents\/([^/]+)\/AGENT\.md$/;
@@ -58,12 +59,14 @@ export function parseHubAgentMarkdown(id: string, file: string, raw: string): Hu
   if (![undefined, 'true', 'false'].includes(allowBash) || !['true', 'false'].includes(byDefault)) return null;
 
   const requires = readHubList(fields.get('requires'));
+  const uses = readHubList(fields.get('uses'));
   const allowPrefixes = readHubList(fields.get('allow_prefixes'));
   const sharedSkills = readHubList(fields.get('shared_skills'));
-  if (!requires || !allowPrefixes || !sharedSkills?.every(isHubPathSegment)) return null;
+  if (!requires || !uses || !allowPrefixes || !sharedSkills?.every(isHubPathSegment)) return null;
   const account = fields.get('account')?.trim();
   return {
     id: normalizedId, agentDir, file, label, mode, approverTier, closePolicy, requires: [...new Set(requires.map(normalize))],
+    uses: [...new Set(uses.map(normalize))],
     ...(account && { account }),
     ...(fields.has('allow_prefixes') && { allowPrefixes }),
     ...(allowBash !== undefined && { allowBash: allowBash === 'true' }),
@@ -178,7 +181,9 @@ export function resolveHubAgentCapabilities(agent: HubAgent, agents: readonly Hu
     ].filter(Boolean).join('\n\n');
     return { kind: 'blocked', agent, message: renderNote(message) };
   }
-  const tools = capabilities.filter(pack => pack.enabled && agent.requires.includes(normalize(pack.name))).flatMap(pack => pack.tools);
+  const selected = new Set([...agent.requires, ...agent.uses]);
+  const allEnabled = agent.uses.includes('*');
+  const tools = capabilities.filter(pack => pack.enabled && (allEnabled || selected.has(normalize(pack.name)))).flatMap(pack => pack.tools);
   const enabled = tools.filter(tool => agent.mode !== 'readonly' || tool.policy === 'readonly');
   return { kind: 'matched', agent, enabledToolNames: [...new Set(enabled.map(tool => tool.name))] };
 }

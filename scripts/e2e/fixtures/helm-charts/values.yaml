@@ -1,0 +1,6 @@
+image:
+  repository: busybox
+  tag: "1.36"
+service:
+  port: 8080
+replicaCount: 1

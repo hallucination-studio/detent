@@ -47,16 +47,31 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
   const issues = (id: number, iid: number) => project(id) + '/issues/' + iid;
   const mr = (id: number, iid: number) => project(id) + '/merge_requests/' + iid;
   const file = (id: number, path: string) => project(id) + '/repository/files/' + encodeURIComponent(path);
+  async function fileBytes(id: number, path: string, ref: string) {
+    const data = await api.json<{ content: string }>(file(id, path) + '?ref=' + encodeURIComponent(ref));
+    return Buffer.from(data.content, 'base64');
+  }
   return {
+    fileBytes,
     project(path: string) { return api.json<Project>('/projects/' + encodeURIComponent(path)); },
+    lookupProject(path: string) { return api.lookup<Project>('/projects/' + encodeURIComponent(path)); },
+    listTree(id: number, ref = 'main') {
+      return api.all<{ path: string; type: string; mode: string; id: string }>(
+        project(id) + '/repository/tree?recursive=true&ref=' + encodeURIComponent(ref));
+    },
+    async seedFiles(id: number, files: { file_path: string; content: string }[]) {
+      await api.request(project(id) + '/repository/commits', 'POST', {
+        branch: 'main', commit_message: 'Import existing service configuration',
+        actions: files.map(file => ({ action: 'create', ...file })),
+      });
+    },
     async upsertFile(id: number, path: string, content: string, message: string, branch = 'main', startBranch?: string) {
       const url = file(id, path);
       const existing = await api.lookup(url + '?ref=' + encodeURIComponent(startBranch ?? branch));
       await api.request(url, existing ? 'PUT' : 'POST', { branch, start_branch: startBranch, content, commit_message: message });
     },
     async getFile(id: number, path: string, ref = 'main') {
-      const data = await api.json<{ content: string }>(file(id, path) + '?ref=' + encodeURIComponent(ref));
-      return Buffer.from(data.content, 'base64').toString('utf8');
+      return (await fileBytes(id, path, ref)).toString('utf8');
     },
     async headSha(id: number) {
       const commit = await api.json<{ id: string }>(project(id) + '/repository/commits/main');
@@ -79,7 +94,7 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
     },
     getMr(id: number, iid: number) { return api.json<MR>(mr(id, iid)); },
     mrDiffs(id: number, iid: number) {
-      return api.all<{ new_path: string; deleted_file: boolean }>(mr(id, iid) + '/diffs');
+      return api.all<{ old_path: string; new_path: string; new_file: boolean; deleted_file: boolean; diff: string }>(mr(id, iid) + '/diffs');
     },
     openMr(id: number, branch: string, title: string, botId: number) {
       return api.json<MR>(project(id) + '/merge_requests', 'POST', {
@@ -93,11 +108,11 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
     getDiscussion(id: number, iid: number, discussion: string) {
       return api.json<Discussion>(mr(id, iid) + '/discussions/' + encodeURIComponent(discussion));
     },
-    async mergeMergeRequest(id: number, iid: number) {
+    async mergeMergeRequest(id: number, iid: number, sha?: string) {
       const path = mr(id, iid) + '/merge';
       const deadline = Date.now() + 30000;
       for (;;) {
-        const res = await api.request(path, 'PUT', { should_remove_source_branch: false }, tokens.sre, [405, 409, 422]);
+        const res = await api.request(path, 'PUT', { should_remove_source_branch: false, sha }, tokens.sre, sha ? [405, 422] : [405, 409, 422]);
         if (res.ok) {
           const merged: { state: string; merge_commit_sha: string } = await res.json();
           assert.equal(merged.state, 'merged');
@@ -142,7 +157,8 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
 
 export interface E2EGitLabDriver extends ReturnType<typeof projectActions> {
   readonly hubProjectPath: string;
-  readonly targetProjects: { web: string; api: string; ansible: string };
+  readonly groupPath: string;
+  readonly targetProjects: { web: string; api: string; ansible: string; helm: string };
   readonly credentials: readonly string[];
   detentPublicUrl(port: number): string;
   ensureUsers(): Promise<{ botId: number; botToken: string }>;

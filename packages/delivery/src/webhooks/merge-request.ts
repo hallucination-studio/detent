@@ -33,7 +33,7 @@ export const matchMergeRequestWebhook: WebhookExtension = (event) => {
         const ref = `${project.path_with_namespace ?? mr.targetProjectPath}!${attrs.iid}`;
         const url = mr.mrWebUrl;
         const branches = `${attrs.source_branch ?? mr.sourceBranch} → ${attrs.target_branch ?? mr.targetBranch}`;
-        const prompt = `关联 MR ${ref} (${url}) 已由 @${user.username} 合并。分支 ${branches}，合并提交 SHA：${sha ?? '未知'}。请按已批准的方案继续下一步。`;
+        const prompt = `关联 MR ${ref} (${url}) 已由 @${user.username} 合并。分支 ${branches}，合并提交 SHA：${sha ?? '未知'}。合并提交可能包含 MR 评审期间的修改，后续部署和验证必须以该提交为准，不得回退评审修改。请按已批准的方案继续下一步。`;
         await orchestrator.resumeSession(mr.sessionId, prompt, {
           permissionMode: 'default',
           async beforeRun(session) {

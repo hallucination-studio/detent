@@ -23,6 +23,27 @@ function readonlyKubectlGet(args: string[]) {
   return true;
 }
 
+function readonlyHelm(subcommand: string, args: string[]) {
+  if (!['list', 'status', 'history', 'version'].includes(subcommand)) return false;
+  let releases = 0;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (!arg.startsWith('-')) {
+      releases++;
+      continue;
+    }
+    if (['-A', '--all-namespaces', '--short', '--show-resources', '--deployed', '--failed', '--pending', '--all'].includes(arg)) continue;
+    const separator = arg.indexOf('=');
+    const flag = separator < 0 ? arg : arg.slice(0, separator);
+    if (!['-n', '--namespace', '-o', '--output', '--max', '--revision', '--filter'].includes(flag)) return false;
+    const value = separator < 0 ? args[++i] : arg.slice(separator + 1);
+    if (!value || value.startsWith('-')) return false;
+    if (['-o', '--output'].includes(flag) && !['table', 'json', 'yaml'].includes(value)) return false;
+    if (['--max', '--revision'].includes(flag) && !/^\d+$/.test(value)) return false;
+  }
+  return releases === (['status', 'history'].includes(subcommand) ? 1 : 0);
+}
+
 // Only these read-only forms accept extra arguments after a configured prefix.
 function readonlyPrefixArguments([program, ...args]: string[]) {
   const [subcommand, ...rest] = args;
@@ -34,6 +55,7 @@ function readonlyPrefixArguments([program, ...args]: string[]) {
     case 'ss': return args.every(arg => /^-[tulnpa46sxriemo]+$/.test(arg));
     case 'df': return !args.some(arg => arg.length > 2 && arg.startsWith('--') && '--sync'.startsWith(arg));
     case 'kubectl': return subcommand === 'get' && readonlyKubectlGet(rest);
+    case 'helm': return readonlyHelm(subcommand, rest);
     default: return false;
   }
 }

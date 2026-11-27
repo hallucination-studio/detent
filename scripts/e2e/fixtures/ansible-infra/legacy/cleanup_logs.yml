@@ -1,0 +1,5 @@
+- name: Inventory old log files
+  hosts: all
+  tasks:
+    - name: List stale files
+      shell: find /var/tmp/old -type f

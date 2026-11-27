@@ -14,7 +14,7 @@ it('derives Agent defaults from its id and preserves the original directory and 
   expect(parse('')).toEqual({
     id: 'deploy.v1', file: agentFile, agentDir: 'Deploy.V1', label: 'agent::deploy.v1',
     mode: 'governed', approverTier: 'standard', closePolicy: 'manual', description: agentFile,
-    requires: [], sharedSkills: [], skills: [], body: '# Procedure\n\nReview the result.',
+    requires: [], uses: [], sharedSkills: [], skills: [], body: '# Procedure\n\nReview the result.',
   } satisfies HubAgent);
 });
 
@@ -38,6 +38,7 @@ it.each([
   'unknown: yes', 'description: "unclosed', 'description: [not, scalar]', 'description: key: value', 'label: ', 'label: x\nlabel: y',
   'mode: auto', 'approver_tier: elevated', 'close_policy: invalid', 'allow_bash: yes', 'default: yes',
   'requires: [broken', 'requires: [one,,two]', 'requires: [nested, [list]]',
+  'uses: [broken', 'uses: [checks,,other]',
   'routing_hint: |\nUnindented text', 'routing_hint: >\nmode: readonly', 'routing_hint: |+\n  Unsupported style',
   'shared_skills: [../outside]', 'shared_skills: [..]', 'shared_skills: [a/b]', 'shared_skills: [""]',
   'shared_skills: [" verify "]', 'shared_skills: [a,,b]', 'shared_skills: [a, b',
@@ -137,6 +138,25 @@ const checks: DetentCapabilityPack = {
 };
 const deploy = parse('requires: [checks]\ndefault: true')!;
 const audit = parseHubAgentMarkdown('audit', 'agents/audit/AGENT.md', markdown('label: Audit\nmode: readonly\nrequires: checks'))!;
+
+it('selects named optional packs alongside requirements without blocking on unavailable options', () => {
+  const agent = parse('requires: [base]\nuses: [ Checks, "CHECKS", missing ]')!;
+  expect(agent.uses).toEqual(['checks', 'missing']);
+  const base = { ...checks, name: 'base', tools: [{ ...inspect, name: 'base_tool' }] };
+  const unrelated = { ...base, name: 'unrelated', tools: [{ ...inspect, name: 'other' }] };
+  const match = (enabled: boolean) => matchHubAgent([agent], [agent.label], [base, { ...checks, enabled }, unrelated]);
+  expect(match(true)).toMatchObject({ kind: 'matched', enabledToolNames: ['base_tool', 'inspect', 'apply'] });
+  expect(match(false)).toMatchObject({ kind: 'matched', enabledToolNames: ['base_tool'] });
+});
+
+it.each(['readonly', 'governed'])('selects every enabled pack with a wildcard in %s mode', mode => {
+  const agent = parse(`mode: ${mode}\nuses: ['*']`)!;
+  const packs = [checks, { ...checks, name: 'extra', tools: [{ ...inspect, name: 'extra_tool' }] },
+    { ...checks, name: 'disabled', enabled: false, tools: [{ ...inspect, name: 'hidden' }] }];
+  expect(matchHubAgent([agent], [agent.label], packs)).toMatchObject({
+    kind: 'matched', enabledToolNames: mode === 'readonly' ? ['inspect', 'extra_tool'] : ['inspect', 'apply', 'extra_tool'],
+  });
+});
 
 it('prioritizes a single explicitly matched readonly Agent and leaves unmatched Issues unified', () => {
   expect(matchHubAgent([deploy, audit], ['unknown'], [checks])).toBeUndefined();

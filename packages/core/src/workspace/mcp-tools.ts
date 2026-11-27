@@ -53,6 +53,9 @@ export class WorkspaceTools {
   }
   private async push(t: SessionWorktreeRow, message: string) {
     const { host, sandbox: s } = this;
+    if (!this.lockedWorktree && (t.branchName === t.baseBranch ||
+        t.branchName === (await host.gitlab.getProject(t.targetProjectId)).default_branch))
+      throw Error('禁止直接推送到基线分支 ' + t.branchName + '，请先调用 detent_checkout_worktree 检出新的特性分支后再修改提交。');
     if (this.lockedWorktree && (this.lockedWorktree.directoryName !== t.directoryName || this.lockedWorktree.branchName !== t.branchName))
       throw Error('Push is restricted to the MR worktree');
     const dir = await host.projectDir(s, t.directoryName);

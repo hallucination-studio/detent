@@ -3,10 +3,10 @@ import { defineExtensionTool, type DetentCapabilityPack } from '../extensions.js
 import { GitLabError, type GitLabClient } from '../gitlab/client.js';
 import { escapeTableCell } from '../gitlab/note-streamer.js';
 
-interface TargetProject { id: number; path_with_namespace: string }
-export interface OnboardingGitLab extends Pick<GitLabClient, 'getProjectMemberAccess' | 'listProjectHooks' | 'upsertProjectHook'> {
+interface TargetProject { id: number; path_with_namespace: string; default_branch?: string; web_url?: string }
+export interface OnboardingGitLab extends Pick<GitLabClient, 'getProjectMemberAccess' | 'getGroupMemberAccess' | 'createProject' | 'listProjectHooks' | 'upsertProjectHook'> {
   getProject(ref: number | string): Promise<TargetProject>;
-  getGroup(ref: number | string): Promise<{ id: number }>;
+  getGroup(ref: number | string): Promise<{ id: number; full_path?: string }>;
   listGroupProjects(id: number): Promise<TargetProject[]>;
   getBotUser(): Promise<{ id: number; username: string }>;
 }
@@ -56,6 +56,33 @@ export function createGitLabOnboardingTools({ gitlab, publicUrl, webhookSecret, 
     const denied = targets.rows.filter(row => !row.canManageWebhooks);
     if (denied.length) throw Error(targets.grant(denied.map(row => row.path)));
     return targets;
+  }
+  async function prepareCreate(input: { group: number | string; path: string }) {
+    if (!publicUrl || !webhookSecret) throw Error(setupHint);
+    const bot = await gitlab.getBotUser();
+    const grp = await gitlab.getGroup(input.group).catch(error => {
+      if (error instanceof GitLabError && [403, 404].includes(error.status))
+        throw Error(`请核对群组路径 ${input.group}，并在父群组授予 @${bot.username} Maintainer（40）权限。`);
+      throw error;
+    });
+    const groupPath = grp.full_path ?? String(input.group);
+    const access = await gitlab.getGroupMemberAccess(grp.id, bot.id).catch(error => {
+      if (error instanceof GitLabError && error.status === 403) return null;
+      throw error;
+    });
+    if ((access ?? 0) < 40) throw Error(`请在目标群组 ${groupPath} 授予 @${bot.username} Maintainer（40）权限。`);
+    return { bot, grp, groupPath, fullPath: groupPath + '/' + input.path };
+  }
+  async function findProject(fullPath: string) {
+    try {
+      return await gitlab.getProject(fullPath);
+    } catch (error) {
+      if (error instanceof GitLabError && error.status === 404) return null;
+      throw error;
+    }
+  }
+  async function requireAvailable(fullPath: string) {
+    if (await findProject(fullPath)) throw Error('仓库 ' + fullPath + ' 已存在，请直接检出修改或使用 detent_onboard_project 接入。');
   }
   return [
     defineExtensionTool({
@@ -115,6 +142,57 @@ export function createGitLabOnboardingTools({ gitlab, publicUrl, webhookSecret, 
           }
         }
         return { webhookUrl, onboarded };
+      },
+    }),
+    defineExtensionTool({
+      name: 'detent_create_project',
+      description: '经生产审批后在指定 GitLab 群组中创建新私有仓库（初始化默认分支 main）并自动配置 Detent Webhook',
+      policy: 'always_approve',
+      schema: {
+        group: ref,
+        path: z.string().trim().min(1).max(128).regex(/^[a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?$/)
+          .refine(path => !path.includes('..') && !/\.(git|atom)$/i.test(path), '无效的 GitLab 项目路径'),
+        name: z.string().trim().min(1).max(128).optional(),
+        description: z.string().trim().max(500).optional(),
+      },
+      async guard(input) {
+        try {
+          const { fullPath } = await prepareCreate(input);
+          await requireAvailable(fullPath);
+          return { ok: true };
+        } catch (error) {
+          return { ok: false, reason: error instanceof Error ? error.message : '无法核验新仓库路径或群组权限。' };
+        }
+      },
+      async renderApprovalCard(id, input) {
+        const { groupPath, fullPath } = await prepareCreate(input);
+        await requireAvailable(fullPath);
+        return [
+          '### GitLab 新建仓库审批',
+          '目标群组：' + escapeTableCell(groupPath, 'code'),
+          '新仓库路径：' + escapeTableCell(fullPath, 'code'),
+          '默认分支：`main`（私有仓库，初始化基础 `README.md`）',
+          '回调地址：' + escapeTableCell(webhookUrl, 'code'),
+          '订阅事件：' + eventNames.map(name => escapeTableCell(name, 'code')).join('、'),
+          '> 👍 或 `/approve` 放行 · 👎 或 `/reject` 拒绝 · <sub>审批单 `' + id + '`</sub>',
+        ].join('\n\n');
+      },
+      async execute(input, ctx) {
+        if (!ctx.approvalId) throw Error('新建仓库缺少审批单。');
+        const { grp, fullPath } = await prepareCreate(input);
+        const created = await gitlab.createProject({
+          namespace_id: grp.id, name: input.name ?? input.path, path: input.path, description: input.description,
+          visibility: 'private', default_branch: 'main', initialize_with_readme: true,
+        }).catch(async error => {
+          if (!(error instanceof GitLabError) || ![400, 409].includes(error.status)) throw error;
+          const existing = await findProject(fullPath);
+          if (!existing) throw error;
+          return existing;
+        });
+        await gitlab.upsertProjectHook(created.id, { ...events, url: webhookUrl, token: webhookSecret!,
+          push_events: false, issues_events: false, enable_ssl_verification: sslVerify ?? webhookUrl.startsWith('https:') });
+        return { projectId: created.id, path: created.path_with_namespace, defaultBranch: created.default_branch || 'main',
+          webUrl: created.web_url, webhookUrl, webhookConfigured: true };
       },
     }),
   ];

@@ -58,8 +58,9 @@ export function liveGitLab(baseUrl: string, adminToken: string): E2EGitLabDriver
 
   return {
     ...projectActions(api, tokens),
+    groupPath: namespace,
     hubProjectPath: namespace + '/workspace-hub',
-    targetProjects: { web: namespace + '/web', api: namespace + '/api', ansible: namespace + '/ansible-infra' },
+    targetProjects: { web: namespace + '/web', api: namespace + '/api', ansible: namespace + '/ansible-infra', helm: namespace + '/helm-charts' },
     get credentials() { return [...pats.values()]; },
     detentPublicUrl: port => (process.env.E2E_DETENT_PUBLIC_URL || 'http://host.docker.internal:' + port)
       .replace(/\/+$/, '').replace(/\/webhooks\/gitlab$/, ''),
@@ -79,6 +80,10 @@ export function liveGitLab(baseUrl: string, adminToken: string): E2EGitLabDriver
       }
       if (!botCredentials) {
         const bot = await identity('detent-bot');
+        const members = '/groups/' + group.id + '/members';
+        const member = await api.lookup<{ access_level: number }>(members + '/' + bot.id) ??
+          await api.json<{ access_level: number }>(members, 'POST', { user_id: bot.id, access_level: 40 });
+        assert.equal(member.access_level, 40);
         // Track the token even when bootstrap fails before writing --env-out.
         botCredentials = { botId: bot.id, botToken: await createPat(bot.id) };
       }
@@ -89,8 +94,9 @@ export function liveGitLab(baseUrl: string, adminToken: string): E2EGitLabDriver
       const project = await api.json<{ id: number; path_with_namespace: string }>('/projects', 'POST', {
         namespace_id: group.id, name: 'payment', path: 'payment', initialize_with_readme: true, default_branch: 'main',
       });
-      const member = await api.json<{ access_level: number }>('/projects/' + project.id + '/members', 'POST',
-        { user_id: botId, access_level: 40 });
+      const members = '/projects/' + project.id + '/members';
+      const member = await api.lookup<{ access_level: number }>(members + '/all/' + botId) ??
+        await api.json<{ access_level: number }>(members, 'POST', { user_id: botId, access_level: 40 });
       assert.equal(member.access_level, 40);
       return project;
     },

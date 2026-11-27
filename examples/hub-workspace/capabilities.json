@@ -7,7 +7,7 @@
       "access_key_secret": "$secret:JMS_AK_SECRET"
     },
     "default_account": "",
-    "inspect_allow_prefixes": ["systemctl status", "nginx -t", "df -h", "free -m", "uptime", "ss -tlnp", "kubectl get", "cat /etc/nginx", "docker ps", "jps"],
+    "inspect_allow_prefixes": ["systemctl status", "nginx -t", "df -h", "free -m", "uptime", "ss -tlnp", "kubectl get", "helm list", "helm status", "helm history", "cat /etc/nginx", "docker ps", "jps"],
     "blocked_assets": [],
     "block_failed_pipeline": true
   },

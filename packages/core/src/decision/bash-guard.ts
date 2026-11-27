@@ -2,11 +2,61 @@ import path from 'node:path';
 import { contained } from '../workspace/contained-path.js';
 
 // Check the literal invocation. Workspace scripts and build/test targets run as code in the turn sandbox.
-const blockedProgram = /^(?:sudo|su|doas|chmod|chown|mount|umount|mkfs(?:\..*)?|dd|kill|pkill|killall|shutdown|reboot|halt|poweroff|crontab|systemctl|service|launchctl|curl|wget|ssh|scp|sftp|rsync|nc|ncat|netcat|socat|telnet|ftp|nmap|twine|gh|glab|docker|podman|kubectl|helm|terraform|pulumi|printenv)$/;
+const blockedProgram = /^(?:sudo|su|doas|chmod|chown|mount|umount|mkfs(?:\..*)?|dd|kill|pkill|killall|shutdown|reboot|halt|poweroff|crontab|systemctl|service|launchctl|curl|wget|ssh|scp|sftp|rsync|nc|ncat|netcat|socat|telnet|ftp|nmap|twine|gh|glab|docker|podman|kubectl|terraform|pulumi|printenv)$/;
 const indirectShell = new Set('env eval exec command builtin source . pushd popd xargs time timeout nice nohup if then while until for function'.split(' '));
 const inspection = new Set('cd pwd ls tree cat tac head tail wc grep rg stat file du basename dirname realpath readlink diff cmp echo printf test true false git'.split(' '));
+const validators = new Set(['helm', 'ansible-playbook', 'yamllint']);
 const shell = /^(?:sh|bash|zsh|dash)$/;
 const readGit = new Set('status diff log show rev-parse ls-files ls-tree branch remote describe shortlog blame grep cat-file show-ref diff-tree'.split(' '));
+const helmBlockedFlags = ['--kubeconfig', '--kube-context', '--kube-apiserver', '--kube-token', '--kube-as-user',
+  '--kube-as-group', '--kube-ca-file', '--kube-tls-server-name', '--kube-insecure-skip-tls-verify', '--repo',
+  '--registry-config', '--post-renderer', '--validate', '--output-dir', '--dependency-update', '--enable-dns'];
+
+function offlineHelm(args: string[]) {
+  const [command, subcommand] = args;
+  if (!['lint', 'template', 'show', 'version'].includes(command) && !(command === 'dependency' && subcommand === 'list')) return false;
+  return !args.some((arg, i) => {
+    const flag = arg.toLowerCase();
+    return helmBlockedFlags.some(prefix => flag.startsWith(prefix)) || flag.includes('://') ||
+      flag === '--dry-run=server' || (flag === '--dry-run' && args[i + 1]?.toLowerCase() === 'server') ||
+      (command === 'template' && /^-[gh]*[ou]/i.test(arg));
+  });
+}
+
+function syntaxOnlyPlaybook(args: string[]) {
+  const end = args.indexOf('--');
+  const options = end === -1 ? args : args.slice(0, end);
+  return options.includes('--syntax-check') && !options.some(arg =>
+    /^(?:--become|--private-key|--key-file|--ask-pass|--ask-become-pass|--connection)/.test(arg) ||
+    /^-[vCDh]*[bkcK]/.test(arg));
+}
+
+// CLI options can contain multiple paths or attach a path to a short flag.
+// Expand those operands before applying the same realpath checks as positional paths.
+function validationPaths(program: string, args: string[]) {
+  const paths: string[] = [];
+  for (const [i, arg] of args.entries()) {
+    if (program === 'helm') {
+      const values = /^(--values(?:=|$)|-[gh]*f=?|--set-file(?:=|$))(.*)$/.exec(arg);
+      if (values) {
+        const entries = (values[2] || args[i + 1] || '').split(',');
+        for (const entry of entries) paths.push(values[1].startsWith('--set-file') ? entry.slice(entry.indexOf('=') + 1) : entry);
+      }
+    } else if (program === 'ansible-playbook') {
+      const option = /^(--(?:inventory(?:-file)?|module-path|extra-vars|limit|vault-id)(?:=|$)|-[vCD]*[ielM]=?)(.*)$/.exec(arg);
+      if (!option) continue;
+      const value = option[2] || args[i + 1] || '';
+      if (option[1].startsWith('--vault-id')) paths.push(value.slice(value.indexOf('@') + 1));
+      else if (/^(?:--extra-vars|--limit|-[vCD]*[el])/.test(arg)) {
+        if (value.startsWith('@')) paths.push(value.slice(1));
+      } else paths.push(...value.split(/[:,]/));
+    } else if (program === 'yamllint') {
+      const config = /^-s*c=?(.+)$/.exec(arg);
+      if (config) paths.push(config[1]);
+    }
+  }
+  return paths;
+}
 
 function readOnlyGit(words: string[]) {
   const [subcommand, ...args] = words;
@@ -31,6 +81,8 @@ async function bashOperandsContained(args: string[], root: string, cwd: string, 
 }
 
 async function blockedBashWrite(program: string, args: string[], root: string, cwd: string) {
+  // The literal Helm and playbook invocations have already passed their command-specific checks.
+  if (validators.has(program)) return false;
   if (inspection.has(program) && !args.some(arg => /^(?:--output(?:=|$)|-o)/.test(arg))) return false;
   const targets = ['.', ...args];
   // A directory destination implicitly writes a child named after each source.
@@ -83,13 +135,20 @@ export async function validateLocalSandboxBash(command: unknown, workspaceRoot: 
     if (!executable || !/^[\w./+-]+$/.test(executable)) return syntax;
     const program = path.basename(executable);
     if (!await contained(workspaceRoot, executable, false, cwd)) return '命令路径超出工作区';
-    if (blockedProgram.test(program) || (!inspection.has(program) && args.some(arg => blockedProgram.test(path.basename(arg)))))
+    if (program === 'helm' && !offlineHelm(args)) return '仅允许离线 Helm Chart 静态校验与渲染（lint/template/show）';
+    if (program === 'ansible-playbook' && !syntaxOnlyPlaybook(args))
+      return '本地沙箱仅允许 ansible-playbook --syntax-check 语法检查，远端执行请走受治理发布工具';
+    const inspecting = inspection.has(program) || validators.has(program);
+    if (blockedProgram.test(program) || (!inspecting && args.some(arg => {
+      const name = path.basename(arg);
+      return blockedProgram.test(name) || name === 'helm' || name === 'ansible-playbook';
+    })))
       return '禁止执行此命令';
     if (indirectShell.has(program))
       return '禁止执行此命令';
     if (shell.test(program) && (!args[0] || args[0].startsWith('-'))) return syntax;
     if (['npm', 'yarn', 'pnpm', 'cargo'].includes(program) && args.includes('publish')) return '禁止发布软件包';
-    if (!inspection.has(program) && args.includes('git') && (args.includes('push') || args.includes('remote')))
+    if (!inspecting && args.includes('git') && (args.includes('push') || args.includes('remote')))
       return '请直接调用本地只读 Git 查询';
     if (program === 'find' && args.some(arg => /^-(?:exec|ok)/.test(arg))) return syntax;
     let operandCwd = cwd;
@@ -102,7 +161,8 @@ export async function validateLocalSandboxBash(command: unknown, workspaceRoot: 
       }
       if (!readOnlyGit(args)) return '仅允许本地只读 Git 查询';
     }
-    if (!await bashOperandsContained(args, workspaceRoot, operandCwd, false) ||
+    const readOperands = validators.has(program) ? [...args, ...validationPaths(program, args)] : args;
+    if (!await bashOperandsContained(readOperands, workspaceRoot, operandCwd, false) ||
         await blockedBashWrite(program, args, workspaceRoot, operandCwd))
       return '路径超出工作区或写入受保护文件';
     if (program === 'cd') {

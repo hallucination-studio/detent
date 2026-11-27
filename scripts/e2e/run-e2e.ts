@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -14,16 +14,21 @@ import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import { liveGitLab } from './live-gitlab.js';
 import { runScenario, sopNames, type SopName } from './sop-scenarios.js';
 import { loadStackState, type RealE2EStackState } from './stack.js';
+import { ensureLocalHelmPath } from './toolchain.js';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const run = promisify(execFile);
 
 function selectedSops(): SopName[] {
-  const { values } = parseArgs({ options: { sop: { type: 'string', default: 'all' } } });
+  const { values } = parseArgs({ options: { sop: { type: 'string', default: 'all' }, help: { type: 'boolean', short: 'h' } } });
+  if (values.help) {
+    console.log('Usage: npm run e2e -- --sop=all|sop1,...,sop9');
+    return [];
+  }
   if (values.sop === 'all') return sopNames;
   const names = values.sop!.split(',').map(s => s.trim());
   for (const name of names) {
-    if (!sopNames.includes(name as SopName)) throw Error('Expected --sop=all or a comma-separated list of sop1 through sop6');
+    if (!sopNames.includes(name as SopName)) throw Error('Expected --sop=all or a comma-separated list of sop1 through sop9');
   }
   return [...new Set(names as SopName[])];
 }
@@ -102,12 +107,18 @@ function startPod(env: NodeJS.ProcessEnv, audit: CredentialAudit) {
       const pid = child.pid;
       const killGroup = () => {
         try { process.kill(-pid, 'SIGKILL'); }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+        catch (error) {
+          const { code } = error as NodeJS.ErrnoException;
+          if (code !== 'ESRCH' && code !== 'EPERM') throw error;
+        }
       };
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
       const timer = setTimeout(killGroup, 15000);
       try { await exited; }
-      finally { clearTimeout(timer); killGroup(); }
+      finally {
+        clearTimeout(timer);
+        if (child.exitCode === null && child.signalCode === null) killGroup();
+      }
     },
   };
 }
@@ -169,17 +180,28 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+async function seedRepository(gitlab: ReturnType<typeof liveGitLab>, id: number, fixture: string) {
+  const dir = join(root, 'scripts/e2e/fixtures', fixture);
+  const entries = await readdir(dir, { withFileTypes: true, recursive: true });
+  const files = await Promise.all(entries.filter(entry => entry.isFile()).map(async entry => {
+    const path = join(entry.parentPath, entry.name);
+    return { file_path: relative(dir, path), content: await readFile(path, 'utf8') };
+  }));
+  await gitlab.seedFiles(id, files);
+}
+
 async function main() {
   const selected = selectedSops();
+  if (!selected.length) return;
   const models = await modelConfig();
   let stack: RealE2EStackState;
   try { stack = await loadStackState(); }
-  catch { throw Error('Cannot load the real E2E stack state. Run npm run e2e:up first.'); }
+  catch (cause) { throw Error('Cannot load the real E2E stack state. Run npm run e2e:up first.', { cause }); }
   const timeoutMs = Number(process.env.E2E_PHASE_TIMEOUT_MS ?? 150000);
   assert.ok(Number.isSafeInteger(timeoutMs) && timeoutMs > 0, 'Invalid E2E_PHASE_TIMEOUT_MS');
-  const sopTimeoutMs = Number(process.env.E2E_SOP_TIMEOUT_MS ?? 300000);
-  assert.ok(Number.isSafeInteger(sopTimeoutMs) && sopTimeoutMs > 0 && sopTimeoutMs <= 300000,
-    'E2E_SOP_TIMEOUT_MS must be between 1 and 300000');
+  const sopTimeoutMs = Number(process.env.E2E_SOP_TIMEOUT_MS ?? 420000);
+  assert.ok(Number.isSafeInteger(sopTimeoutMs) && sopTimeoutMs > 0 && sopTimeoutMs <= 600000,
+    'E2E_SOP_TIMEOUT_MS must be between 1 and 600000');
   const gitlab = liveGitLab(stack.gitlabUrl, stack.gitlabAdminToken);
   const audit = new CredentialAudit();
   const hookSecret = randomBytes(32).toString('hex');
@@ -220,33 +242,49 @@ async function main() {
     });
     const config = parseEnv(await readFile(envFile, 'utf8'));
     const paths = gitlab.targetProjects;
-    const [hub, web, api, ansible] = await Promise.all([gitlab.hubProjectPath, paths.web, paths.api, paths.ansible].map(gitlab.project));
-    for (const p of [hub, web, api, ansible]) projectIds.add(p.id);
+    const [hub, web, api, ansible, helm] = await Promise.all([gitlab.hubProjectPath, paths.web, paths.api, paths.ansible, paths.helm].map(gitlab.project));
+    for (const p of [hub, web, api, ansible, helm]) projectIds.add(p.id);
     assert.equal(hub.id, Number(config.GITLAB_HUB_PROJECT_ID));
     await gitlab.upsertFile(api.id, 'service.conf', 'port=19092\n', 'Seed service port configuration');
+    await Promise.all([
+      seedRepository(gitlab, ansible.id, 'ansible-infra'),
+      seedRepository(gitlab, helm.id, 'helm-charts'),
+    ]);
     const capabilities = JSON.parse(await gitlab.getFile(hub.id, 'capabilities.json'));
     capabilities.jumpserver.base_url = stack.jumpserverUrl;
     await gitlab.upsertFile(hub.id, 'capabilities.json', JSON.stringify(capabilities, null, 2) + '\n', 'Connect the local JumpServer');
+    const hubInstructions = await gitlab.getFile(hub.id, 'CLAUDE.md');
+    await gitlab.upsertFile(hub.id, 'CLAUDE.md', [
+      hubInstructions, '',
+      '通过 `target-node-01` 访问的 E2E Kubernetes 验证集群仅有控制平面，没有可调度 Pod 的工作节点。',
+      '执行 `helm upgrade --install` 时请省略 `--wait`；部署后用 `helm status` 检查 release 状态，并核对集群中 Kubernetes 资源的 spec。', '',
+    ].join('\n'), 'Document the E2E verification cluster topology');
     checkRunning();
 
+    const helmPath = await ensureLocalHelmPath();
     console.log('Starting Delivery on port ' + port);
     await reservation.close();
     const podId = 'delivery-' + hub.id;
     pod = startPod({
-      ...local, ...config, ...models, POD_ID: podId, HOST: '0.0.0.0', PORT: String(port),
+      ...local, ...config, ...models, PATH: helmPath, POD_ID: podId, HOST: '0.0.0.0', PORT: String(port),
       EPHEMERAL_ROOT: join(tmp, 'sandboxes'), MYSQL_HOST: stack.mysql.host, MYSQL_PORT: String(stack.mysql.port),
       MYSQL_USER: stack.mysql.user, MYSQL_PASSWORD: stack.mysql.password, MYSQL_DATABASE: stack.mysql.database,
       DETENT_SECRET_JMS_AK_ID: stack.jumpserverAccessKeyId, DETENT_SECRET_JMS_AK_SECRET: stack.jumpserverAccessKeySecret,
       DELIVERY_JOB_POLL_INTERVAL_MS: '1000',
     }, audit);
     const deadline = Date.now() + 60000;
+    let lastHealthError = '';
     do {
       checkRunning();
-      const health = await fetch('http://127.0.0.1:' + port + '/healthz', { signal: AbortSignal.timeout(2000) }).catch(() => undefined);
+      const health = await fetch('http://127.0.0.1:' + port + '/healthz', { signal: AbortSignal.timeout(2000) }).catch(error => {
+        lastHealthError = message(error);
+        return undefined;
+      });
+      if (health) lastHealthError = 'HTTP ' + health.status + ', waiting for ' + podId;
       if (health?.ok && (await health.json()).podId === podId) { ready = true; break; }
       await delay(300);
     } while (Date.now() < deadline);
-    assert.ok(ready, 'Delivery Pod did not become healthy within 60s');
+    assert.ok(ready, 'Delivery Pod did not become healthy within 60s: ' + lastHealthError);
 
     for (const name of selected) {
       checkRunning();
@@ -254,7 +292,7 @@ async function main() {
       console.log('Starting ' + name);
       let result = 'FAILED';
       try {
-        await runScenario(name, { db, gitlab, stack, hub: hub.id, web, api, ansible, botId, timeoutMs, sopDeadline: start + sopTimeoutMs,
+        await runScenario(name, { db, gitlab, stack, hub: hub.id, web, api, ansible, helm, groupPath: gitlab.groupPath, helmPath, botId, timeoutMs, sopDeadline: start + sopTimeoutMs,
           redact: text => audit.redact(text), webhookUrl: publicUrl + '/webhooks/gitlab', checkRunning, registerProject: id => projectIds.add(id) });
         checkRunning();
         result = 'passed';

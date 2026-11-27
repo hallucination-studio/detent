@@ -129,17 +129,34 @@ services:
       timeout: 4s
       retries: 24
 
+  k3s:
+    image: rancher/k3s:v1.31.4-k3s1
+    command: ["server", "--disable-agent", "--disable=traefik,servicelb,metrics-server,local-storage,coredns", "--tls-san=k3s", "--write-kubeconfig=/output/kubeconfig.yaml", "--write-kubeconfig-mode=0644"]
+    volumes:
+      - k3s-data:/var/lib/rancher/k3s
+      - k3s-kubeconfig:/output
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /output/kubeconfig.yaml && kubectl --kubeconfig=/output/kubeconfig.yaml get --raw=/readyz | grep -qx ok"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
   target-node-01:
     build: ./target-node
     hostname: target-node-01
     container_name: detent-e2e-target-node-01
     init: true
+    depends_on:
+      k3s:
+        condition: service_healthy
+    volumes:
+      - k3s-kubeconfig:/k3s-kubeconfig:ro
     healthcheck:
       test:
         - CMD
         - python3
         - -c
-        - "import socket; assert socket.create_connection(('localhost', 22), 2).recv(4) == b'SSH-'; assert socket.create_connection(('localhost', 9092), 2).recv(10).startswith(b'demo-kafka')"
+        - "import socket, subprocess; assert socket.create_connection(('localhost', 22), 2).recv(4) == b'SSH-'; assert socket.create_connection(('localhost', 9092), 2).recv(10).startswith(b'demo-kafka'); assert subprocess.check_output(['su', '-', 'ops', '-c', 'helm version --short >/dev/null && kubectl get --raw=/readyz']).strip() == b'ok'"
       interval: 5s
       timeout: 5s
       retries: 12
@@ -156,3 +173,5 @@ volumes:
   mysql-data:
   jms-pg-data:
   jms-data:
+  k3s-data:
+  k3s-kubeconfig:

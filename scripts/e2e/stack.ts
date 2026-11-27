@@ -178,7 +178,7 @@ async function checkAsset(state: RealE2EStackState) {
 function checkServices() {
   const rows = compose(['ps', '--status', 'running', '--format', '{{.Service}} {{.Health}}'],
     { timeout: 10_000 }).trim().split('\n');
-  for (const service of ['jms-celery', target]) {
+  for (const service of ['k3s', 'jms-celery', target]) {
     if (!rows.includes(service + ' healthy')) throw Error(service + ' is not healthy');
   }
 }
@@ -190,7 +190,7 @@ async function up() {
   const mysql = { host: '127.0.0.1', port: publishedPort('mysql', 3306), user: 'detent',
     password: 'detent-e2e-mysql', database: 'detent' };
 
-  console.log('Waiting for MySQL, GitLab, JumpServer and the Ansible worker.');
+  console.log('Waiting for MySQL, GitLab, JumpServer, K3s and the managed host.');
   await Promise.all([
     waitFor('MySQL', 120, async () => {
       compose(['exec', '-T', 'mysql', 'mysqladmin', 'ping', '--protocol=tcp', '--silent'], { timeout: 5000 });
@@ -204,7 +204,7 @@ async function up() {
       const health = await (await get(jumpserverUrl + '/api/health/')).json();
       if (!health.status) throw Error('JumpServer database or Redis health check failed');
     }),
-    waitFor('JumpServer worker and managed host', 240, checkServices),
+    waitFor('K3s, JumpServer worker and managed host', 240, checkServices),
   ]);
 
   console.log('Provisioning the GitLab token and JumpServer asset permission.');
@@ -240,7 +240,7 @@ async function main(command: string | undefined) {
       const state = loadStackState();
       await Promise.all([checkMysql(state.mysql), checkGitlab(state), checkAsset(state)]);
       checkServices();
-      console.log('MySQL, the GitLab root token, the signed JumpServer asset lookup and the worker are ready.');
+      console.log('MySQL, the GitLab root token, JumpServer, K3s and the managed host are ready.');
       return;
     }
     default:

@@ -6,6 +6,11 @@ if [[ ${1:-} == reset-config ]]; then
     exec install -o ops -g ops -m 0644 /opt/detent-demo/app.conf /etc/detent-demo/app.conf
 fi
 
+install -d -m 0700 -o ops -g ops /home/ops/.kube
+install -m 0600 /k3s-kubeconfig/kubeconfig.yaml /home/ops/.kube/config
+sed -i 's@https://127\.0\.0\.1:6443@https://k3s:6443@g' /home/ops/.kube/config
+chown -R ops:ops /home/ops/.kube
+
 ssh-keygen -A
 /usr/sbin/sshd -t
 # The SSH user can see its own listener's PID and process name in ss -lntp.

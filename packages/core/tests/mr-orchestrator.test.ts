@@ -92,7 +92,7 @@ async function setup() {
 }
 
 it('checks out the assigned source, registers only MR tools, resolves a real shallow merge conflict, and pushes only the source', async () => {
-  const { root, config, repo, mr, gitlab, run, send, session } = await setup();
+  const { root, config, repo, mr, gitlab, run, send, session, decide } = await setup();
   const seed = path.join(root, 'seed');
   const remote = path.join(root, '2.git');
   for (const branch of ['feature', 'main']) {
@@ -108,9 +108,13 @@ it('checks out the assigned source, registers only MR tools, resolves a real sha
     expect(tree).toMatchObject({ branchName: 'feature', baseBranch: 'main', status: 'ACTIVE' });
     const dir = path.join(t.sandbox.workspaceRoot, 'projects', tree.directoryName);
     expect(await readdir(t.sandbox.workspaceRoot)).toEqual(['projects']);
-    for (const text of ['2!1', mr.title, mr.description!, 'feature -> main', 'draft=true', 'has_conflicts=true', 'lint', 'tracked:7', tree.directoryName])
+    for (const text of ['GitLab MR org/project2 (#2)!1 · Review me', 'project: 2', 'Read/Glob/Grep inside projects/' + tree.directoryName, mr.title, mr.description!, 'feature -> main', 'draft=true', 'has_conflicts=true', 'lint', 'tracked:7', tree.directoryName])
       expect(t.systemPrompt).toContain(text);
     expect(t.systemPrompt).not.toContain('test-secret');
+    for (const command of ['sh check.sh', 'cat check.sh && cat health.txt', 'cd projects/' + tree.directoryName + ' && git status && git remote -v'])
+      expect(await t.gate.canUseTool('Bash', { command })).toMatchObject({ behavior: 'allow' });
+    expect(decide).not.toHaveBeenCalled();
+    expect(await repo.getLatestPendingApproval(t.session.id)).toBeNull();
     const allowed = ['detent_commit_and_push', 'detent_get_pipeline_status', 'detent_get_pipeline_job_log'];
     const extensions = ['detent_get_mr_diff', 'detent_list_mr_discussions', 'detent_sync_target_branch'];
     for (const tool of ['detent_create_mr', 'detent_close_issue', 'detent_checkout_worktree', 'detent_close_worktree', 'detent_list_projects', 'detent_create_release', 'external__run'])
@@ -290,6 +294,8 @@ it('checks fork write permission and uses read-only suggestions while retaining 
     const [tree] = await repo.listActiveWorktrees(t.session.id);
     expect(tree.targetProjectId).toBe(3);
     expect(t.systemPrompt).toContain('Read-only fork');
+    expect(t.systemPrompt).toContain('GitLab MR org/project2 (#2)!1');
+    expect(await t.gate.canUseTool('Bash', { command: 'git status' })).toMatchObject({ behavior: 'deny' });
     for (const [name, input] of [['Edit', { file_path: 'a' }], ['detent_commit_and_push', {}], ['mcp__detent__detent_sync_target_branch', {}]] as const)
       expect(await t.gate.preflight(name, input)).toMatchObject({ behavior: 'deny' });
     await expect(t.tools.invoke('detent_commit_and_push', { directory_name: tree.directoryName, commit_message: 'bad' })).rejects.toThrow(/read-only/);
@@ -385,7 +391,7 @@ it.each(['close', 'merge'])('stops an active turn, expires approvals and archive
   await post(opened);
   await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
   const s = await session();
-  const pending = await repo.createApprovalRequest(s.id, 'TOOL_USE', 'Bash', {});
+  const pending = await repo.createApprovalRequest(s.id, 'ASK_USER', 'AskUserQuestion', { questions: [{ question: 'Which branch?' }] });
   await send({ ...opened, object_attributes: { ...opened.object_attributes, action, state: action === 'close' ? 'closed' : 'merged' } });
   expect(await session()).toMatchObject({ status: 'DONE', lockedByPod: null });
   expect(await repo.findWorktree(s.id, 2, 'feature')).toMatchObject({ status: 'ARCHIVED' });

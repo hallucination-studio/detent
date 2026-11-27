@@ -1,5 +1,4 @@
 import { z } from 'zod';
-import { createDecisionClient, type DecisionClient } from '../decision/jev-client.js';
 import { randomUUID } from 'node:crypto';
 import { createIssueChannel } from './channel.js';
 import { TurnRuntime, SessionBusy, StopTurn, formatInboxMessages, type Active } from './turn-runtime.js';
@@ -44,7 +43,6 @@ type Client = WorkspaceGitLab &
   > & Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile' | 'closeIssue'>>;
 export class SessionOrchestrator extends TurnRuntime {
   private readonly denialNotices = new Set<string>();
-  private readonly decision?: DecisionClient;
   constructor(
     config: AppConfig,
     repo: DetentRepository,
@@ -53,7 +51,6 @@ export class SessionOrchestrator extends TurnRuntime {
     private extensions: DetentExtensions = {},
   ) {
     super(config, repo, extensions.hooks);
-    this.decision = extensions.decisionClient ?? createDecisionClient(config);
   }
   private async getCapabilities(): Promise<readonly DetentCapabilityPack[]> {
     const { config, gitlab } = this;
@@ -231,7 +228,6 @@ export class SessionOrchestrator extends TurnRuntime {
         },
       }));
       const gate = new PermissionGate({
-        decision: this.decision,
         capabilities,
         extensionTools: [...(this.extensions.tools ?? []), ...turnTools],
         profile: profile?.enabledExtensionTools

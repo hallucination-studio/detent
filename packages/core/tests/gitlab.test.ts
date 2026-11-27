@@ -157,7 +157,7 @@ it('coalesces 20 events, serializes final flush and redacts approval cards and t
     expect(
       renderToolApprovalCard({
         id: 'a',
-        toolName: 'Bash',
+        toolName: 'external',
         toolInput: { command: url },
         approvalType: 'TOOL_USE',
       }),
@@ -216,7 +216,7 @@ it('publishes a text-only result without empty sections or executable quick acti
   expect(renderPlanApprovalCard('/close')).toContain('### 📋 实施方案审批\n\n\\/close\n\n---');
 });
 
-it('renders numbered questions, fenced commands and escaped fallback tool inputs', () => {
+it('renders numbered questions and escaped fallback tool inputs', () => {
   const tool = { id: 'approval-id', toolName: 'AskUserQuestion', approvalType: 'ASK_USER' } as const;
   const questions = [{ question: '哪个分支？\n /label' }, { question: '/close' }];
   const ask = renderToolApprovalCard({ ...tool, toolInput: { questions } });
@@ -225,12 +225,6 @@ it('renders numbered questions, fenced commands and escaped fallback tool inputs
   expect(ask).not.toMatch(/AskUserQuestion|approval-id|questions/);
 
   const approval = { ...tool, approvalType: 'TOOL_USE' } as const;
-  const command = 'echo ````\n/close\ncd /tmp/turn/workspace/projects/web';
-  const bash = renderToolApprovalCard(
-    { ...approval, toolName: 'Bash', toolInput: { command, description: '检查' } },
-    '/tmp/turn/workspace',
-  );
-  expect(bash).toContain('**用途**：检查\n\n`````sh\necho ````\n\\/close\ncd projects/web\n`````');
   const card = (toolInput: Record<string, unknown>) => renderToolApprovalCard({ ...approval, toolName: 'other', toolInput });
   expect(card({ 'a|b': 'c\r/label\n|' })).toContain('| a\\|b | c /label \\| |');
   expect(escapeTableCell('prod`|`svc', 'code')).toBe('`` prod`\\|`svc ``');

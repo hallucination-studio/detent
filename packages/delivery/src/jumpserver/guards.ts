@@ -23,19 +23,18 @@ function readonlyKubectlGet(args: string[]) {
   return true;
 }
 
-// Limit options on programs that can open other files, switch hosts, or change
-// state despite a read-only subcommand. Configured prefixes still apply afterward.
-function readonlyArguments([program, ...args]: string[]) {
+// Only these read-only forms accept extra arguments after a configured prefix.
+function readonlyPrefixArguments([program, ...args]: string[]) {
   const [subcommand, ...rest] = args;
   switch (program) {
     case 'uptime': return args.every(arg => ['-p', '-s', '--pretty', '--since'].includes(arg));
-    case 'nginx': return subcommand !== '-t' || rest.every(arg => arg === '-q');
-    case 'systemctl': return subcommand !== 'status' || rest.every(arg =>
+    case 'nginx': return subcommand === '-t' && rest.every(arg => arg === '-q');
+    case 'systemctl': return subcommand === 'status' && rest.every(arg =>
       !arg.startsWith('-') || ['--no-pager', '--full', '-l'].includes(arg));
     case 'ss': return args.every(arg => /^-[tulnpa46sxriemo]+$/.test(arg));
     case 'df': return !args.some(arg => arg.length > 2 && arg.startsWith('--') && '--sync'.startsWith(arg));
-    case 'kubectl': return subcommand !== 'get' || readonlyKubectlGet(rest);
-    default: return true;
+    case 'kubectl': return subcommand === 'get' && readonlyKubectlGet(rest);
+    default: return false;
   }
 }
 
@@ -53,23 +52,19 @@ export function validateReadonlyInspectCommand(command: string, allowPrefixes: r
   const words = normalized.split(' ');
   const [executable, ...args] = words;
   const program = installedProgram(executable);
-  if (!readonlyArguments([program, ...args])) return deny('巡检命令参数不在只读白名单');
 
   const allowed = allowPrefixes.some(value => {
     const prefix = normalizeShellCommand(value);
     if (!prefix) return false;
     const [prefixProgram, ...prefixArgs] = prefix.split(' ');
     if (prefixProgram !== executable && prefixProgram !== program) return false;
-    if (program === 'ss' && readonlyArguments(['ss', ...prefixArgs])) {
-      const flags = args.join('');
-      return [...prefixArgs.join('')].every(flag => flags.includes(flag));
-    }
     const candidate = [prefixProgram, ...args].join(' ');
+    if (candidate === prefix) return true;
     const path = prefixArgs.at(-1) ?? '';
     const pathPrefix = path.startsWith('/');
-    if (candidate !== prefix && !candidate.startsWith(prefix + ' ') &&
-        !(pathPrefix && candidate.startsWith(prefix + '/'))) return false;
-    if (!pathPrefix || program !== 'cat') return true;
+    if (!candidate.startsWith(prefix + ' ') && !(pathPrefix && candidate.startsWith(prefix + '/'))) return false;
+    if (program !== 'cat') return readonlyPrefixArguments([program, ...args]);
+    if (!pathPrefix) return false;
     const endOptions = words.indexOf('--');
     return words.every((word, i) => i === 0 || word === path || word.startsWith(path + '/') ||
       (word !== '-' && word.startsWith('-') && (endOptions === -1 || i <= endOptions)));
@@ -97,78 +92,63 @@ const blockedPrograms = new Set((
   'rsync wget env command xargs busybox timeout nohup nice'
 ).split(' '));
 
-function loopbackProbe(args: string[]) {
-  let urls = 0;
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (/^-[IsSik]+$/.test(arg) || arg === '--head') continue;
-    if (arg === '-m' || arg === '--max-time') {
-      if (!/^\d+(?:\.\d+)?$/.test(args[++i] ?? '')) return false;
-      continue;
+// Parse only literal arguments and pipes. Active shell syntax fails closed.
+function splitPipes(command: string): string[][] | null {
+  const stages: string[][] = [[]];
+  let args = stages[0];
+  let word: string | undefined;
+  let quote = '';
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (quote) {
+      if (char === quote) quote = '';
+      else if (quote === '"' && /[$`]/.test(char)) return null;
+      else if (quote === '"' && char === '\\' && /["\\$`]/.test(command[i + 1] ?? '')) word += command[++i];
+      else word += char;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+      word ??= '';
+    } else if (char === ' ' || char === '\t' || char === '|') {
+      if (word !== undefined) args.push(word);
+      word = undefined;
+      if (char === '|') {
+        if (!args.length) return null;
+        args = [];
+        stages.push(args);
+      }
+    } else {
+      if (/[;&<>`$()~\\*?{}\[\]]/.test(char) || command.startsWith('..', i)) return null;
+      word = (word ?? '') + char;
     }
-    // Match the raw authority too: URL parsing alone normalizes surprising host spellings.
-    if (!/^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/[^\s{}\[\]]*)?$/i.test(arg)) return false;
-    urls++;
   }
-  return urls === 1;
+  if (word !== undefined) args.push(word);
+  return quote || !args.length ? null : stages;
 }
 
-function blockedStage(segment: string) {
-  const words = segment.match(/(?:[^\s'"]+|'[^']*'|"[^"]*")+/g) ?? [];
-  const [executable, ...args] = words.map(word => word.replace(/['"]/g, ''));
-  const [subcommand, ...rest] = args;
-  const program = installedProgram(executable ?? '');
-  const literal = [program, ...args].join(' ');
-  if (program !== 'kubectl' && /\bsecrets?\b/i.test(literal)) return true;
-  if (program === 'kafka-topics.sh') {
-    // Exactly one read operation, optionally accompanied by a broker list.
-    const options = [...args];
-    const bootstrap = options.indexOf('--bootstrap-server');
-    if (bootstrap >= 0) {
-      const brokers = options[bootstrap + 1];
-      if (!brokers || !brokers.split(',').every(broker => /^[\w.-]+:\d{1,5}$/.test(broker))) return true;
-      options.splice(bootstrap, 2);
-    }
-    return options.length !== 1 || !['--list', '--describe'].includes(options[0]);
+function blockedStage([executable, ...args]: string[]) {
+  const program = executable.split('/').at(-1) ?? '';
+  if (!/^[\w./-]+$/.test(executable) || !program || blockedPrograms.has(program)) return true;
+
+  const literal = [executable, ...args].join(' ').replace(/\/+(?:\.\/+)+|\/{2,}/g, '/');
+  if (/\/etc\/(?:shadow|sudoers|gshadow)\b|\.ssh\b|id_(?:rsa|ed25519)\b|\.env\b|\/secrets?\b/i.test(literal)) return true;
+  const kubectlGet = program === 'kubectl' && args[0] === 'get' && !args.includes('--');
+  for (const [i, arg] of args.entries()) {
+    if (!/\bsecrets?\b/i.test(arg)) continue;
+    // A namespace named "secrets" does not select the Secret resource.
+    if (kubectlGet && /^--namespace=secrets?$/i.test(arg)) continue;
+    if (kubectlGet && /^secrets?$/i.test(arg) && ['-n', '--namespace'].includes(args[i - 1])) continue;
+    return true;
   }
-  if (!program || !/^[\w-]+$/.test(program) || blockedPrograms.has(program)) return true;
-  switch (program) {
-    case 'systemctl':
-    case 'service': {
-      const verbs = ['status', 'is-active', 'is-enabled', 'list-units', 'list-timers', 'show'];
-      if (program === 'service') return args.length !== 2 || !verbs.includes(args[1]);
-      return !verbs.includes(subcommand) || rest.some(arg => arg.startsWith('-') && !['--no-pager', '--full', '-l'].includes(arg));
-    }
-    case 'kubectl':
-      return !['get', 'describe', 'logs', 'top', 'version', 'cluster-info'].includes(subcommand) ||
-        /go-template-file|--(?:raw|server|token|kubeconfig|client-key)/.test(literal) ||
-        (subcommand === 'get' ? !readonlyKubectlGet(rest) : /\bsecrets?\b/i.test(literal));
-    case 'nginx': return !['-t', '-T', '-v', '-V'].includes(subcommand) || rest.some(arg => arg !== '-q');
-    case 'curl': return !loopbackProbe(args);
-    case 'df':
-    case 'ss': return !readonlyArguments([program, ...args]);
-    case 'sed': return args.some(arg => /^-[^-]*i|^--in-place/.test(arg)) || /(?:^|[\s/])[ew](?:\s|$)/.test(literal);
-    case 'awk': return /\bsystem\s*\(|\bgetline\b/.test(literal) || args.some(arg => /^-f|^--file/.test(arg));
-    case 'find': return args.some(arg => /^-(?:delete|exec|ok|fprint|fprintf)/.test(arg));
-    case 'journalctl': return args.some(arg => /^--(?:vacuum|rotate|flush|sync|relinquish|setup|update|rebuild)/.test(arg));
-    case 'sort': return args.some(arg => /^-o|^--output/.test(arg));
-    case 'ip': return !['a', 'addr', 'address', 'link', 'route', 'neigh'].includes(subcommand) ||
-      rest.some(arg => !['show', 'list'].includes(arg));
-    default: return false;
-  }
+  if (program === 'awk') return args.some(arg => /\||\bsystem\s*\(|\bgetline\b/.test(arg));
+  if (program === 'sed') return args.some(arg => /^-[^-]*i|^--in-place/.test(arg));
+  if (program === 'find') return args.some(arg => /^-(?:delete|exec(?:dir)?|ok(?:dir)?)$/.test(arg));
+  return false;
 }
 
 export function isHardBlockedRemoteInspectCommand(command: string) {
-  if (!command?.trim() || command.length > 512 || /[\r\n\0;&<>`()~\\]|\|\||\.\./.test(command)) return true;
-  // Shell expansions are literal inside single quotes (for example, an awk field).
-  if (/[$*?{}]/.test(command.replace(/'[^']*'/g, ''))) return true;
-  // Remove balanced quotes before checking literals, including adjacent quoted fragments.
-  const literal = command.replace(/'([^']*)'|"([^"]*)"/g, (_match, single, double) => single ?? double);
-  if (/'[^']*\|[^']*'|"[^"]*\|[^"]*"/.test(command)) return true;
-  const paths = literal.replace(/\/+(?:\.\/+)+|\/{2,}/g, '/');
-  if (/['"\[\]]/.test(literal.replaceAll('[::1]', '')) ||
-      /\/etc\/(?:shadow|sudoers|gshadow)|\.ssh\b|id_(?:rsa|ed25519)\b|\.env\b|(?:^|\/)secrets?(?:[/\s.]|$)/i.test(paths)) return true;
-  return command.split('|').some(blockedStage);
+  if (!command?.trim() || command.length > 512 || /[\r\n\0]/.test(command)) return true;
+  const stages = splitPipes(command);
+  return stages === null || stages.some(blockedStage);
 }
 
 const effects = { pure_readonly: '纯只读诊断', read_sensitive_secret: '读取敏感凭据或密钥',
@@ -218,11 +198,11 @@ export async function validateShellCommands(commands: readonly string[], allowPr
 
 export function buildBatchShellScript(commands: readonly string[]) {
   if (commands.length === 1) return commands[0];
-  const lines = ['set +e', 'batch_rc=0'];
+  const lines = ['set +e'];
   for (const [index, cmd] of commands.entries()) {
     const quoted = "'" + cmd.replaceAll("'", "'\\''") + "'";
     lines.push(`printf '=== [%d/%d] %s ===\\n' ${index + 1} ${commands.length} ${quoted}`,
-      '(', cmd, ')', 'rc=$?', `printf '[rc=%d]\\n' "$rc"`, '[ "$rc" -eq 0 ] || batch_rc=$rc');
+      '(', cmd, ')', `printf '[rc=%d]\\n' "$?"`);
   }
-  return [...lines, 'exit "$batch_rc"'].join('\n');
+  return [...lines, 'exit 0'].join('\n');
 }

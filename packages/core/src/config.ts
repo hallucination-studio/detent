@@ -48,6 +48,7 @@ const ConfigSchema = z.object({
   jevModel: z.string().optional(),
   jevThreshold: z.coerce.number().min(0.5).max(0.99).default(0.9),
   jevTimeoutMs: z.coerce.number().int().positive().max(30000).default(6000),
+  // Retained for configuration compatibility. Local Bash uses the sandbox gate.
   safeBashPrefixes: z
     .string()
     .default('git status,git diff,git log,git branch')

@@ -18,7 +18,7 @@ RUN apt-get update \
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 COPY --from=builder /app/packages/core/dist packages/core/dist
 COPY --from=builder /app/packages/delivery/dist packages/delivery/dist
-COPY scripts/bootstrap.ts scripts/smoke-live.mjs scripts/
+COPY scripts/bootstrap.ts scripts/
 COPY examples/hub-workspace/ examples/hub-workspace/
 COPY .env.example ./
 RUN install -d -o node -g node /tmp/detent-sandboxes

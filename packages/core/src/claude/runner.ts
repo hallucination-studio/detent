@@ -45,7 +45,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
     const failed = new Set<string>();
     const calls = new Map<string, { name: string; input: unknown }>();
     const canUseTool = async (name: string, input: Record<string, unknown>, step = trace.handler(name, input)) => {
-      const { jevConfidence: _confidence, ...decision } = await gate.canUseTool(name, input);
+      const decision = await gate.canUseTool(name, input);
       if (decision.behavior === 'deny') {
         failed.add(step.id);
         trace.update(step, decision.message, '⛔ 已拦截：');
@@ -105,6 +105,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
       CLAUDE_CONFIG_DIR: sandbox.claudeHome + '/.claude',
       TMPDIR: sandbox.rootDir,
       ...(this.config.claudeModel && { ANTHROPIC_SMALL_FAST_MODEL: this.config.claudeModel, CLAUDE_CODE_SUBAGENT_MODEL: this.config.claudeModel }),
+      CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR: '1',
       LANG: 'en_US.UTF-8',
       MCP_TOOL_TIMEOUT: '300000',
       MCP_TIMEOUT: '30000',
@@ -177,7 +178,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
           },
           disallowedTools: [
             ...(gate.readonly ? ['Edit', 'Write'] : []),
-            ...(gate.disableBash ? ['Bash'] : []),
+            ...(gate.disableBash || gate.readonly || session.permissionMode === 'plan' ? ['Bash'] : []),
             'Task', 'MultiEdit', 'NotebookEdit', 'ExitPlanMode', 'BashOutput', 'KillShell',
             'SlashCommand', 'TodoWrite', 'WebFetch', 'WebSearch', 'ListMcpResourcesTool', 'ReadMcpResourceTool',
           ],

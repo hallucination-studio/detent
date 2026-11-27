@@ -72,10 +72,8 @@ export function renderPlanApprovalCard(plan: string) {
 
 export function renderToolApprovalCard(
   a: Pick<ApprovalRequestRow, 'id' | 'toolName' | 'toolInput' | 'approvalType'>,
-  workspaceRoot?: string,
-  riskNote?: string,
 ) {
-  const { questions, command, description } = a.toolInput;
+  const { questions } = a.toolInput;
   if (a.approvalType === 'ASK_USER') {
     const lines = (Array.isArray(questions) ? questions : [])
       .filter(q => typeof q?.question === 'string')
@@ -87,17 +85,6 @@ export function renderToolApprovalCard(
     ].filter(Boolean).join('\n\n'));
   }
   const footer = `> 👍 或 \`/approve\` 放行 · 👎 或 \`/reject <原因>\` 拒绝 · <sub>\`${a.id}\`</sub>`;
-  if (a.toolName === 'Bash') {
-    let shell = typeof command === 'string' ? command : '';
-    if (workspaceRoot) shell = shell.replaceAll(workspaceRoot + '/', '').replaceAll(workspaceRoot, '.');
-    return renderNote([
-      '### 🛡️ 命令执行审批',
-      typeof description === 'string' && description && '**用途**：' + description,
-      codeFence(shell, 'sh'),
-      riskNote && '**风控提示**：' + riskNote,
-      footer,
-    ].filter(Boolean).join('\n\n'));
-  }
   const entries = Object.entries(a.toolInput);
   const simple = entries.length && entries.every(([, value]) => value === null || typeof value !== 'object');
   const details = simple

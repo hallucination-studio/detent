@@ -233,14 +233,16 @@ export class MergeRequestOrchestrator extends TurnRuntime {
       await transcript.hydrateTranscriptToTmp(s, claudeHome, workspaceRoot);
       const flush = () => transcript.flushIncrementalTranscriptToMySql(s, claudeHome, workspaceRoot, s.claudeSessionId!);
       const gate = new PermissionGate({ session: s, config: this.config, repo: this.repo, controller, workspaceRoot, channel,
-        profile: { readonly }, decision: this.options.decision, previousDecision, allowedWorkspaceTools: mrWorkspaceTools,
+        profile: { readonly }, previousDecision, allowedWorkspaceTools: mrWorkspaceTools,
         extensionTools: createMrTools(this.gitlab, mr, host, sandbox, tree),
         checkpoint: async () => { await flush(); await host.checkpoint(sandbox!, s.id); } });
       const pipeline = mr.head_pipeline ?? (await this.gitlab.listPipelines(s.hubProjectId, mr.iid))[0]
         ?? (await this.gitlab.listPipelines(mr.source_project_id, mr.source_branch))[0];
       const jobs = pipeline?.status === 'failed' ? await this.gitlab.getPipelineJobs(pipeline.project_id ?? mr.source_project_id, pipeline.id) : [];
+      const targetProjectPath = tree.targetProjectId === mr.target_project_id ? tree.targetProjectPath
+        : (await this.gitlab.getProject(mr.target_project_id)).path_with_namespace;
       const system = buildMrSystemPrompt(mr, tree, readonly, plan, pipeline, jobs.filter(j => j.status === 'failed').map(j => j.name),
-        await this.gitlab.listMergeRequestDiscussions(s.hubProjectId, mr.iid));
+        await this.gitlab.listMergeRequestDiscussions(s.hubProjectId, mr.iid), targetProjectPath);
       controller.signal.throwIfAborted();
       const replyThreads = new Set(discussions);
       let result: string;

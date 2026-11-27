@@ -139,41 +139,19 @@ npm run bootstrap -- --env-out .env
 
 ---
 
-## 确定性交付 E2E
+## 真实服务栈 SOP E2E
 
-两种模式都使用真实的 bootstrap、Delivery Pod、Claude Code 二进制和 MySQL 8.0。所有模型请求均由本地 Anthropic SSE 服务响应，JumpServer 替身校验上传的 Playbook ZIP。准备 Node.js 20.12+ 和项目 npm 依赖后运行：
+以下命令的入口脚本将在第 2 步实现。验收将通过真实 GitLab Webhook 触发 Hub SOP，并将 Issue、MR 的状态与 MySQL 中的会话及审批记录核对。
 
 ```bash
-# 离线 GitLab 使用 Git 和 git-http-backend
-npm run e2e:smoke
-npm run e2e:offline
-
-# 本地 GitLab CE 18.3.0，预先导出 E2E_GITLAB_ADMIN_TOKEN
-E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab
+npm run e2e:up    # 启动测试环境
+npm run e2e       # 构建 Detent 并运行 SOP 场景
+npm run e2e:down  # 拆除测试环境
 ```
 
-每轮 Claude 通过带令牌认证的回环 HTTP MCP 调用工具。工具审批和提问先保存会话并释放 Pod 租约，获授权的用户回复后由新进程恢复。通过 `jms_list_assets` 查询资产，向 `jms_shell` 传入 `commands` 数组完成批量巡检。生产审批通过后，`jms_job` 异步提交任务并返回链接，本轮结束。Delivery 记录终态并唤醒原 Issue 进行核验。`jms_job_status` 可查询当前会话所属的任务。
-
-运行 `npm run e2e:offline -- --suite=jumpserver` 可单独验收 JumpServer，包括超过 30 秒的巡检调用。其他套件为 `install`、`issues`、`mrs`、`concurrency` 与 `security`。
-
-离线套件验证仓库自助接入、安装升级、Issue 工作流、MR Worker、双 Pod 并发以及安全与事件处理。两个 Pod 共用 MySQL，通过回环代理接收 Webhook，验证并行 SDK 轮次、审批与恢复竞争、凭证脱敏和生产变更硬拦截。
-
-真实模式下，GitLab 公布的 HTTP 克隆地址应与 `E2E_GITLAB_URL` 同源。允许 GitLab 容器向 `host.docker.internal` 投递项目 Webhook。使用其他路由时，以 `E2E_DETENT_PUBLIC_URL` 指定 GitLab 可访问的地址，以 `E2E_POD_PORT` 指定对应的宿主监听端口。每次运行保留独立的 `e2e-*/workspace-hub` 和三个目标项目供复核，并撤销临时令牌。
-
-两种模式均重复运行 bootstrap，检查 Hub 文件、标签、Webhook、凭证及客户自定义 SOP，并覆盖六个 SOP 场景和 V6 MR 交互。
-
-1. 缺能力时给出指引，模型请求数为零。无标签 Kafka 工单可先巡检，再在同一工单提交配置修复方案，获批后开 MR。
-2. 跨库代码交付生成两个 MR。两个和一个 MR 待合并时均拒绝关单，最后一个合并后关单并归档两个 Worktree。
-3. 在线修改发版 SOP，维护者批准后创建锁定 SHA 的 Tag 和 Release。
-4. 在线新增热修复 SOP，仅打 Tag，随后须单独获得生产档位的关单审批。
-5. 只读巡检确认 `web01` 上 nginx 状态后关单，审批记录为零。
-6. 环境变更在 Pod 重启后恢复方案。人工合并 Ansible MR 并批准生产执行，随后校验 ZIP、执行审计、变更后巡检和沙箱清理。
-
-两种模式均检查行内评审、MR 折叠工具轨迹、独立会话收尾，以及外部 MR 的单次提及和分配。离线驱动还模拟 Bot 触发的失败流水线和部署失败，检查分支提交、在线策略切换、轮中指示和 Hub 告警 Issue。
-
-完成的 Issue 流程均检查 GitLab `closed`、`claude::done` 与 MySQL `DONE`。默认使用本地缓存的 `mysql:8.0` 镜像启动容器。如需复用本地 MySQL 8.0，设置 `E2E_MYSQL_HOST=127.0.0.1`。可选的 `E2E_MYSQL_PORT`、`E2E_MYSQL_USER`、`E2E_MYSQL_PASSWORD`、`E2E_MYSQL_DATABASE` 分别默认为 `3306`、`root`、空密码和 `detent`。请使用专用测试库。脚本会创建 Detent 所需的表，结束时清理本次测试的会话数据。
-
 ## Issue 内交互使用手册
+
+每轮 Claude 通过带令牌认证的回环 HTTP MCP 调用工具。工具审批和提问先保存会话并释放 Pod 租约，获授权的用户回复后由新进程恢复。通过 `jms_list_assets` 查询资产，向 `jms_shell` 传入 `commands` 数组完成批量巡检。生产审批通过后，`jms_job` 异步提交任务并返回链接，本轮结束。Delivery 记录终态并唤醒原 Issue 进行核验。`jms_job_status` 可查询当前会话所属的任务。
 
 ### 工单闭环
 

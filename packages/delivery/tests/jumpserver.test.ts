@@ -381,23 +381,30 @@ it('evaluates eligible remote diagnostics once, preserves quoted arguments and c
   const tool = asTool('shell');
   await gate.invokeExtension(tool, { asset_ids: ['web01'], commands: ['uptime'] });
   for (const command of [
-    'systemctl restart nginx', 'rm -rf /tmp/x', 'sudo uptime', 'cat /etc/shadow', 'kubectl get secrets',
-    'curl -X POST http://127.0.0.1/', 'curl -sI https://evil.example/', 'curl -sI http://localhost@evil.example/',
-    "curl http://localhost/ '|' uptime https://evil.example/", 'cat /etc/nginx/.env', 'cat /etc//shadow',
-    'ps aux | tee log', 'nginx -t -g daemon', 'kubectl get pods -o go-template-file=x', 'ss -K',
-    'df --sync', 'sed -i s/a/b/ f', 'find . -exec ls', "awk 'system(cmd)'",
+    'rm -rf /', 'sudo uptime', 'cat /etc/shadow', 'kubectl get secret', 'kubectl get secrets',
+    'cat /etc/nginx/.env', 'cat /etc//shadow', 'ps aux | tee log', 'sed -i s/a/b/ f',
+    'find . -delete', 'find . -exec ls', "awk 'system(cmd)'", 'uptime; id', 'uptime > file', 'uptime $(id)',
   ]) expect(await gate.canUseTool(tool, { asset_ids: ['web01'], commands: [command] }), command).toMatchObject({ behavior: 'deny' });
   expect(decide).not.toHaveBeenCalled();
-  await gate.invokeExtension(tool, { asset_ids: ['web01'], commands: ['ss -lntp'] });
+  await gate.invokeExtension(tool, { asset_ids: ['web01'], commands: ['ss -tlnp'] });
   expect(decide).not.toHaveBeenCalled();
-  for (const command of ['journalctl -u nginx -n 20', 'ps aux | grep nginx',
-    "ps aux | grep 'two  words'", 'curl -sI http://127.0.0.1/healthz']) {
+  const diagnostics = ['systemctl --failed --no-pager --no-legend', 'ss -tulnp', 'journalctl -u kafka -n 50 --no-pager',
+    "ps -ef | grep -Ei 'kafka|zookeeper' | grep -v grep", "ps aux | grep 'two  words'",
+    "curl -sS -m 3 -o /dev/null -w '%{http_code} %{time_total}s' http://127.0.0.1:9092/"];
+  for (const command of diagnostics) {
     await gate.invokeExtension(tool, { asset_ids: ['web01'], commands: [command] });
     expect(decide.mock.lastCall?.[0]).toEqual({ surface: 'remote_jumpserver_readonly_inspect', command });
     expect(client.runShell).toHaveBeenLastCalledWith({ assetIds: ['web01'], account: undefined, commands: [command] });
   }
-  expect(decide).toHaveBeenCalledTimes(4);
+  expect(decide).toHaveBeenCalledTimes(diagnostics.length);
   await expect(gate.invokeExtension(tool, { asset_ids: ['restricted'], commands: ['ss -lntp'] })).rejects.toThrow('黑名单');
+  for (const command of ['systemctl restart nginx', 'curl -X POST http://127.0.0.1/', 'nginx -t -g daemon',
+    'kubectl get pods -o go-template-file=x', 'ss -K', 'df --sync']) {
+    decide.mockResolvedValueOnce({ effect: { type: 'choice', choice: 'ambiguous' },
+      zero_side_effect: { type: 'noul', noul: 0 }, impact: { type: 'score', score: 2 } });
+    await expect(gate.invokeExtension(tool, { asset_ids: ['web01'], commands: [command] })).rejects.toThrow('Jev: choice=ambiguous');
+    expect(decide.mock.lastCall?.[0]).toEqual({ surface: 'remote_jumpserver_readonly_inspect', command });
+  }
   for (const [choice, noul, score] of [['state_mutating', 1, 0], ['pure_readonly', 0.74, 0], ['pure_readonly', 1, 1.4]] as const) {
     decide.mockResolvedValueOnce({ effect: { type: 'choice', choice }, zero_side_effect: { type: 'noul', noul }, impact: { type: 'score', score } });
     await expect(gate.invokeExtension(tool, { asset_ids: ['web01'], commands: ['date'] })).rejects.toThrow(`Jev: choice=${choice}, noul=${noul}, impact=${score}`);
@@ -406,7 +413,7 @@ it('evaluates eligible remote diagnostics once, preserves quoted arguments and c
   await gate.invokeExtension(tool, { asset_ids: ['web01'], commands: ['date'] });
   decide.mockRejectedValueOnce(Error('provider timeout'));
   await expect(gate.invokeExtension(tool, { asset_ids: ['web01'], commands: ['date'] })).rejects.toThrow('provider timeout');
-  expect(client.runShell).toHaveBeenCalledTimes(7);
+  expect(client.runShell).toHaveBeenCalledTimes(diagnostics.length + 3);
 });
 
 it('lists real, active accounts in server order and falls back to asset detail only on 404', async () => {
@@ -462,7 +469,7 @@ it('groups inspection by the first active real account and reports every group�
     expect.objectContaining({ assets: ['a', 'c'], runas: 'ops-first', runas_policy: 'skip' }),
     expect.objectContaining({ assets: ['b'], runas: 'ops-second', runas_policy: 'skip' }),
   ]);
-  for (const job of jobs) expect(job.args).toMatch(/set \+e[\s\S]*uptime[\s\S]*df -h/);
+  for (const job of jobs) expect(job.args).toMatch(/^set \+e\n[\s\S]*uptime[\s\S]*df -h[\s\S]*\nexit 0$/);
   expect(grouped).toMatchObject({ status: 'FAILED', groups: [
     { assetIds: ['a', 'c'], account: 'ops-first', jobId: 'first', status: 'SUCCESS' },
     { assetIds: ['b'], account: 'ops-second', jobId: 'second', status: 'FAILED' },

@@ -1,89 +1,114 @@
 import path from 'node:path';
-import { logError, redactGitUrl } from '../gitlab/redact.js';
-import { isHubScopePath } from '../workspace/hub-paths.js';
-import type { DecisionClient, DecisionQuestion } from './jev-client.js';
+import { contained } from '../workspace/contained-path.js';
 
-// Unknown executables (including remote infrastructure clients) require a human.
-// Only literal invocations of workspace development and inspection tools reach the model.
-const localPrograms = new Set((
-  'pwd ls tree cat tac head tail less more wc sort uniq cut tr grep egrep fgrep rg ag find fd stat file ' +
-  'du df basename dirname realpath readlink diff cmp echo printf base64 test true false cd git make cmake ninja ' +
-  'npm npx yarn pnpm bun deno node tsc eslint prettier vitest jest python python3 pip pip3 pytest poetry uv ' +
-  'cargo rustc rustfmt go gofmt mvn gradle dotnet ruby bundle rake gcc clang g++ javac java ' +
-  'mkdir rmdir touch cp mv rm tee sed awk perl jq date which whoami uname'
-).split(/\s+/));
-const dangerous = /\b(?:sudo|su|doas|chmod|chown|mount|umount|mkfs|dd|kill|pkill|killall|shutdown|reboot|crontab|systemctl|service|launchctl|curl|wget|ssh|scp|sftp|rsync|nc|ncat|netcat|socat|telnet|ftp|nmap|twine|gh|glab|docker|podman|kubectl|helm|terraform|pulumi|eval|exec|printenv)\b/;
-const protectedMetadata = /(?:^|[^\w.-])(?:\.git|\.claude|\.mcp\.json)(?:$|[^\w.-])/i;
-export const bashWriteOperation = />|\b(?:tee|rm|mv|cp|ln|unlink|dd|sed|perl|python3?|node|chmod|chown|touch|mkdir|rmdir|truncate|install|patch|apply|checkout|restore|reset|clean|output|write|format|fmt)\b/;
+// Check the literal invocation. Workspace scripts and build/test targets run as code in the turn sandbox.
+const blockedProgram = /^(?:sudo|su|doas|chmod|chown|mount|umount|mkfs(?:\..*)?|dd|kill|pkill|killall|shutdown|reboot|halt|poweroff|crontab|systemctl|service|launchctl|curl|wget|ssh|scp|sftp|rsync|nc|ncat|netcat|socat|telnet|ftp|nmap|twine|gh|glab|docker|podman|kubectl|helm|terraform|pulumi|printenv)$/;
+const indirectShell = new Set('env eval exec command builtin source . pushd popd xargs time timeout nice nohup if then while until for function'.split(' '));
+const inspection = new Set('cd pwd ls tree cat tac head tail wc grep rg stat file du basename dirname realpath readlink diff cmp echo printf test true false git'.split(' '));
+const shell = /^(?:sh|bash|zsh|dash)$/;
+const readGit = new Set('status diff log show rev-parse ls-files ls-tree branch remote describe shortlog blame grep cat-file show-ref diff-tree'.split(' '));
 
-export function bashOperands(command: string) {
-  const words = command.match(/(?:[^\s"'|&;<>]|"[^"]*"|'[^']*')+/g) ?? [];
-  return words.flatMap(word => {
-    const literal = word.replace(/"([^"]*)"|'([^']*)'/g, (_match, double, single) => double ?? single);
-    const argument = literal.replace(/^(?:(?:--?[\w-]+|[a-zA-Z_]\w*)=|-[A-Za-z](?=\/))/, '');
-    return argument !== literal ? [literal, argument] : [literal];
+function readOnlyGit(words: string[]) {
+  const [subcommand, ...args] = words;
+  if (!readGit.has(subcommand)) return false;
+  if (subcommand === 'remote')
+    return args.length === 0 || (args.length === 1 && ['-v', '--verbose'].includes(args[0])) || args[0] === 'get-url';
+  if (subcommand === 'branch') return args.every(arg => ['--list', '-a', '--all', '--show-current', '-r', '--remotes', '-v', '-vv'].includes(arg));
+  const unsafe = ['--output', '--ext-diff', '--textconv', '--no-index', '--open-files-in-pager'];
+  return !args.some(arg => {
+    const [flag] = arg.split('=');
+    return flag === '-O' || (flag.length > 2 && flag.startsWith('--') && unsafe.some(option => option.startsWith(flag)));
   });
 }
 
-export function isHardGatedLocalBash(command: unknown, workspaceRoot: string) {
-  if (typeof command !== 'string' || !command.trim() || command.length > 2000 ||
-      /[\0`$\\]|[<>]\(|&(?![&>])/.test(command.replaceAll('&&', ';'))) return true;
-  // Reject fragmented shell words instead of guessing what quoting would execute.
-  if (/[\w./-]['"][\w./-]|['"]['"]/.test(command)) return true;
-  const literal = command.replace(/['"]/g, '');
-  if (/[{}\[\]*?]/.test(literal) && bashWriteOperation.test(literal)) return true;
-  if (/\b(?:rm|mv|cp|tee)\b/.test(literal) && literal.split(/\s+/).includes('/dev/null')) return true;
-  if (/(?:^|[^\w.-])\.\.(?:$|[^\w.-])|(?:^|[\s=:/<>])~/.test(literal)) return true;
-  for (const match of literal.matchAll(/(?:^|[\s=:<>|;&(]|-[A-Za-z])(\/[^\s;|&<>)]*)/g)) {
-    const target = path.resolve(match[1]);
-    const relative = path.relative(workspaceRoot, target);
-    if (target !== '/dev/null' && (relative === '..' || relative.startsWith('../') || path.isAbsolute(relative))) return true;
+async function bashOperandsContained(args: string[], root: string, cwd: string, write: boolean) {
+  for (const arg of new Set(args)) {
+    const value = arg.replace(/^(?:--?[\w-]+=|-[A-Za-z](?=\/)|-[oICL](?=.+))/, '');
+    if (value === '/dev/null' && !write) continue;
+    if (!await contained(root, value, write, cwd)) return false;
   }
-  if (bashWriteOperation.test(literal)) {
-    if (protectedMetadata.test(literal)) return true;
-    // Project paths may use the same names as protected Hub files and directories.
-    if (bashOperands(command).some(operand => isHubScopePath(path.relative(workspaceRoot, path.resolve(workspaceRoot, operand))))) return true;
-  }
-  return literal.split(/&&|\|\||[;|\n]/).some(segment => {
-    const words = segment.trim().split(/\s+/);
-    if (words[0] === 'env') words.shift();
-    while (/^\w+=/.test(words[0])) words.shift();
-    const [program] = words;
-    if (!localPrograms.has(program) || dangerous.test(segment)) return true;
-    if (/\b(?:git\s+.*?\b(?:push|remote|config|credential)|(?:npm|yarn|pnpm|cargo)\s+.*?\bpublish)\b/.test(segment)) return true;
-    if (program === 'git' && /\s(?:-c|--config-env)(?:\s|=)/.test(segment)) return true;
-    return /\b(?:sh|bash|zsh)\s+-[a-z]*c\b|\bfind\b.*\s-(?:exec|ok)/.test(segment);
-  });
+  return true;
 }
 
-const questions = {
-  category: { type: 'choice', criteria: {
-    readonly_inspect: '纯只读查看、目录列表、文件读取/搜索、只读 git 状态/日志查询及管道过滤，不修改任何文件或环境',
-    workspace_dev: '仅在当前临时开发工作区内进行的构建、测试、Lint、格式化、依赖安装（如 npm/pnpm/yarn/pip/go/cargo install）或无外部影响的本地开发命令',
-    external_or_destructive: '会对外部系统、远端仓库、宿主机造成影响，或包含网络外传、提权、破坏性删除、敏感凭据访问或安全绕过',
-    uncertain: '语义模糊、混淆或无法确定影响范围',
-  } },
-  no_external_impact: { type: 'noul', instructions: '判断执行该命令是否对外部环境、生产系统和宿主机完全无不良影响，可免人工审批自动放行',
-    criteria: { true: '无外部或生产影响，仅限只读检查或当前临时工作区开发操作', false: '存在外部影响、破坏性风险、敏感凭据访问或无法确定安全' } },
-  impact: { type: 'score', instructions: '评估该命令对外部环境与系统安全的影响等级', criteria: [
-    '0: 纯只读，零改动', '1: 仅影响当前临时工作区（构建/测试/依赖安装），无外部影响',
-    '2: 有外部影响、系统改动或潜在破坏性，需人工 Review', '3: 高危破坏、越权或安全绕过风险',
-  ] },
-} satisfies Record<string, DecisionQuestion>;
+async function blockedBashWrite(program: string, args: string[], root: string, cwd: string) {
+  if (inspection.has(program) && !args.some(arg => /^(?:--output(?:=|$)|-o)/.test(arg))) return false;
+  const targets = ['.', ...args];
+  // A directory destination implicitly writes a child named after each source.
+  if (['cp', 'mv', 'ln', 'install'].includes(program)) {
+    const operands = args.filter(arg => !arg.startsWith('-'));
+    const flag = args.findIndex(arg => arg === '--target-directory' || arg.startsWith('--target-directory=') || arg.startsWith('-t'));
+    const destination = flag < 0 ? (operands.length > 1 ? operands.pop() : '.')
+      : args[flag].replace(/^(?:--target-directory=?|-t)/, '') || args[flag + 1];
+    if (!destination) return true;
+    targets.push(destination, ...operands.map(source => path.join(destination, path.basename(source))));
+  }
+  return !await bashOperandsContained(targets, root, cwd, true);
+}
 
-export async function evaluateLocalBash(decision: DecisionClient, command: string, description: unknown, readonly: boolean) {
-  try {
-    const { category, no_external_impact: safety, impact } = await decision.decide({
-      surface: 'local_ephemeral_workspace_bash', mode: readonly ? 'readonly' : 'coding',
-      command: redactGitUrl(command), description: typeof description === 'string' ? redactGitUrl(description) : '',
-    }, questions);
-    if (category.type !== 'choice' || safety.type !== 'noul' || impact.type !== 'score' ||
-        !Object.hasOwn(questions.category.criteria, category.choice)) throw Error('Invalid Jev Bash decision');
-    const allowed = (category.choice === 'readonly_inspect' || (!readonly && category.choice === 'workspace_dev')) &&
-      safety.noul >= decision.threshold && safety.noul <= 1 && impact.score >= 0 && impact.score <= (readonly ? 1.2 : 1.4);
-    return { allowed, confidence: safety.noul, riskNote: `分类 ${category.choice}，安全概率 ${safety.noul.toFixed(2)}，影响等级 ${impact.score.toFixed(2)}` };
-  } catch (error) {
-    const detail = logError('bash-guard', error);
-    return { allowed: false, riskNote: '决策评估超时或不可用：' + detail };
+export async function validateLocalSandboxBash(command: unknown, workspaceRoot: string) {
+  if (typeof command !== 'string' || !command.trim() || command.length > 2000 || command.includes('\0'))
+    return '命令为空、过长或包含无效字符';
+  const syntax = '仅支持可静态检查的本地命令和路径';
+  // Tokenize without running a shell. Keep quoted operands intact for realpath checks.
+  const tokens = command.trim().match(/[ \t]+|&&|\|\||[;|\n]|\d*>&[012](?!\d)|\d*(?:>>?|<)|(?:[^\s"'&;|<>`$\\(){}\[\]*?#!]+|"[^"\n`$\\]*"|'[^'\n]*')+/gy) ?? [];
+  if (tokens.join('') !== command.trim()) return syntax;
+  const segments: string[][] = [[]];
+  const separators = new Set<string>();
+  for (const token of tokens) {
+    if (/^[ \t]+$/.test(token)) continue;
+    if (['&&', '||', '|', ';', '\n'].includes(token)) {
+      separators.add(token);
+      segments.push([]);
+    } else segments[segments.length - 1].push(token);
+  }
+  const chainedWithAnd = [...separators].every(op => op === '&&');
+  let cwd = workspaceRoot;
+  const unquote = (word: string) => word.replace(/"([^"]*)"|'([^']*)'/g, (_, double, single) => double ?? single);
+  for (const segment of segments) {
+    const words: string[] = [];
+    for (let j = 0; j < segment.length; j++) {
+      const token = segment[j];
+      if (/^\d*>&[012]$/.test(token)) continue;
+      if (!/^\d*[<>]/.test(token)) {
+        words.push(unquote(token));
+        continue;
+      }
+      const operand = segment[++j];
+      if (!operand || /^\d*[<>]/.test(operand)) return syntax;
+      const dest = unquote(operand);
+      if (dest !== '/dev/null' && !await contained(workspaceRoot, dest, !token.endsWith('<'), cwd))
+        return '重定向路径超出工作区或受保护';
+    }
+    const [executable, ...args] = words;
+    if (!executable || !/^[\w./+-]+$/.test(executable)) return syntax;
+    const program = path.basename(executable);
+    if (!await contained(workspaceRoot, executable, false, cwd)) return '命令路径超出工作区';
+    if (blockedProgram.test(program) || (!inspection.has(program) && args.some(arg => blockedProgram.test(path.basename(arg)))))
+      return '禁止执行此命令';
+    if (indirectShell.has(program))
+      return '禁止执行此命令';
+    if (shell.test(program) && (!args[0] || args[0].startsWith('-'))) return syntax;
+    if (['npm', 'yarn', 'pnpm', 'cargo'].includes(program) && args.includes('publish')) return '禁止发布软件包';
+    if (!inspection.has(program) && args.includes('git') && (args.includes('push') || args.includes('remote')))
+      return '请直接调用本地只读 Git 查询';
+    if (program === 'find' && args.some(arg => /^-(?:exec|ok)/.test(arg))) return syntax;
+    let operandCwd = cwd;
+    if (program === 'git') {
+      if (args[0] === '-C') {
+        const dir = args[1];
+        if (!dir || !await contained(workspaceRoot, dir, false, cwd)) return 'Git 工作目录超出工作区';
+        operandCwd = path.resolve(cwd, dir);
+        args.splice(0, 2);
+      }
+      if (!readOnlyGit(args)) return '仅允许本地只读 Git 查询';
+    }
+    if (!await bashOperandsContained(args, workspaceRoot, operandCwd, false) ||
+        await blockedBashWrite(program, args, workspaceRoot, operandCwd))
+      return '路径超出工作区或写入受保护文件';
+    if (program === 'cd') {
+      // After a failed cd, only && guarantees the next command cannot run in the old directory.
+      if (args.length !== 1 || !args[0] || args[0].startsWith('-') || !chainedWithAnd) return syntax;
+      cwd = path.resolve(cwd, args[0]);
+    }
   }
 }

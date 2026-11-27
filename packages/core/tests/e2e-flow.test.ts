@@ -64,7 +64,7 @@ async function mockGitLab(root: string) {
   };
 }
 
-it('resumes both a Bash approval and a user question and reports two MRs and a pipeline', async () => {
+it('auto-allows local development, resumes an extension approval and a user question and reports two MRs and a pipeline', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'detent-flow-'));
   try {
     const gitlab = await mockGitLab(root);
@@ -113,6 +113,7 @@ it('resumes both a Bash approval and a user question and reports two MRs and a p
         if (dirs.length < 4) {
           const permission = await t.gate.canUseTool('Bash', { command: 'npm install ioredis' });
           expect(permission.behavior).toBe('allow');
+          await t.gate.invokeExtension('mcp__detent__release', {});
           await log('question');
         }
         const question = await t.gate.canUseTool('AskUserQuestion', { questions: [{ question: '目标分支？' }] });
@@ -137,8 +138,12 @@ it('resumes both a Bash approval and a user question and reports two MRs and a p
       }),
     };
     const errors: unknown[] = [];
+    const decide = vi.fn();
     function pod(podId: string) {
-      const orch = new SessionOrchestrator({ ...config, podId }, repo, gitlab, runner);
+      const orch = new SessionOrchestrator({ ...config, podId }, repo, gitlab, runner, {
+        decisionClient: { provider: 'custom', threshold: 0.9, decide },
+        tools: [{ name: 'release', description: 'Release', schema: {}, policy: 'always_approve', execute: vi.fn() }],
+      });
       const client = Object.assign(new GitLabClient(config, async () => { throw Error('Unexpected GitLab API call'); }), gitlab, {
         listOpenMergeRequestsByBranch: vi.fn().mockResolvedValue([{ iid: 1 }]),
         getMergeRequest: vi.fn().mockResolvedValue({ iid: 1, state: 'opened', assignees: [] }),
@@ -204,7 +209,8 @@ it('resumes both a Bash approval and a user question and reports two MRs and a p
     });
     expect(gitlab.notes.some(body => body.includes('🔍 工具调用轨迹（2 步）') && body.includes('2. **`detent_create_mr`**'))).toBe(true);
     expect(ids.size).toBe(1);
-    expect(runner.run.mock.calls[2][0].prompt).toContain('工具 Bash，参数 {"command":"npm install ioredis"}');
+    expect(decide).not.toHaveBeenCalled();
+    expect(runner.run.mock.calls[2][0].prompt).toContain('工具 release，参数 {}');
     expect(runner.run.mock.calls[3][0].prompt).toContain('AskUserQuestion');
     expect(new Set(dirs).size).toBe(4);
     expect(await repo.listSessionMergeRequests(s.id)).toHaveLength(2);
@@ -309,7 +315,7 @@ it('stops waiting for an approval lease when the original pod resumes coding', a
     const s = await repo.getOrCreateSession(1, 42, 'test');
     await repo.acquireSessionLease(s.id, 'original-pod', 30);
     await repo.updateSessionState(s.id, { status: 'WAITING_TOOL', permissionMode: 'default' });
-    const approval = await repo.createApprovalRequest(s.id, 'TOOL_USE', 'Bash', { command: 'npm install' });
+    const approval = await repo.createApprovalRequest(s.id, 'TOOL_USE', 'release', {});
     const runner = { run: vi.fn() };
     const pod = new SessionOrchestrator(loadConfig({}), repo, await mockGitLab(root), runner);
     const acquire = vi.spyOn(repo, 'acquireSessionLease');
@@ -560,11 +566,11 @@ it('resumes a vote received while the publishing worker still holds a coding lea
     const s = await repo.getOrCreateSession(1, 42, 'test');
     await repo.acquireSessionLease(s.id, 'publisher', 30);
     await repo.updateSessionState(s.id, { status: 'CODING', permissionMode: 'default' });
-    const input = { command: 'npm install' };
-    const card = await repo.createApprovalRequest(s.id, 'TOOL_USE', 'Bash', input);
+    const input = { questions: [{ question: 'Which branch?' }] };
+    const card = await repo.createApprovalRequest(s.id, 'ASK_USER', 'AskUserQuestion', input);
     await repo.updateApprovalNoteId(card.id, 7);
     const run = vi.fn(async (turn: TurnInput) => {
-      expect(await turn.gate.canUseTool('Bash', input)).toMatchObject({ behavior: 'allow' });
+      expect(await turn.gate.canUseTool('AskUserQuestion', input)).toMatchObject({ behavior: 'allow' });
       return 'done';
     });
     const pod = new SessionOrchestrator(loadConfig({ EPHEMERAL_ROOT: path.join(root, 'turns') }), repo, await mockGitLab(root), { run });

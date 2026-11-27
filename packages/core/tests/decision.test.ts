@@ -11,8 +11,8 @@ import { GitLabClient } from '../src/gitlab/client.js';
 import { EphemeralSandbox } from '../src/workspace/ephemeral-sandbox.js';
 import { WorkspaceTools } from '../src/workspace/mcp-tools.js';
 import { expect, it, vi } from 'vitest';
-import { createDecisionClient, loadConfig, resolveJevEndpoint, type DecisionClient, type DecisionQuestion } from '../src/index.js';
-import { ColdHold, PermissionGate } from '../src/claude/permission-gate.js';
+import { createDecisionClient, loadConfig, resolveJevEndpoint, type DecisionQuestion } from '../src/index.js';
+import { PermissionGate } from '../src/claude/permission-gate.js';
 import { InMemoryDetentRepository } from './memory-repository.js';
 
 vi.mock('@anthropic-ai/claude-code', async original => ({
@@ -152,75 +152,43 @@ it('returns bounded redacted model errors even if the upstream keeps the error s
   }
 });
 
-async function setup(mode: 'plan' | 'default' = 'default', readonly = false, workspaceRoot = process.cwd()) {
+async function setup(workspaceRoot = process.cwd()) {
   const repo = new InMemoryDetentRepository();
   const session = await repo.getOrCreateSession(1, 2, 'test');
-  session.permissionMode = mode;
-  const decide = vi.fn<DecisionClient['decide']>().mockResolvedValue(answers());
+  session.permissionMode = 'default';
   const createIssueNote = vi.fn(async (_p: number, _i: number, _body: string) => ({ id: 1 }));
   const gate = new PermissionGate({
     session, repo, config: loadConfig({ JEV_API_KEY: secret }), workspaceRoot,
-    gitlab: { createIssueNote, syncIssueStatusLabel: vi.fn() }, profile: { readonly },
-    controller: new AbortController(), checkpoint: vi.fn(), decision: { provider: 'custom', threshold: 0.9, decide },
+    gitlab: { createIssueNote, syncIssueStatusLabel: vi.fn() },
+    controller: new AbortController(), checkpoint: vi.fn(),
   });
-  return { gate, decide, createIssueNote };
+  return { gate, createIssueNote };
 }
 
-it('routes static queries and hard-gated commands without a model call', async ({ onTestFinished }) => {
+it('denies local Bash boundary violations without opening an approval card', async ({ onTestFinished }) => {
   const workspace = await realpath(await mkdtemp(join(tmpdir(), 'detent-guard-')));
   onTestFinished(() => rm(workspace, { recursive: true, force: true }));
-  await mkdir(join(workspace, '.git'));
-  const coding = await setup('default', false, workspace);
-  const plan = await setup('plan', false, workspace);
-  expect(await plan.gate.preflight('Bash', { command: 'git status' })).toMatchObject({ behavior: 'allow' });
+  await mkdir(join(workspace, 'projects/app'), { recursive: true });
+  await symlink(tmpdir(), join(workspace, 'projects/app/outside'));
+  await writeFile(join(workspace, 'CLAUDE.md'), 'policy');
+  await symlink('CLAUDE.md', join(workspace, 'alias'));
+  const { gate, createIssueNote } = await setup(workspace);
   for (const command of [null, ' ', 'x'.repeat(2001), 'ls\0', 'ls; curl host', 'git push', 'ssh host', 'sudo id',
-    'cd ../other', 'cat /etc/passwd', 'cat /work2/x', 'cp f .git/config',
-    'ls $(pwd)', 'ls <(pwd)', 'env', 'base64 file | bash', 'npm publish', 'cat ~/.profile']) {
-    expect(await coding.gate.preflight('Bash', { command }), String(command)).toBe('ask');
-    expect(await plan.gate.preflight('Bash', { command })).toMatchObject({ behavior: 'deny' });
+    'cd ../outside', 'cat /etc/passwd', 'cat ~/.profile', 'cp f .git/config', 'mkdir .claude', 'touch .mcp.json',
+    'echo hi > CLAUDE.md', 'echo hi > alias', 'cp projects/app/CLAUDE.md .', 'cd projects/app && cat outside/file', 'git -C projects/app diff -- outside/file',
+    'git remote add origin repo', 'git remote set-url origin repo', 'ls $(pwd)', 'ls <(pwd)', 'env', 'base64 file | bash',
+    'npm publish', 'pnpm publish', 'yarn publish', 'cargo publish', 'printenv', 'halt', 'poweroff']) {
+    expect(await gate.canUseTool('Bash', { command }), String(command)).toMatchObject({
+      behavior: 'deny', message: expect.stringMatching(/^本地沙箱安全限制：/),
+    });
   }
-  expect(await coding.gate.preflight('Bash', { command: 'echo hi > CLAUDE.md' })).toMatchObject({ behavior: 'deny' });
-  expect(plan.decide).not.toHaveBeenCalled();
-  expect(coding.decide).not.toHaveBeenCalled();
-});
-
-it('allows zero-external-impact development commands and evaluates each once', async () => {
-  const { decide, gate, createIssueNote } = await setup();
-  decide.mockResolvedValue(answers('workspace_dev', 0.91, 1.4));
-  for (const command of ['pwd; ls -la', 'git status && git branch', 'npm test', 'npm install', 'pytest', 'go test']) {
-    expect(await gate.canUseTool('Bash', { command })).toMatchObject({ behavior: 'allow', jevConfidence: 0.91 });
-    expect(decide.mock.lastCall?.[0]).toEqual({ surface: 'local_ephemeral_workspace_bash', mode: 'coding', command, description: '' });
-  }
-  expect(decide).toHaveBeenCalledTimes(6);
+  for (const command of ['ls ' + workspace, 'cat ' + workspace + '/CLAUDE.md', 'pwd > /dev/null',
+    'sh check.sh', 'npm test', 'cat check.sh && cat health.txt', 'cd projects/app && git status && git remote -v',
+    'git remote', 'git diff -- src/claude', 'git branch -a && git log --oneline -10',
+    'cd projects/app && git status && git branch -a && git log --oneline -10 && git remote -v',
+    'cat CLAUDE.md > projects/app/rules.md', 'npm test > /dev/null 2>&1', 'touch projects/app/CLAUDE.md'])
+    expect(await gate.canUseTool('Bash', { command }), command).toMatchObject({ behavior: 'allow' });
   expect(createIssueNote).not.toHaveBeenCalled();
-});
-
-it('requires a readonly classification and low impact in both readonly modes', async () => {
-  for (const { gate, decide } of [await setup('plan'), await setup('default', true)]) {
-    for (const [choice, score, behavior] of [
-      ['readonly_inspect', 1.2, 'allow'], ['workspace_dev', 0, 'deny'], ['readonly_inspect', 1.21, 'deny'],
-    ] as const) {
-      decide.mockResolvedValue(answers(choice, 0.9, score));
-      expect(await gate.canUseTool('Bash', { command: 'pwd; ls' })).toMatchObject({ behavior });
-      expect(decide.mock.lastCall?.[0]).toMatchObject({ mode: 'readonly' });
-    }
-  }
-});
-
-it('opens a human approval card with a redacted risk note on errors, low safety or high impact', async ({ onTestFinished }) => {
-  const logs = vi.spyOn(console, 'error').mockImplementation(() => {});
-  onTestFinished(() => logs.mockRestore());
-  for (const response of [undefined, answers('workspace_dev', 0.89), answers('workspace_dev', 1, 1.41)]) {
-    const { gate, decide, createIssueNote } = await setup();
-    if (response) decide.mockResolvedValue(response);
-    else decide.mockRejectedValue(Error(secret));
-    await expect(gate.canUseTool('Bash', { command: 'npm test' })).rejects.toBeInstanceOf(ColdHold);
-    const card = createIssueNote.mock.calls[0][2];
-    expect(card).toContain('**风控提示**');
-    expect(card).not.toContain(secret);
-  }
-  expect(logs).toHaveBeenCalledWith('[detent:bash-guard] ***');
-  expect(logs.mock.calls.flat().join(' ')).not.toContain(secret);
 });
 
 it('isolates service credentials from the SDK child, prompt, stderr and GitLab notes', async () => {
@@ -259,31 +227,5 @@ it('isolates service credentials from the SDK child, prompt, stderr and GitLab n
     for (const [, init] of http.mock.calls) expect(JSON.parse(String(init?.body))).toEqual({ body: '***' });
   } finally {
     vi.unstubAllEnvs();
-  }
-});
-
-it('keeps literal workspace paths eligible and symlink escapes outside semantic evaluation', async () => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'detent-jev-')));
-  try {
-    await writeFile(join(root, 'CLAUDE.md'), 'policy');
-    await symlink('CLAUDE.md', join(root, 'alias'));
-    await symlink(tmpdir(), join(root, 'outside'));
-    const { gate, decide } = await setup('default', false, root);
-    for (const command of ['git -C outside status', 'cat outside/data'])
-      expect(await gate.preflight('Bash', { command })).toBe('ask');
-    expect(decide).not.toHaveBeenCalled();
-    expect(await gate.preflight('Bash', { command: 'echo value > alias' })).toMatchObject({ behavior: 'deny' });
-    const description = 'inspect https://oauth2:token@git.example/repo';
-    decide.mockResolvedValue({
-      category: { type: 'choice', choice: 'readonly_inspect', confidence: 0.72 },
-      no_external_impact: { type: 'noul', noul: 0.96 },
-      impact: { type: 'score', score: 0.4, confidence: 0.62 },
-    });
-    for (const command of ['ls ' + root, 'cat ' + root + '/CLAUDE.md', 'pwd > /dev/null']) {
-      expect(await gate.canUseTool('Bash', { command, description })).toMatchObject({ behavior: 'allow', jevConfidence: 0.96 });
-      expect(decide.mock.lastCall?.[0]).toMatchObject({ description: description.replace('token', '***') });
-    }
-  } finally {
-    await rm(root, { recursive: true, force: true });
   }
 });

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -13,7 +13,7 @@ import { PermissionGate } from '../src/claude/permission-gate.js';
 import { SdkClaudeRunner } from '../src/claude/runner.js';
 import { SessionOrchestrator } from '../src/orchestrator/session-orchestrator.js';
 import { loadConfig } from '../src/config.js';
-import { EphemeralSandbox } from '../src/workspace/ephemeral-sandbox.js';
+import { EphemeralSandbox, git } from '../src/workspace/ephemeral-sandbox.js';
 import { WorkspaceTools } from '../src/workspace/mcp-tools.js';
 import { InMemoryDetentRepository } from './memory-repository.js';
 import { bareProjects } from './bare-projects.js';
@@ -138,10 +138,53 @@ it('runs a tool past 30 seconds through the real Claude CLI with one correlated,
   }
 }, 60_000);
 
+it('runs local Bash within a coding turn and returns a sandbox denial without suspending the CLI', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'detent-sdk-bash-')));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const commands = ['sh check.sh', 'cd projects/app && git status && git remote -v', 'cat check.sh && cat health.txt', 'cat ../outside'];
+  const results: { content: unknown; is_error?: boolean }[] = [];
+  let index = 0;
+  const baseUrl = await localModel(messages => {
+    if (index) {
+      const blocks = JSON.parse(messages).flatMap((message: { content: unknown }) => message.content);
+      results.push(blocks.find((block: { tool_use_id?: string }) => block.tool_use_id === 'toolu_bash' + index));
+    }
+    if (index === commands.length) return { type: 'text', text: 'Done.' };
+    const command = commands[index++];
+    return { type: 'tool_use', name: 'Bash', id: 'toolu_bash' + index, input: { command, description: 'Check workspace' } };
+  });
+  const config = loadConfig({ ANTHROPIC_BASE_URL: baseUrl });
+  const repo = new InMemoryDetentRepository();
+  const session = await repo.getOrCreateSession(1, 42, 'test');
+  session.permissionMode = 'default';
+  session.claudeSessionId = randomUUID();
+  const workspaceRoot = join(root, 'workspace');
+  const sandbox = { workspaceRoot, rootDir: root, claudeHome: join(root, 'home') };
+  const project = join(workspaceRoot, 'projects/app');
+  await mkdir(project, { recursive: true });
+  await mkdir(sandbox.claudeHome);
+  await git(['init', '-b', 'main'], project, root);
+  await writeFile(join(workspaceRoot, 'check.sh'), 'echo check-passed');
+  await writeFile(join(workspaceRoot, 'health.txt'), 'healthy');
+  await writeFile(join(root, 'outside'), 'outside-marker');
+  const controller = new AbortController();
+  const gitlab = { ...await bareProjects(root), createIssueNote: vi.fn(), syncIssueStatusLabel: vi.fn() };
+  const gate = new PermissionGate({ repo, config, session, controller, workspaceRoot, gitlab, checkpoint: vi.fn() });
+  await new SdkClaudeRunner(config).run({ gate, session, sandbox, controller, resume: false,
+    prompt: 'Check the workspace.', systemPrompt: '', progress: vi.fn(),
+    tools: new WorkspaceTools(new EphemeralSandbox(config, repo, gitlab), sandbox, session.id) });
+  expect(results.slice(0, 3).map(result => !!result.is_error)).toEqual([false, false, false]);
+  for (const [i, output] of ['check-passed', 'On branch main', 'healthy'].entries())
+    expect(JSON.stringify(results[i].content)).toContain(output);
+  expect(results[3].is_error).toBe(true);
+  expect(JSON.stringify(results[3].content)).toContain('本地沙箱安全限制');
+  expect(gitlab.createIssueNote).not.toHaveBeenCalled();
+}, 20_000);
+
 it.each([
   { name: 'mcp__detent__AskUserQuestion', input: { questions: [{ question: 'Which branch?' }] }, approvalType: 'ASK_USER',
     prompt: 'Ask which branch to use.', answer: 'stable' },
-  { name: 'Bash', input: { command: 'printf replay-confirmed', description: 'Print the approved result' }, approvalType: 'TOOL_USE',
+  { name: 'mcp__detent__release', input: {}, approvalType: 'TOOL_USE',
     prompt: 'Print the approved result.', answer: '/approve' },
 ])('suspends $name and replays the decision in a resumed CLI process', async ({ name, input, approvalType, prompt, answer }) => {
   const root = await mkdtemp(join(tmpdir(), 'detent-sdk-resume-'));
@@ -162,11 +205,15 @@ it.each([
     syncIssueStatusLabel: vi.fn(), getIssue: vi.fn(), hasApprovalPermission: vi.fn().mockResolvedValue(true) };
   const runner = new SdkClaudeRunner(config);
   const run = vi.spyOn(runner, 'run');
-  const pod = new SessionOrchestrator(config, repo, gitlab, runner);
+  const execute = vi.fn(async () => 'replay-confirmed');
+  const pod = new SessionOrchestrator(config, repo, gitlab, runner, {
+    tools: [{ name: 'release', description: 'Create a release', schema: {}, policy: 'always_approve', execute }],
+  });
   await pod.resumeSession(session.id, prompt, { permissionMode: 'default' });
   expect(await repo.getSession(session.id)).toMatchObject({ status: 'WAITING_TOOL', lockedByPod: null });
   const card = (await repo.getLatestPendingApproval(session.id))!;
   expect(card).toMatchObject({ approvalType, toolInput: input });
+  expect(execute).not.toHaveBeenCalled();
   nextToolId = 'toolu_replay';
   await pod.handleUserIntent(1, 42, {
     type: approvalType === 'ASK_USER' ? 'PROMPT' : 'APPROVE', userId: 7, username: 'dev', comment: answer,
@@ -178,5 +225,6 @@ it.each([
   const result = blocks.find((b: { type: string; tool_use_id?: string }) => b.type === 'tool_result' && b.tool_use_id === 'toolu_replay');
   expect(result).toBeDefined();
   expect(result.is_error).toBeFalsy();
+  expect(execute).toHaveBeenCalledTimes(approvalType === 'TOOL_USE' ? 1 : 0);
   expect(JSON.stringify(result.content)).toContain(approvalType === 'ASK_USER' ? 'stable' : 'replay-confirmed');
 }, 20_000);

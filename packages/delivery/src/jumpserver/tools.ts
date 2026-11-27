@@ -59,7 +59,11 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
     defineExtensionTool({
       name: 'jms_shell', description: '在授权资产上批量执行只读巡检命令（一次可传入多条命令合并执行）', policy: 'readonly',
       // Validate raw characters/length before trim can discard a newline or an oversized suffix.
-      schema: { asset_ids: assets(50), commands: z.array(z.string().max(512).regex(/^[^\r\n\0]+$/).trim().min(1)).min(1).max(10) },
+      schema: {
+        asset_ids: assets(50),
+        commands: z.array(z.string().max(512).regex(/^[^\r\n\0]+$/).trim().min(1)).min(1).max(10)
+          .describe('待执行的只读命令列表（每项为单条非交互式只读命令，如 ps/ss/df/uptime/free，勿用 top/htop 等终端交互程序；多条命令请拆成数组元素，勿用 ; 或 && 拼接）'),
+      },
       async guard(input, ctx) {
         const targets = checkAssets(input.asset_ids);
         if (!targets.ok) return targets;

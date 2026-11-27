@@ -277,8 +277,12 @@ it('accepts extension webhooks while work is pending and retries busy handlers i
   expect(handle).toHaveBeenCalledTimes(2);
 });
 
-it.each(['plan', 'default'] as const)('uses the default SDK mode and locks readonly tools in %s sessions', async mode => {
-  const { gate, execute, ctx } = await setup(mode, 'readonly', { name: 'Reviewer', readonly: true });
+it.each([
+  { mode: 'plan', readonly: false },
+  { mode: 'plan', readonly: true },
+  { mode: 'default', readonly: true },
+] as const)('disables Bash in the SDK and gate for $mode sessions with readonly=$readonly', async ({ mode, readonly }) => {
+  const { gate, execute, ctx } = await setup(mode, 'readonly', { name: 'Reviewer', readonly });
   const { config, controller, session, workspaceRoot } = ctx;
   await gate.invokeExtension(toolId, input);
   expect(execute).toHaveBeenCalledWith(input, expect.objectContaining({ profileName: 'Reviewer' }));
@@ -292,13 +296,13 @@ it.each(['plan', 'default'] as const)('uses the default SDK mode and locks reado
   expect(await options.canUseTool!('Bash', { command }, { signal: controller.signal })).toMatchObject({ behavior: 'deny' });
   expect(progress).toHaveBeenCalledWith(expect.objectContaining({ name: 'Bash', input: JSON.stringify({ command }), result: expect.stringMatching(/^⛔ 已拦截：/) }));
   expect(options).toMatchObject({
-    permissionMode: 'default', disallowedTools: expect.arrayContaining(['Edit', 'Write']),
+    permissionMode: readonly ? 'default' : 'plan', disallowedTools: expect.arrayContaining(readonly ? ['Edit', 'Write', 'Bash'] : ['Bash']),
   });
   for (const policy of ['coding_auto', 'always_approve'] as const) {
     const { gate } = await setup('default', policy, { readonly: true });
     expect(await gate.preflight(toolId, input)).toMatchObject({ behavior: 'deny' });
   }
-  expect(await gate.preflight('Bash', { command: 'git status' })).toMatchObject({ behavior: 'allow' });
+  expect(await gate.preflight('Bash', { command: 'git status' })).toMatchObject({ behavior: 'deny' });
   expect(await gate.preflight('Bash', { command: 'npm test' })).toMatchObject({ behavior: 'deny' });
 });
 

@@ -69,36 +69,26 @@ it('scrubs credentials from nested transcript values before checkpoint and resum
     expect(await readFile(file, 'utf8')).toBe(record.rawJsonLine + '\n');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
-it('allows configured Git queries and gates compound commands and side effects', async () => {
-  const { gate, root, session, ctx } = await setup();
+it('disables Bash in plan and readonly modes regardless of legacy safe prefixes', async () => {
+  const { root, session, ctx } = await setup();
   try {
-    await symlink(path.dirname(root), path.join(root, 'outside'));
-    for (const command of [
-      'git -C projects/app status', 'git -C projects/app diff --stat',
-      'git -C . log -n 2', 'git -C projects/app branch --list',
-      'git status --ignored', 'git log -n 5', 'git diff HEAD~1', 'git diff -- src/claude',
-      'git branch', 'git branch --list', 'git branch -a -vv', 'git branch -r', 'git branch --remotes',
-      'git branch --show-current', 'git branch --all -v',
-    ])
-      expect(await gate.canUseTool('Bash', { command }), command).toMatchObject({ behavior: 'allow' });
-
-    const gated = [
-      'git branch -D main', 'git branch new-name', 'git branch -m old new', 'git diff --output file',
-      'git diff --output=file', 'git log --output=file', 'git status && pwd', 'git status; pwd',
-      'git status | cat', 'git status > file', 'git diff $(pwd)', 'git diff `pwd`', 'git status\npwd',
-      'git status-extra', 'git -C /etc status', 'git -C ../outside status', 'git -C outside status',
-      'git -C ~/other status', 'git -C projects/app branch -D main', 'git -C projects/app status && pwd',
-      'git -C projects/app diff --output=report', 'git -C projects/app log --out=file',
-    ];
-    for (const command of gated)
-      expect(await gate.preflight('Bash', { command }), command).toMatchObject({ behavior: 'deny' });
-    session.permissionMode = 'default';
-    for (const command of gated)
-      expect(await gate.preflight('Bash', { command }), command).toBe('ask');
-    ctx.config.safeBashPrefixes = ['npm test'];
-    expect(await gate.preflight('Bash', { command: 'git -C projects/app status' })).toBe('ask');
-    expect(await gate.preflight('Bash', { command: 'npm test -- --watch=false' })).toMatchObject({ behavior: 'allow' });
-    expect(await gate.preflight('Bash', { command: 'git status' })).toBe('ask');
+    const config = loadConfig({ SAFE_BASH_PREFIXES: 'git status, sudo' });
+    expect(config.safeBashPrefixes).toEqual(['git status', 'sudo']);
+    for (const mode of ['plan', 'default'] as const) {
+      session.permissionMode = mode;
+      const gate = new PermissionGate({ ...ctx, config, profile: { readonly: mode === 'default' } });
+      for (const command of ['git status', 'sh check.sh', 'sudo id'])
+        expect(await gate.canUseTool('Bash', { command })).toMatchObject({ behavior: 'deny' });
+    }
+    const coding = new PermissionGate({ ...ctx, config });
+    expect(await coding.canUseTool('Bash', { command: 'npm test' })).toMatchObject({ behavior: 'allow' });
+    expect(await coding.canUseTool('Bash', { command: 'sudo id' })).toMatchObject({ behavior: 'deny' });
+    const input = { command: 'git push' };
+    const legacy = await ctx.repo.createApprovalRequest(session.id, 'TOOL_USE', 'Bash', input);
+    await ctx.repo.resolveApprovalRequest(legacy.id, 'APPROVED', 'dev');
+    const replay = new PermissionGate({ ...ctx, previousDecision: (await ctx.repo.getApproval(legacy.id))! });
+    expect(await replay.canUseTool('Bash', input)).toMatchObject({ behavior: 'deny' });
+    expect(ctx.checkpoint).not.toHaveBeenCalled();
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -150,11 +140,14 @@ it('automatically allows every registered workspace tool after plan approval', a
   }
 });
 it.each(['APPROVED', 'REJECTED'] as const)('suspends and replays a tool approval %s', async (status) => {
-  const { repo, session, ctx, gate, root } = await setup();
+  const { repo, session, ctx, root } = await setup();
   try {
     session.permissionMode = 'default';
-    const input = { command: 'npm install ioredis' };
-    await expect(gate.canUseTool('Bash', input)).rejects.toBeInstanceOf(ColdHold);
+    const tool = { name: 'release', policy: 'always_approve' as const, schema: {}, description: 'Release', execute: vi.fn() };
+    const options = { ...ctx, extensionTools: [tool] };
+    const gate = new PermissionGate(options);
+    const input = {};
+    await expect(gate.canUseTool('mcp__detent__release', input)).rejects.toBeInstanceOf(ColdHold);
     expect(ctx.controller.signal.reason).toBeInstanceOf(ColdHold);
     expect(ctx.checkpoint).toHaveBeenCalledOnce();
     expect(await repo.getApprovalByNoteId(session.id, 20)).toMatchObject({
@@ -163,8 +156,8 @@ it.each(['APPROVED', 'REJECTED'] as const)('suspends and replays a tool approval
     });
     const row = (await repo.getLatestPendingApproval(session.id))!;
     await repo.resolveApprovalRequest(row.id, status, 'dev', 'because');
-    const resumed = new PermissionGate({ ...ctx, controller: new AbortController(), previousDecision: (await repo.getApproval(row.id))! });
-    expect(await resumed.canUseTool('Bash', input)).toMatchObject(
+    const resumed = new PermissionGate({ ...options, controller: new AbortController(), previousDecision: (await repo.getApproval(row.id))! });
+    expect(await resumed.canUseTool('mcp__detent__release', input)).toMatchObject(
       status === 'APPROVED' ? { behavior: 'allow' } : { behavior: 'deny', message: 'because' },
     );
   } finally {

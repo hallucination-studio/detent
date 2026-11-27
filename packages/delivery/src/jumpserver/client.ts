@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { redactDeliveryOutput, type DeliveryConfig } from '../config.js';
 import { buildBatchShellScript } from './guards.js';
 import { playbookUpload } from './playbook.js';
+import { readTaskLog } from './ws-log.js';
 
 export type JumpServerAuth =
   | { kind: 'signature'; accessKeyId: string; accessKeySecret: string }
@@ -78,6 +79,7 @@ class HttpError extends Error {
 
 export class HttpJumpServerClient implements JumpServerClient {
   private readonly base: string;
+  private useWebSocketLogs = false;
   private accountsEndpointSupported = true;
   private readonly accountCache = new Map<string, { accounts: string[]; expiresAt: number }>();
 
@@ -98,6 +100,19 @@ export class HttpJumpServerClient implements JumpServerClient {
     return budget ? AbortSignal.any([budget, timeout]) : timeout;
   }
 
+  private authHeaders(auth: JumpServerAuth, method: string, url: URL) {
+    const date = new Date().toUTCString();
+    const headers = new Headers({ Accept: 'application/json', Date: date });
+    if (this.config.jumpserverOrgId) headers.set('X-JMS-ORG', this.config.jumpserverOrgId);
+    if (auth.kind === 'signature') {
+      const target = method.toLowerCase() + ' ' + url.pathname + url.search;
+      const signature = createHmac('sha256', auth.accessKeySecret)
+        .update('(request-target): ' + target + '\naccept: application/json\ndate: ' + date).digest('base64');
+      headers.set('Authorization', `Signature keyId="${auth.accessKeyId}",algorithm="hmac-sha256",headers="(request-target) accept date",signature="${signature}"`);
+    } else headers.set('Authorization', 'Bearer ' + auth.token);
+    return headers;
+  }
+
   private async request<S extends z.ZodTypeAny>(
     auth: JumpServerAuth, path: string, schema: S, body?: object,
     { signal, fallbackOn404 = false }: { signal?: AbortSignal; fallbackOn404?: boolean } = {},
@@ -105,15 +120,7 @@ export class HttpJumpServerClient implements JumpServerClient {
     const method = body ? 'POST' : 'GET';
     try {
       const url = new URL(this.base + '/api/v1/' + path);
-      const date = new Date().toUTCString();
-      const headers = new Headers({ Accept: 'application/json', Date: date });
-      if (this.config.jumpserverOrgId) headers.set('X-JMS-ORG', this.config.jumpserverOrgId);
-      if (auth.kind === 'signature') {
-        const target = method.toLowerCase() + ' ' + url.pathname + url.search;
-        const signature = createHmac('sha256', auth.accessKeySecret)
-          .update('(request-target): ' + target + '\naccept: application/json\ndate: ' + date).digest('base64');
-        headers.set('Authorization', `Signature keyId="${auth.accessKeyId}",algorithm="hmac-sha256",headers="(request-target) accept date",signature="${signature}"`);
-      } else headers.set('Authorization', 'Bearer ' + auth.token);
+      const headers = this.authHeaders(auth, method, url);
 
       if (body && !(body instanceof FormData)) headers.set('Content-Type', 'application/json');
       const response = await fetch(url, {
@@ -279,24 +286,53 @@ export class HttpJumpServerClient implements JumpServerClient {
     }
   }
 
+  private async jobLog(auth: JumpServerAuth, jobId: string, signal: AbortSignal) {
+    const id = segment(jobId);
+    if (!this.useWebSocketLogs) {
+      try {
+        const reply = await this.request(auth, 'ops/job-execution/result/' + id + '/',
+          z.object({ result: z.record(z.unknown()).nullable() }), undefined, { signal, fallbackOn404: true });
+        return { output: JSON.stringify(reply.result), truncated: false };
+      } catch (error) {
+        if (!(error instanceof HttpError) || error.status !== 404) throw error;
+      }
+      try {
+        const log = await this.request(auth, 'ops/ansible/job-execution/' + id + '/log/',
+          z.object({ data: z.string() }), undefined, { signal, fallbackOn404: true });
+        return { output: log.data.replaceAll('\u0000', ''), truncated: false };
+      } catch (error) {
+        if (!(error instanceof HttpError) || error.status !== 404) throw error;
+        this.useWebSocketLogs = true;
+      }
+    }
+
+    const url = new URL(this.base + '/ws/ops/tasks/log/');
+    try {
+      for (const type of ['ansible', 'celery'] as const) {
+        const log = await readTaskLog(url, this.authHeaders(auth, 'GET', url), jobId, type, signal);
+        if (log) return log;
+      }
+      throw Error('JumpServer Ansible and Celery task logs unavailable');
+    } catch (error) {
+      const message = this.redact(error instanceof Error ? error.message : String(error));
+      console.error('[detent:jumpserver]', 'GET', this.redact(url.pathname), message.slice(0, 1000));
+      throw Error(message.slice(0, 300));
+    }
+  }
+
   private async result(auth: JumpServerAuth, jobId: string, signal: AbortSignal): Promise<JobResultResponse> {
     const id = segment(jobId);
     const { status, summary } = await this.request(auth, 'ops/job-execution/task-detail/' + id + '/', detail, undefined, { signal });
     let output = JSON.stringify(summary ?? {});
+    let truncated = false;
     if (status === 'SUCCESS' || status === 'FAILED') {
-      // Newer releases expose structured results. Earlier v3/v4 installations expose a log tail.
-      try {
-        const reply = await this.request(auth, 'ops/job-execution/result/' + id + '/',
-          z.object({ result: z.record(z.unknown()).nullable() }), undefined, { signal, fallbackOn404: true });
-        output += '\n' + JSON.stringify(reply.result);
-      } catch (error) {
-        if (!(error instanceof HttpError) || error.status !== 404) throw error;
-        const log = await this.request(auth, 'ops/ansible/job-execution/' + id + '/log/', z.object({ data: z.string() }), undefined, { signal });
-        output += '\n' + log.data.replaceAll('\u0000', '');
-      }
+      const log = await this.jobLog(auth, jobId, signal);
+      output += '\n' + log.output;
+      truncated = log.truncated;
     }
-    const safe = this.redact(output);
-    return { jobId, jobUrl: this.jobUrl(jobId), status, outputSummary: safe.slice(0, 16000) };
+    const safe = redactDeliveryOutput(output, this.config, this.gitlab, truncated);
+    const outputSummary = truncated || safe.length > 16000 ? safe.slice(0, 15999).replace(/[\uD800-\uDBFF]$/, '') + '…' : safe;
+    return { jobId, jobUrl: this.jobUrl(jobId), status, outputSummary };
   }
 
   async getJobResult(jobId: string) {

@@ -100,7 +100,7 @@ ALTER TABLE session_merge_requests
      - `JUMPSERVER_INSPECT_ALLOW_PREFIXES`（只读巡检允许的命令白名单，默认如 `systemctl status,nginx -t,df -h,free -m,uptime,ss -tlnp,kubectl get,cat /etc/nginx` 等）
      - `JUMPSERVER_ORG_ID` 可选，`JUMPSERVER_TIMEOUT_MS` 默认 60000。
      - `JUMPSERVER_BLOCKED_ASSETS` 使用逗号分隔资产 ID，忽略大小写。`JUMPSERVER_BLOCK_FAILED_PIPELINE` 默认开启，可用 false 或 0 关闭。
-   - 定义干净的 `JumpServerClient` 接口（支持真实 JumpServer v3/v4 REST API 签名认证 + 离线 Mock 实现供自动化测试）。
+   - 定义干净的 `JumpServerClient` 接口（支持 JumpServer v3/v4 REST API 签名认证）。
 2. **4 个受治理 JumpServer MCP 工具（`packages/delivery/src/jumpserver/tools.ts`）**：
    - `jms_list_assets`（`policy: 'readonly'`）
    - `jms_shell`（`policy: 'readonly'`，内置只读命令白名单 + 禁止 `; | & > < $()` 注入检查）
@@ -139,24 +139,24 @@ ALTER TABLE session_merge_requests
 
 **Stage 4 已实现。** 运行 `npm run start:delivery` 启动构建后的入口，或用 `npm run dev:delivery` 开发。显式标签限定本轮 SOP，无标签工单使用统一工程会话。生产审批按 `DELIVERY_PROD_APPROVERS` 名单与项目成员资格校验；无名单时使用 `DELIVERY_PROD_MIN_ACCESS_LEVEL`（默认 40）。[环境示例](../.env.example) 列出全部 JumpServer 与 Delivery 配置。
 
-审计仓储使用同一 MySQL 池记录角色、目标资产、MR、SHA、审批单、任务与结果，`/status` 同时展示 MR 与执行审计。六阶段 E2E 通过 HTTP Webhook、临时 Git 仓库与受控外部服务替身验证审批、硬拦截、同一会话恢复、任务验收和沙箱清理。另有共享池建表、只读角色、生产权限与审计仓储测试。
+审计仓储使用同一 MySQL 池记录角色、目标资产、MR、SHA、审批单、任务与结果，`/status` 同时展示 MR 与执行审计。Delivery 包内的六阶段集成测试通过 HTTP Webhook、临时 Git 仓库与受控外部服务替身验证审批、硬拦截、同一会话恢复、任务验收和沙箱清理。另有共享池建表、只读角色、生产权限与审计仓储测试。
 
 ---
 
 ## Stage 5–7 · Hub SOP、可选能力包与发版
 
-Core 加载 Hub SOP、检查所需能力并提供受审批的 GitLab 发版工具。Delivery 装配 JumpServer 等可选能力。bootstrap 补齐 Hub 规范和 Issue 模板。离线验收覆盖缺能力时的配置指引、运行中更新发布规范和跨 Pod 环境变更。
+Core 加载 Hub SOP、检查所需能力并提供受审批的 GitLab 发版工具。Delivery 装配 JumpServer 等可选能力。bootstrap 补齐 Hub 规范和 Issue 模板。SOP 验收目标包括缺能力时的配置指引、运行中更新发布规范和跨 Pod 环境变更。
 
-## V4 演进实施计划：Issue 自动闭环终止条件与全 SOP 确定性 Mock-LLM E2E
+## V4 演进实施计划：Issue 自动闭环终止条件与真实服务栈 SOP E2E
 
 | 阶段 | 阶段目标 | 核心交付物 | 核心验收标准 |
 | :--- | :--- | :--- | :--- |
 | **Stage 8** | **Issue 自动闭环机制（`DONE` / `claude::done` + `detent_close_issue` + `close_policy` + 硬守卫）** | • `SessionStatus` 新增 `'DONE'` 与 `claude::done` 标签；`GitLabClient` 新增 `closeIssue`<br/>• `HubWorkflow` 支持 `close_policy: manual \| auto \| approve`（默认 `manual`）<br/>• `SessionOrchestrator` 集成 `detent_close_issue` 延迟原子关闭与 4 重硬守卫；`DetentExtensions.resolveTurnProfile` 返回的 `TurnProfile` 支持 `closePolicy` 与 `canCloseIssue`<br/>• `@detent/delivery` 注入执行记录终态守卫、MR 合并跳过 `DONE` 会话；标准模板更新 `close_policy: auto` 与终止条件；`scripts/bootstrap.ts` 补齐 `claude::done` 标签 | 1. 单测覆盖：`manual`/`auto`/`approve`、Plan 阶段禁关、未合并 MR 禁关、待审项禁关、未成功执行记录禁关、轮次报错不关单、只读巡检使用 SDK `default` 模式且工作区保持只读，关单前先归档 Worktree 再刷新最终评论，关闭后置 `DONE`<br/>2. `packages/core` 零业务污染<br/>3. `npm run check && npm run build` 全绿 |
-| **Stage 9** | **全 6 场景 Mock-LLM 确定性 E2E（支持全离线 `e2e:offline` 与真本地 GitLab CE 18.3.0 `e2e:gitlab` 双目标）+ 活文档同步** | • 升级 `scripts/e2e/offline-anthropic.ts` 支持全 6 条 SOP（`audit` / `code-delivery` / `release` / `env-change` / `hotfix` / `close_policy: approve`）与提前关单拦截验证<br/>• 抽离简洁的 GitLab E2E Driver 适配离线 `offline-gitlab.ts` 与真实本地 GitLab CE v18.3.0 API（`scripts/e2e/live-gitlab.ts`），新增 `npm run e2e:gitlab`<br/>• 同步更新 `AGENT.md`、`.opencodereview/rule.json`、`README.md`、`README.zh-CN.md` | 1. `npm run check && npm run build` 100% 通过<br/>2. `npm run e2e:offline` 跑通全部 6 条 SOP + Issue 自动闭环（退出码 0）<br/>3. `npm run e2e:gitlab` 对真实本地 Docker GitLab CE 18.3.0 + MySQL 8.0 + Mock LLM 跑通全部 6 条 SOP（0 真实模型 API 调用，全部完结 Issue 为 `closed` + `claude::done`）<br/>4. 推送前完成 `ocr delegate` 100% 覆盖率审查 |
+| **Stage 9** | **真实服务栈 SOP 验收** | 第 2 步实现 `scripts/e2e/stack.ts` 和 `scripts/e2e/run-e2e.ts`，复用 `gitlab-driver.ts` 与 `live-gitlab.ts` 操作真实 GitLab | 先用 `npm run e2e:up` 启动环境，再用 `npm run e2e` 构建并验证巡检、代码交付、发版、环境变更、热修复和关单审批，最后用 `npm run e2e:down` 拆除环境。完成的 Issue 在 GitLab 为 `closed` 且带有 `claude::done`，对应 MySQL 会话为 `DONE`。 |
 
 ### Jev 风控验收
 
-使用回环百炼 Decision Model API 验证 Bash 静态放行、硬门禁、语义放行和失败回退。代码交付在计划获批后执行复合命令，MySQL 中 Bash 审批行数为零；审计通过只读工具执行 `ss -lntp`。单测覆盖超时、响应校验、置信度及密钥隔离。生产执行、发版、方案和审批关单继续验证人工身份。
+使用配置的百炼 Decision Model API 验证 Bash 静态放行、硬门禁、语义放行和失败回退。代码交付在计划获批后执行复合命令，MySQL 中 Bash 审批行数为零；审计通过只读工具执行 `ss -lntp`。单测覆盖超时、响应校验、置信度及密钥隔离。生产执行、发版、方案和审批关单继续验证人工身份。
 
 ## Stage 10 · V6 控制面基础
 
@@ -172,11 +172,11 @@ Core 加载 Hub SOP、检查所需能力并提供受审批的 GitLab 发版工�
 - 流水线按 Hub 规则处置，检查提交 SHA、尝试次数与事件幂等性。测试验证关联 Issue 通知及独立的合并事件队列。
 - 验收命令为 `npm run check` 和 `npm run build`。真实进程验收见 Stage 12。
 
-## Stage 12 · 双目标端到端验收
+## Stage 12 · 真实 GitLab 的 MR 端到端验收
 
-- 共用真实 Claude Code、MySQL 8.0、构建后的 Delivery 服务及六个原有 SOP 场景。Issue 创建的双 MR 自动分配给 Bot，行内修复在源分支生成提交并回复原讨论串。两次人工合并后检查两个 MR 会话的 `DONE`，以及 Hub Issue 的关闭状态和 `claude::done`。
-- 外部 MR 通过单次提及和后续分配分别触发。离线驱动发送 Bot 用户的失败流水线，检查任务日志、独立修复、Hub Issue 评论不变、在线策略从 `notify` 切换到 `run`，以及 PostToolUse 消费轮中指示并影响提交。仓库部署失败应生成带来源信息的 Hub 告警 Issue。
-- `npm run e2e:offline` 包含合成 CI 和部署事件；`e2e:gitlab` 使用真实 GitLab 产生的 Webhook。质量门禁为 `npm run check`、`npm run build` 与 `git diff --check`。
+- 在真实服务栈上验证以下 MR 场景。Issue 创建的双 MR 自动分配给 Bot，行内修复在源分支生成提交并回复原讨论串。两次人工合并后检查两个 MR 会话的 `DONE`，以及 Hub Issue 的关闭状态和 `claude::done`。
+- 外部 MR 通过单次提及和后续分配分别触发。通过 GitLab 触发 Bot 用户的失败流水线，检查任务日志、独立修复、Hub Issue 评论不变、在线策略从 `notify` 切换到 `run`，以及 PostToolUse 消费轮中指示并影响提交。仓库部署失败应生成带来源信息的 Hub 告警 Issue。
+- CI 和部署场景使用 GitLab 实际投递的 Webhook。质量门禁为 `npm run check`、`npm run build` 与 `git diff --check`。
 - V6 新增 `MR_MAX_AUTO_FIX_ATTEMPTS`、`WATCHDOG_INTERVAL_MS` 和 `WATCHDOG_MAX_RECOVERIES`。默认值、范围和 MySQL 8.0 升级 SQL 见[设计文档](DESIGN.md#v6-mysql-upgrade)。
 
 ## Stage 13 · 可重复安装
@@ -188,21 +188,21 @@ Core 加载 Hub SOP、检查所需能力并提供受审批的 GitLab 发版工�
 - 新 Hub 的 GitLab 首页来自 `examples/hub-workspace/README.md`。Issue 模板提供编辑器内提示，`agents/onboarding/AGENT.md` 指导用户授权目标仓库与申请接入。
 - Hub 与 MR 的 `/help` 走免模型、免会话写入路径。验收实时 Agent 就绪状态、权限、讨论串和首次接管提示。
 - `gitlab-onboarding` 根据 `DETENT_PUBLIC_URL` 和服务端 Webhook 密钥启用。验收只读检查、整组 Maintainer 门槛、生产审批、幂等更新及凭证隔离。
-- 离线套件从引导首页、群组发现与欢迎工单开始，验证 Developer 无法批准、SRE 批准后新项目的签名 Webhook 能实际启动 MR Worker。质量门禁为 `npm run check && npm run build && npm run e2e:offline`。
+- 接入验收从引导首页、群组发现与欢迎工单开始，验证 Developer 无法批准、SRE 批准后新项目的签名 Webhook 能实际启动 MR Worker。在测试环境中通过 `npm run e2e` 验收接入流程。
 
 交互验收覆盖未开通能力零 Claude 调用、就绪场景的简短澄清、Issue 与 MR 的直接回答、生产审批拒绝提示去重与外部人员静默，以及状态、帮助和脱敏的业务执行记录。
 
 ## Stage 15 · Hub 能力与密钥
 
 - 验收通用环境密钥、完整引用与请求头模板、默认分支能力热更新、外部 MCP 生产审批，以及 Agent 级账号与巡检前缀。
-- 离线驱动通过真实子进程启动边界、模型请求、GitLab 评论与工具轨迹、MySQL transcript 检查凭证隔离。在编码轮次验证 Hub 能力文件的写保护。
-- Branch 4 使用单把 AccessKey 验证巡检和生产执行签名。先使用流程 `account`，其次使用 Hub `default_account`。两者均未设置时，逐资产按 JumpServer 返回顺序选择首个有效授权账号，跳过停用账号和以 `@` 开头的虚拟账号。巡检按账号分组并汇总结果。单个 Ansible 任务要求所有目标使用同一账号，否则须指定共同的 `account` 或分组执行。缺少有效账号时，错误指出对应资产。 离线场景验证两组巡检，且合并 SHA 与生产审批通过后，Ansible 以首账号和 `runas_policy=skip` 执行。
+- 检查真实子进程的环境、模型请求、GitLab 评论与工具轨迹及 MySQL transcript 中的凭证隔离。在编码轮次验证 Hub 能力文件的写保护。
+- Branch 4 使用单把 AccessKey 验证巡检和生产执行签名。先使用流程 `account`，其次使用 Hub `default_account`。两者均未设置时，逐资产按 JumpServer 返回顺序选择首个有效授权账号，跳过停用账号和以 `@` 开头的虚拟账号。巡检按账号分组并汇总结果。单个 Ansible 任务要求所有目标使用同一账号，否则须指定共同的 `account` 或分组执行。缺少有效账号时，错误指出对应资产。验收时检查两组巡检，且合并 SHA 与生产审批通过后，Ansible 以首账号和 `runas_policy=skip` 执行。
 
 ### JumpServer 契约与单工单会话验收
 
 | 场景 | 观测点 |
 | --- | --- |
-| J-1 | 直接向回环 API 提交缺失或错误的 `is_periodic` 得到 400。Delivery Pod 提交巡检、Playbook 时须显式为 false。 |
+| J-1 | 直接向 JumpServer API 提交缺失或错误的 `is_periodic` 得到 400。Delivery Pod 提交巡检、Playbook 时须显式为 false。 |
 | J-2、J-5 | 过滤虚拟与停用账号，HTML 404 回退至资产详情。按 Agent、Hub、资产首账号选择，空授权或未授权账号在提交前拒绝。 |
 | J-3、J-4 | 检查结构化结果及去除 NUL 的日志回退。同账号批量提交一次，不同账号的巡检分组汇总。混合账号的 Playbook 在上传前拒绝，失败执行写审计并阻止关单。 |
 | J-6、J-7 | 验证 Kafka 进程、监听端口、Topic 列表、日期和主机名。硬拒绝不访问 Jev 或 JumpServer。语义放行要求 pure_readonly、noul ≥ 0.75、impact ≤ 1.35，拒绝展示评分。资产黑名单覆盖巡检及 Playbook。 |
@@ -219,8 +219,8 @@ Core 加载 Hub SOP、检查所需能力并提供受审批的 GitLab 发版工�
 - `coding_auto` 在方案批准后开放。
 - `always_approve` 要求单次工具审批，生产工具额外校验生产审批人。
 
-模型代理在父进程脱敏并认证请求，向上游发送 Messages 和 token 计数请求前，将模型名统一为配置的 `CLAUDE_MODEL`。离线网关逐个检查 Messages 的模型名。Kafka 场景通过同一会话的工具轨迹、审批记录、MR 和源分支文件验收。
+模型代理在父进程脱敏并认证请求，向上游发送 Messages 和 token 计数请求前，将模型名统一为配置的 `CLAUDE_MODEL`。验收时核对 Messages 请求的模型名。Kafka 场景通过同一会话的工具轨迹、审批记录、MR 和源分支文件验收。
 
 ## Stage 18 · 批量巡检与异步任务
 
-每轮 Claude 通过带令牌认证的回环 HTTP MCP 调用工具。工具审批和提问先保存会话并释放 Pod 租约，获授权的用户回复后由新进程恢复。通过 `jms_list_assets` 查询资产，向 `jms_shell` 传入 `commands` 数组完成批量巡检。生产审批通过后，`jms_job` 异步提交任务并返回链接，本轮结束。Delivery 记录终态并唤醒原 Issue 进行核验。`jms_job_status` 可查询当前会话所属的任务。 `npm run e2e:smoke` 验收统一工单与生产变更。全量离线套件另验证跨 Pod 恢复、超过 30 秒的工具调用和失败任务拒绝关单。
+每轮 Claude 通过带令牌认证的回环 HTTP MCP 调用工具。工具审批和提问先保存会话并释放 Pod 租约，获授权的用户回复后由新进程恢复。通过 `jms_list_assets` 查询资产，向 `jms_shell` 传入 `commands` 数组完成批量巡检。生产审批通过后，`jms_job` 异步提交任务并返回链接，本轮结束。Delivery 记录终态并唤醒原 Issue 进行核验。`jms_job_status` 可查询当前会话所属的任务。统一工单与生产变更场景还需验证跨 Pod 恢复、超过 30 秒的工具调用和失败任务拒绝关单。

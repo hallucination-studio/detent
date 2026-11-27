@@ -264,7 +264,7 @@ sequenceDiagram
 | `jms_job` | Hub AccessKey | **`always_approve`** | **1. 硬校验对应 Ansible MR 在 MySQL 中已 `merged` 且 `merge_commit_sha` 匹配**<br/>**2. 校验目标资产组不在黑名单**<br/>**3. 审批前与放行后双重校验** | 通过 JumpServer 任务中心（Ops Job Center）下发指定仓库、指定已合并 Commit 的 Ansible Playbook 任务，并通过注入的 tracker 记录实际执行 ID |
 | `jms_job_status` | Hub AccessKey | `readonly` | 必须由 tracker 确认本 Session 拥有任务 ID；未配置则拒绝 | 按需查询 JumpServer 任务中心执行状态、标准输出摘要及 JumpServer Web 审计链接 |
 
-通过 `npm run e2e:smoke` 验证异步提交、回调核验和关单。终态与 `callback_pending` 在同一次更新中提交。投递失败后重新扫描终态行并使用已保存的摘要，收件箱按会话和事件 ID 去重。
+环境变更 SOP 的验收点包括异步提交、回调核验和关单。终态与 `callback_pending` 在同一次更新中提交。投递失败后重新扫描终态行并使用已保存的摘要，收件箱按会话和事件 ID 去重。
 
 Stage 3 通过 `createDeliveryApp(config, options)` 装配。Hub 配置服务地址和 `auth` 后启用四个工具。默认使用同一 AccessKey 做 HMAC-SHA256 签名。未配置 Hub 条目的旧部署仍可使用环境变量为两个角色分别指定凭证。巡检与 Playbook 均校验资产账号，并发送 `runas` 和 `runas_policy=skip`。
 
@@ -355,7 +355,7 @@ erDiagram
 
 模型代理在父进程脱敏并认证请求，向上游发送 Messages 和 token 计数请求前，将模型名统一为配置的 `CLAUDE_MODEL`。
 
-## 六、 V4 架构演进：Issue 自动闭环终止条件与全 SOP 确定性验收
+## 六、 V4 架构演进：Issue 自动闭环终止条件与真实服务栈 SOP 验收
 
 ### 6.1 设计原则：将“轮次结束（`IDLE`）”与“工单闭环（`DONE` / `closed`）”解耦
 
@@ -378,11 +378,9 @@ V4 通过 **3 层组合机制** 实现安全可控的 Issue 闭环：
    - **延迟原子收口**：`detent_close_issue` 在轮次中仅记录待关闭请求；只有本轮 Claude 正常结束且未抛错时，编排器按序完成 **增量落库 transcript → 保存工作区检查点 → 复核关单守卫 → 归档全部活跃 Worktree → 刷新最终评论 → 调用 GitLab `closeIssue`（`state_event: 'close'`）→ 状态置为 `DONE` 并打上 `claude::done`**。Bot 自身关闭触发的 `issue (close)` Webhook 被 `isBotUser` 自动忽略，零自环；人工后续在 GitLab 点 Reopen 并发表评论可无缝恢复会话。
    - **已闭环会话防误唤醒**：`@detent/delivery` 的 MR 合并处理器对已处于 `DONE` 的会话记录合并信息但不再自动拉起新轮次。
 
-### 6.2 全 SOP 确定性 Mock-LLM 验收体系（双目标模式）
+### 6.2 真实服务栈 SOP 验收
 
-为避免依赖外部模型 API，E2E 采用本地确定性 Mock Anthropic SSE 服务驱动真实 `@anthropic-ai/claude-code` 进程。双目标复用同一套场景，V5 扩展见第七节。
-- **`npm run e2e:offline`**：离线 GitLab（含真实 `git-http-backend`）+ 离线 JumpServer + Mock Anthropic + 真实 MySQL 8.0 Docker + 真实 `bootstrap.ts` + 真实 `packages/delivery/dist/server.js`。
-- **`npm run e2e:gitlab`**：直连真实本地 GitLab CE v18.3.0（如 `http://127.0.0.1:8080`）+ 真实 MySQL 8.0 + Mock Anthropic + Mock JumpServer，零模型 API 费用、100% 确定性验收真实 GitLab API/Webhook/Tag/Release/Issue 自动闭环。
+第 2 步将实现 `npm run e2e:up`（启动环境）、`npm run e2e`（构建并运行 SOP 场景）和 `npm run e2e:down`（拆除环境）。测试通过真实 GitLab API 创建 Issue、审批与合并 MR，由项目 Webhook 驱动 Delivery 和 Claude Code。关单后核对 GitLab 的 `closed`、`claude::done` 与 MySQL 的 `DONE`、Worktree 归档记录。涉及生产执行时，再对照已审批的 MR SHA、JumpServer 任务结果和交付审计记录。
 
 ---
 
@@ -489,7 +487,7 @@ ALTER TABLE issue_sessions DROP INDEX hub_project_id,
 
 ### 8.2 Stage 12 验收
 
-Issue 和 MR 的 NoteStreamer 按调用 ID 在折叠轨迹中逐步更新内置工具、工作区工具与 MCP 扩展的参数和结果（含错误与拒绝原因）。路径保留原样，每次读取单列一步，工具名仅去除前缀 `mcp__detent__`。参数与结果先脱敏再截至 300 字符。超过 60 步时展示首尾各 30 步及省略数量。双目标套件按真实源分支提交、原讨论串回复及 MySQL 会话终态验收。离线失败流水线使用 Bot 身份并提供真实 API 路径查询任务与日志。外部 MR 场景在模型返回下一次工具调用前等待评论进入收件箱，校验 PostToolUse 将评论中的随机标记传递到同一轮提交。部署失败按 Hub 策略创建带标签的告警 Issue。
+Issue 和 MR 的 NoteStreamer 按调用 ID 在折叠轨迹中逐步更新内置工具、工作区工具与 MCP 扩展的参数和结果（含错误与拒绝原因）。路径保留原样，每次读取单列一步，工具名仅去除前缀 `mcp__detent__`。参数与结果先脱敏再截至 300 字符。超过 60 步时展示首尾各 30 步及省略数量。MR 场景按源分支提交、原讨论串回复及 MySQL 会话终态验收。流水线失败时通过 GitLab API 查询任务与日志。轮中评论通过 PostToolUse 进入当前轮次，以同一轮提交验证处理结果。部署失败按 Hub 策略创建带标签的告警 Issue。
 
 ## Stage 13–14 · 安装、帮助与仓库接入
 

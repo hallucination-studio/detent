@@ -88,7 +88,7 @@ it('requires an approved plan, resolved approvals and merged MRs before scheduli
   expect(await status()).toBe('WAITING_PLAN');
   expect(gitlab.closeIssue).not.toHaveBeenCalled();
   run.mockImplementationOnce(async ({ gate }) => {
-    const pending = await repo.createApprovalRequest(session.id, 'TOOL_USE', 'Bash', {});
+    const pending = await repo.createApprovalRequest(session.id, 'TOOL_USE', 'detent_create_release', {});
     await expect(gate.invokeExtension(tool, input)).rejects.toThrow('尚有待审批项');
     await repo.resolveApprovalRequest(pending.id, 'REJECTED', 'dev');
     const mr = await repo.upsertMergeRequest({
@@ -114,7 +114,7 @@ it.each(['error', 'abort during flush', 'cold hold', 'new blocker'])('discards a
     if (failure === 'error') throw Error('run failed');
     if (failure === 'abort during flush') gitlab.updateIssueNote.mockImplementationOnce(() => controller.abort());
     if (failure === 'cold hold') await gate.canUseTool('AskUserQuestion', { questions: [{ question: '确认？' }] });
-    if (failure === 'new blocker') await repo.createApprovalRequest(session.id, 'TOOL_USE', 'Bash', {});
+    if (failure === 'new blocker') await repo.createApprovalRequest(session.id, 'TOOL_USE', 'detent_create_release', {});
     return 'reviewed';
   });
   await turn('default');

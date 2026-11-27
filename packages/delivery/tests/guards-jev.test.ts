@@ -30,6 +30,14 @@ it('accepts a level-one Bailian decision with explicit no-side-effect criteria',
   }));
 });
 
+it.each(["'kafka|zookeeper'", '"kafka|zookeeper"'])('passes the quoted pattern %s intact to Jev', async pattern => {
+  const command = `ps -ef | grep -Ei ${pattern} | grep -v grep`;
+  const { decide, inspect } = await inspectGuard();
+  expect(isHardBlockedRemoteInspectCommand(command)).toBe(false);
+  expect(await inspect(command)).toEqual({ ok: true });
+  expect(decide.mock.calls[0][0]).toMatchObject({ command });
+});
+
 it.each([['state_mutating', 0.79, 0.76], ['pure_readonly', 0.79, 2.1], ['pure_readonly', 0.74, 1]] as const)(
   'surfaces the Jev denial for %s, noul %s and impact %s', async (choice, noul, score) => {
     const { inspect } = await inspectGuard(choice, noul, score);
@@ -37,20 +45,50 @@ it.each([['state_mutating', 0.79, 0.76], ['pure_readonly', 0.79, 2.1], ['pure_re
       `Jev: choice=${choice}, noul=${noul}, impact=${score}`) });
   });
 
-it('matches installed executables and equivalent ss flags without consulting Jev', async () => {
+it.each([
+  'systemctl --failed --no-pager --no-legend',
+  "curl -sS -m 3 -o /dev/null -w '%{http_code} %{time_total}s' http://127.0.0.1:9092/",
+  'ss -tulnp', 'journalctl -u kafka -n 50 --no-pager',
+  "grep -F 'x;y & z > ..' /var/log/messages", String.raw`grep -E "a\"|b" /var/log/messages`,
+  'ls /srv/nonsecret', 'kubectl get pods --namespace=secrets --sort-by=.metadata.name',
+])('sends the diagnostic %s to Jev', async command => {
   const { decide, inspect } = await inspectGuard();
-  for (const command of ['ss -lntp', 'ss -lp -tn', '/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list'])
+  expect(isHardBlockedRemoteInspectCommand(command)).toBe(false);
+  expect(await inspect(command)).toEqual({ ok: true });
+  expect(decide).toHaveBeenCalledExactlyOnceWith({ surface: 'remote_jumpserver_readonly_inspect', command }, expect.anything());
+});
+
+it('matches literal allowlisted prefixes for installed executables', async () => {
+  const { decide, inspect } = await inspectGuard();
+  for (const command of ['ss -tlnp', '/usr/bin/ss -tlnp', '/opt/kafka/bin/kafka-topics.sh'])
     expect(await inspect(command), command).toEqual({ ok: true });
   expect(decide).not.toHaveBeenCalled();
   const staticOnly = await inspectGuard(undefined, undefined, undefined, false);
-  expect(await staticOnly.inspect('ps -ef')).toMatchObject({ ok: false, reason: expect.stringContaining('白名单') });
+  for (const command of ['ps -ef', 'ss -lntp', '/tmp/uptime'])
+    expect(await staticOnly.inspect(command), command).toMatchObject({ ok: false, reason: expect.stringContaining('白名单') });
+});
+
+it.each([
+  'systemctl restart nginx', 'ss -K', '/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --delete',
+])('requires a Jev verdict for %s and enforces its denial', async command => {
+  const { decide, inspect } = await inspectGuard('state_mutating');
+  expect(isHardBlockedRemoteInspectCommand(command)).toBe(false);
+  expect(await inspect(command)).toMatchObject({ ok: false, reason: expect.stringContaining('Jev: choice=state_mutating') });
+  expect(decide).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ command }), expect.anything());
 });
 
 it('hard-blocks unsafe commands before prefix matching and Jev', async () => {
   const { decide, inspect } = await inspectGuard();
-  for (const command of ['rm -rf /', 'cat /etc/shadow', 'uptime; id', 'uptime && id', 'uptime || id',
-    'uptime > out', 'uptime $(id)', 'ls /run/secrets/key', 'cat .ssh/config', 'cat .env', '/tmp/uptime',
-    'ss -K', '/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --delete']) {
+  for (const command of ['rm -rf /', 'sudo uptime', 'cat /etc/shadow', 'cat /etc/./gshadow', 'cat /etc/sudoers',
+    'uptime; id', 'uptime & id', 'uptime && id', 'uptime || id', 'cat < file',
+    "echo 'a|b' ; rm -rf /", "echo 'ok' | sh", "echo 'a|b' | sh | grep ok",
+    "echo 'unterminated | sh", 'echo "unterminated', '| uptime', 'uptime | ', 'uptime | | uptime',
+    "awk '{ print | cmd }'", "awk 'system(cmd)'", "awk '{ getline record }'",
+    'sed -i s/a/b/ f', 'sed --in-place=.bak s/a/b/ f', 'find /tmp -delete', 'find /tmp -ok rm',
+    'uptime > out', 'uptime $(id)', 'echo "$(id)"', 'echo `id`', 'cat ../file',
+    'ls /run/secrets/key', 'cat .ssh/config', 'cat .env', 'cat id_rsa', 'cat id_ed25519',
+    'kubectl get secret', 'kubectl get secrets', "cat /etc/'sha'dow", 'cat /etc//shadow',
+    '', 'x'.repeat(513), 'uptime\r', 'uptime\n', 'uptime\0']) {
     expect(isHardBlockedRemoteInspectCommand(command), command).toBe(true);
     expect(await inspect(command), command).toMatchObject({ ok: false, reason: expect.stringContaining('硬性') });
   }
@@ -84,7 +122,7 @@ it('starts every eligible Jev check together and preserves the order of the vali
   });
 });
 
-it('quotes batch headers literally and preserves each exit status while continuing the batch', () => {
+it('quotes batch headers literally and reports each exit status while completing the batch successfully', () => {
   const quoted = "printf '%s\\n' 'space  and %s'";
   expect(buildBatchShellScript([quoted])).toBe(quoted);
   const script = buildBatchShellScript([quoted, 'false', 'true']);
@@ -92,7 +130,7 @@ it('quotes batch headers literally and preserves each exit status while continui
   expect(script).toContain("printf '=== [%d/%d] %s ===\\n' 1 3 'printf '\\''%s");
   const run = spawnSync('sh', ['-c', script], { encoding: 'utf8' });
   expect(run.stderr).toBe('');
-  expect(run.status).toBe(1);
+  expect(run.status).toBe(0);
   expect(run.stdout.split('\n')).toEqual([
     `=== [1/3] ${quoted} ===`, 'space  and %s', '[rc=0]', '=== [2/3] false ===', '[rc=1]', '=== [3/3] true ===', '[rc=0]', '',
   ]);

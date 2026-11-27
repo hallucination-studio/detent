@@ -4,7 +4,6 @@ import path from 'node:path';
 import { expect, it, onTestFinished, vi } from 'vitest';
 import { defineExtensionTool, GitLabClient, loadConfig, SessionOrchestrator, type SandboxScope } from '../src/index.js';
 import type { TurnInput } from '../src/claude/runner.js';
-import { isHardGatedLocalBash } from '../src/decision/bash-guard.js';
 import { EphemeralSandbox, git } from '../src/workspace/ephemeral-sandbox.js';
 import { InMemoryDetentRepository } from './memory-repository.js';
 import { bareProjects } from './bare-projects.js';
@@ -148,13 +147,10 @@ it('projects a turn’s selected Agent and shared skills and protects the root p
       expect(await gate.preflight('Bash', { command: 'touch dangling-skill-alias' })).toMatchObject({ behavior: 'deny' });
       expect(await gate.preflight('Bash', { command: 'unlink skills/Shared/SKILL.md' })).toMatchObject({ behavior: 'deny' });
       for (const file_path of ['agents/Deploy/AGENT.md', 'skills/Shared/SKILL.md']) {
-        expect(isHardGatedLocalBash('touch ' + file_path, workspace)).toBe(true);
-        expect(isHardGatedLocalBash('cat ' + file_path, workspace)).toBe(false);
         expect(await gate.preflight('Bash', { command: 'cat ' + file_path })).toMatchObject({ behavior: 'allow' });
       }
       for (const file_path of ['projects/app/agents/new.md', 'projects/app/skills/new.md']) {
         expect(await gate.preflight('Write', { file_path })).toMatchObject({ behavior: 'allow' });
-        expect(isHardGatedLocalBash('touch ' + file_path, workspace)).toBe(false);
         expect(await gate.preflight('Bash', { command: 'touch ' + file_path })).toMatchObject({ behavior: 'allow' });
       }
       return 'Agent projection verified';

@@ -1,6 +1,9 @@
+import { createHash, createHmac } from 'node:crypto';
+import { createServer, type IncomingMessage } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import type { Duplex } from 'node:stream';
 import { strToU8, zipSync } from 'fflate';
-import { afterEach, expect, it, vi } from 'vitest';
-import { offlineJumpServer } from '../../../scripts/e2e/offline-jumpserver.js';
+import { afterEach, expect, it, onTestFinished, vi } from 'vitest';
 import { loadDeliveryConfig } from '../src/config.js';
 import { HttpJumpServerClient } from '../src/jumpserver/client.js';
 
@@ -9,14 +12,66 @@ const gitlab = { gitlabBaseUrl: 'https://git.test', gitlabToken: 'git-token', je
 const jobsPath = '/api/v1/ops/jobs/';
 const accountsPath = '/api/v1/perms/users/self/assets/';
 const scheduleError = { is_periodic: ['Require interval or crontab setting'] };
+const credentials = { accessKeyId: 'fixture-key-id', accessKeySecret: 'fixture-key-secret', job: 'fixture-job-token' };
+const secrets = [...Object.values(credentials), gitlab.gitlabToken, gitlab.jevApiKey,
+  encodeURIComponent(gitlab.secrets.CUSTOM), gitlab.secrets.CUSTOM];
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
+function jumpServerFixture() {
+  const runAs: string[] = [];
+  const tasks = new Map<string, string[]>();
+  const inactive = { username: 'disabled', is_active: false };
+  const html404 = () => new Response('<html>Not Found</html>', { status: 404, headers: { 'Content-Type': 'text/html' } });
+
+  async function handle(request: Request) {
+    const { pathname } = new URL(request.url);
+    switch (request.method + ' ' + pathname) {
+      case 'GET ' + accountsPath + 'web01/accounts/':
+        return Response.json(['@INPUT', inactive, 'ops-first', 'root']);
+      case 'GET ' + accountsPath + 'web02/accounts/':
+      case 'GET ' + accountsPath + 'web03/accounts/':
+        return html404();
+      case 'GET ' + accountsPath + 'web02/':
+        return Response.json({ permed_accounts: ['@INPUT', inactive, 'ops-second', 'root'] });
+      case 'GET ' + accountsPath + 'web03/':
+        return Response.json({ permed_accounts: [] });
+      case 'POST /api/v1/ops/playbooks/':
+        return Response.json({ id: 'playbook' });
+      case 'POST ' + jobsPath: {
+        const job = await request.json();
+        if (job.is_periodic !== false) return Response.json(scheduleError, { status: 400 });
+        runAs.push(job.runas);
+        if (!job.instant) return Response.json({ id: 'definition', variable: [] });
+        const id = 'task-' + (tasks.size + 1);
+        tasks.set(id, job.assets);
+        return Response.json({ task_id: id });
+      }
+      case 'POST /api/v1/ops/job-executions/':
+        expect(await request.json()).toEqual({ job: 'definition', parameters: { jms_service: 'nginx' } });
+        return Response.json({ task_id: 'playbook-task' });
+    }
+
+    const [, endpoint, id] = pathname.match(/^\/api\/v1\/ops\/job-execution\/(task-detail|result)\/([^/]+)\/$/) ?? [];
+    const assets = tasks.get(id);
+    if (request.method === 'GET' && assets) {
+      if (endpoint === 'task-detail') return Response.json({ status: 'success', summary: { success: 1 } });
+      if (assets.includes('web02')) return html404();
+      return Response.json({ result: Object.fromEntries(assets.map(asset => [asset, 'nginx active'])) });
+    }
+    const log = pathname.match(/^\/api\/v1\/ops\/ansible\/job-execution\/([^/]+)\/log\/$/);
+    if (request.method === 'GET' && log && tasks.has(log[1]))
+      return Response.json({ data: '\x1b[32mnginx active\x1b[0m\u0000\u0000\u0000' });
+    return new Response(null, { status: 404 });
+  }
+  return { handle, runAs };
+}
+
 function setup() {
-  const server = offlineJumpServer();
+  const server = jumpServerFixture();
   const config = loadDeliveryConfig({
-    JUMPSERVER_BASE_URL: base, JUMPSERVER_READONLY_ACCESS_KEY_ID: server.accessKeyId,
-    JUMPSERVER_READONLY_ACCESS_KEY_SECRET: server.accessKeySecret, JUMPSERVER_JOB_TOKEN: server.job,
+    JUMPSERVER_BASE_URL: base, JUMPSERVER_READONLY_ACCESS_KEY_ID: credentials.accessKeyId,
+    JUMPSERVER_READONLY_ACCESS_KEY_SECRET: credentials.accessKeySecret, JUMPSERVER_JOB_TOKEN: credentials.job,
   });
   const client = new HttpJumpServerClient(config, gitlab);
   const fetch = vi.fn<typeof globalThis.fetch>(async (url, init) => {
@@ -49,10 +104,8 @@ it.each(['inspection', 'instant playbook', 'parameterized playbook'])('submits %
 });
 
 it('preserves the HTTP status and redacts the body before truncating either diagnostic', async () => {
-  const { client, fetch, server } = setup();
+  const { client, fetch } = setup();
   const log = vi.spyOn(console, 'error').mockImplementation(() => {});
-  const secrets = [server.accessKeyId, server.accessKeySecret, server.job, gitlab.gitlabToken, gitlab.jevApiKey,
-    encodeURIComponent(gitlab.secrets.CUSTOM), gitlab.secrets.CUSTOM];
   const echoed = secrets.join(' ') + ' https://oauth2:unknown@git.test/repo';
   const safe = JSON.stringify({ ...scheduleError, detail: secrets.map(() => '***').join(' ') + ' https://oauth2:***@git.test/repo', padding: 'x'.repeat(1100) });
   fetch.mockResolvedValueOnce(Response.json(['root'])).mockResolvedValueOnce(
@@ -68,7 +121,7 @@ it('uses asset detail and the ANSI log after HTML 404s, removing NUL padding fro
   const { client, server, fetch } = setup();
   const log = vi.spyOn(console, 'error').mockImplementation(() => {});
   const outcome = await client.runShell({ assetIds: ['web02'], commands: ['uptime'] });
-  expect(server.runAs).toMatchObject([{ account: 'ops-second' }]);
+  expect(server.runAs).toEqual(['ops-second']);
   expect(outcome).toMatchObject({ status: 'SUCCESS', outputSummary: '{"success":1}\n\x1b[32mnginx active\x1b[0m' });
   if (!('jobId' in outcome)) throw Error('Expected one inspection job');
   const id = outcome.jobId;
@@ -106,9 +159,9 @@ it('logs an unexpected 404 on the asset detail fallback', async () => {
 });
 
 it.each([{}, { is_periodic: true }, { is_periodic: 'false' }])('rejects unscheduled jobs in the offline API for %j', async fields => {
-  const server = offlineJumpServer();
+  const server = jumpServerFixture();
   const response = await server.handle(new Request(base + jobsPath, {
-    method: 'POST', headers: { Authorization: 'Bearer ' + server.readonly, 'Content-Type': 'application/json' },
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ type: 'adhoc', instant: true, assets: ['web01'], module: 'shell', args: 'uptime',
       runas: 'root', runas_policy: 'skip', ...fields }),
   }));
@@ -121,10 +174,13 @@ it('reuses the resolved account across shell jobs and refreshes the detail looku
   const { client, fetch } = setup();
   const request = { assetIds: ['web02'], commands: ['uptime'] };
   const lookups = () => fetch.mock.calls.map(([url]) => new URL(String(url)).pathname).filter(path => path.startsWith(accountsPath));
+  const start = Date.now();
+  const now = vi.spyOn(Date, 'now').mockReturnValue(start);
   await client.runShell(request);
+  now.mockReturnValue(start + 59999);
   await client.runShell(request);
   expect(lookups()).toEqual([accountsPath + 'web02/accounts/', accountsPath + 'web02/']);
-  vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 60001);
+  now.mockReturnValue(start + 60000);
   await client.runShell(request);
   expect(lookups()).toEqual([accountsPath + 'web02/accounts/', accountsPath + 'web02/', accountsPath + 'web02/']);
 });
@@ -143,12 +199,153 @@ it.each([4500, 60000])('caps each HTTP request separately from the %d ms overall
 it('logs transport, malformed JSON and invalid responses without exposing credentials', async () => {
   const { client, fetch } = setup();
   const log = vi.spyOn(console, 'error').mockImplementation(() => {});
-  fetch.mockRejectedValueOnce(Error('transport ' + gitlab.gitlabToken));
-  await expect(client.listAssets({})).rejects.toThrow('transport ***');
-  fetch.mockResolvedValueOnce(new Response('invalid-' + gitlab.gitlabToken));
-  await expect(client.listAssets({})).rejects.toThrow('Invalid JumpServer JSON');
-  fetch.mockResolvedValueOnce(Response.json({ status: gitlab.gitlabToken, summary: {} }));
-  await expect(client.getJobResult('job')).rejects.toThrow('Invalid JumpServer response');
+  const echoed = secrets.join(' ');
+  fetch.mockRejectedValueOnce(Error('transport ' + echoed));
+  await expect(client.listAssets({})).rejects.toMatchObject({ message: 'transport ' + secrets.map(() => '***').join(' ') });
+  fetch.mockResolvedValueOnce(new Response('invalid-' + echoed));
+  await expect(client.listAssets({})).rejects.toMatchObject({ message: 'Invalid JumpServer JSON' });
+  fetch.mockResolvedValueOnce(Response.json({ status: echoed, summary: {} }));
+  const result = client.getJobResult('job');
+  await expect(result).rejects.toThrow('Invalid JumpServer response');
   expect(log).toHaveBeenCalledTimes(3);
-  expect(JSON.stringify(log.mock.calls)).not.toContain(gitlab.gitlabToken);
+  for (const secret of secrets) {
+    await expect(result).rejects.not.toThrow(secret);
+    expect(JSON.stringify(log.mock.calls)).not.toContain(secret);
+  }
+});
+
+function serverFrame(opcode: number, text: string, fin = true) {
+  const data = Buffer.from(text);
+  const header = Buffer.alloc(data.length < 126 ? 2 : data.length <= 65535 ? 4 : 10);
+  header[0] = (fin ? 0x80 : 0) | opcode;
+  header[1] = header.length === 2 ? data.length : header.length === 4 ? 126 : 127;
+  if (header.length === 4) header.writeUInt16BE(data.length, 2);
+  if (header.length === 10) header.writeBigUInt64BE(BigInt(data.length), 2);
+  return Buffer.concat([header, data]);
+}
+
+async function wsFixture(onFrame: (socket: Duplex, opcode: number, text: string) => void) {
+  const paths: string[] = [];
+  const upgrades: IncomingMessage[] = [];
+  const clientFrames: { masked: boolean; opcode: number; text: string }[] = [];
+  const sockets = new Set<Duplex>();
+  const server = createServer((req, res) => {
+    paths.push(req.url!);
+    if (req.url?.includes('/task-detail/')) {
+      res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ status: 'success', summary: { success: 1 } }));
+    } else res.writeHead(404, { 'Content-Type': 'text/html' }).end('<html>Not Found</html>');
+  });
+  server.on('upgrade', (req, socket) => {
+    upgrades.push(req);
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    const accept = createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+    socket.write(['HTTP/1.1 101 Switching Protocols', 'Upgrade: websocket', 'Connection: Upgrade',
+      'Sec-WebSocket-Accept: ' + accept, '', ''].join('\r\n'));
+    let input = Buffer.alloc(0);
+    socket.on('data', chunk => {
+      input = Buffer.concat([input, chunk]);
+      while (input.length >= 2) {
+        const masked = !!(input[1] & 128);
+        const opcode = input[0] & 15;
+        let size = input[1] & 127;
+        const header = size === 127 ? 10 : size === 126 ? 4 : 2;
+        if (input.length < header) return;
+        if (header === 10) size = Number(input.readBigUInt64BE(2));
+        if (header === 4) size = input.readUInt16BE(2);
+        const start = header + (masked ? 4 : 0);
+        if (input.length < start + size) return;
+        const payload = input.subarray(start, start + size);
+        if (masked) for (let i = 0; i < size; i++) payload[i] ^= input[header + i % 4];
+        input = input.subarray(start + size);
+        const text = payload.toString();
+        clientFrames.push({ masked, opcode, text });
+        if (opcode === 8) socket.end();
+        else onFrame(socket, opcode, text);
+      }
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  onTestFinished(async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  });
+  const url = 'http://127.0.0.1:' + (server.address() as AddressInfo).port;
+  return { paths, upgrades, clientFrames, client: (env: NodeJS.ProcessEnv) =>
+    new HttpJumpServerClient(loadDeliveryConfig({ ...env, JUMPSERVER_BASE_URL: url }), gitlab) };
+}
+
+it('signs v4 log upgrades, reads fragmented Ansible output after HTML 404s and remembers the WS endpoint', async () => {
+  const job = 'job-id';
+  const data = JSON.stringify({ task: job, message: 'target-node-01 ' + secrets.join(' ') + ' custom/' });
+  const fixture = await wsFixture((socket, opcode) => {
+    if (opcode === 1) {
+      const first = serverFrame(1, data.slice(0, 3), false);
+      socket.write(first.subarray(0, 1));
+      socket.write(Buffer.concat([first.subarray(1), serverFrame(9, 'still here'), serverFrame(0, data.slice(3))]));
+    } else if (opcode === 10) {
+      socket.write(Buffer.concat([
+        serverFrame(1, JSON.stringify({ task: job, message: 'secret\0\0\0\0\0' })),
+        serverFrame(1, JSON.stringify({ event: 'end', task: job })),
+      ]));
+    }
+  });
+  const client = fixture.client({ JUMPSERVER_JOB_ACCESS_KEY_ID: credentials.accessKeyId,
+    JUMPSERVER_JOB_ACCESS_KEY_SECRET: credentials.accessKeySecret, JUMPSERVER_READONLY_TOKEN: credentials.job, JUMPSERVER_ORG_ID: 'test-org' });
+  for (let i = 0; i < 2; i++) {
+    const result = await client.getJobResult(job);
+    expect(result.outputSummary).toBe('{"success":1}\ntarget-node-01 ' + secrets.map(() => '***').join(' ') + ' ***');
+  }
+  const detail = '/api/v1/ops/job-execution/task-detail/job-id/';
+  expect(fixture.paths).toEqual([detail, '/api/v1/ops/job-execution/result/job-id/', '/api/v1/ops/ansible/job-execution/job-id/log/', detail]);
+  expect(fixture.upgrades).toHaveLength(2);
+  for (const { method, url, headers } of fixture.upgrades) {
+    expect([method, url, headers.accept, headers['x-jms-org']]).toEqual(['GET', '/ws/ops/tasks/log/', 'application/json', 'test-org']);
+    expect(new Date(headers.date!).toUTCString()).toBe(headers.date);
+    const signature = createHmac('sha256', credentials.accessKeySecret)
+      .update('(request-target): get /ws/ops/tasks/log/\naccept: application/json\ndate: ' + headers.date).digest('base64');
+    expect(headers.authorization).toBe('Signature keyId="' + credentials.accessKeyId +
+      '",algorithm="hmac-sha256",headers="(request-target) accept date",signature="' + signature + '"');
+  }
+  expect(fixture.clientFrames.filter(f => f.opcode !== 8)).toEqual(Array(2).fill([
+    { masked: true, opcode: 1, text: JSON.stringify({ task: job, type: 'ansible' }) },
+    { masked: true, opcode: 10, text: 'still here' },
+  ]).flat());
+});
+
+it('retries unavailable Ansible logs over a fresh Bearer connection and caps a 64-bit Celery frame after redaction', async () => {
+  const types: string[] = [];
+  const fixture = await wsFixture((socket, _opcode, text) => {
+    const { task, type } = JSON.parse(text);
+    types.push(type);
+    if (type === 'ansible') socket.write(serverFrame(1, JSON.stringify({ task, event: 'unavailable' })));
+    else {
+      // Redaction contracts 65k of raw output to under the summary limit. The cap splits the final secret.
+      const repeated = credentials.accessKeySecret.repeat(Math.floor(65536 / credentials.accessKeySecret.length) + 1);
+      socket.write(serverFrame(1, JSON.stringify({ task, message: 'celery ' + repeated })));
+    }
+  });
+  const result = await fixture.client({ JUMPSERVER_JOB_TOKEN: credentials.accessKeySecret,
+    JUMPSERVER_READONLY_TOKEN: 'fixture' }).getJobResult('job');
+  expect(types).toEqual(['ansible', 'celery']);
+  expect(fixture.upgrades.map(req => req.headers.authorization)).toEqual(Array(2).fill('Bearer ' + credentials.accessKeySecret));
+  expect(result.outputSummary).toMatch(/^\{"success":1\}\ncelery \*+…$/);
+  expect(result.outputSummary.length).toBeLessThanOrEqual(16000);
+});
+
+it('rejects an early WebSocket close and only retries on unavailable', async () => {
+  const fixture = await wsFixture(socket => socket.write(serverFrame(8, '')));
+  await expect(fixture.client({ JUMPSERVER_JOB_TOKEN: 'test' }).getJobResult('job')).rejects.toThrow('closed before end');
+  expect(fixture.upgrades).toHaveLength(1);
+});
+
+it('aborts an upgraded WebSocket when the task log stalls', async () => {
+  let closed = false;
+  const fixture = await wsFixture(socket => {
+    socket.on('end', () => { closed = true; socket.end(); });
+  });
+  await expect(fixture.client({ JUMPSERVER_JOB_TOKEN: 'test', JUMPSERVER_TIMEOUT_MS: '500' }).getJobResult('job'))
+    .rejects.toThrow(/timed out|timeout/i);
+  await vi.waitFor(() => expect(closed).toBe(true));
+  expect(fixture.upgrades).toHaveLength(1);
 });

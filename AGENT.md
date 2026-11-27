@@ -56,9 +56,9 @@ Hub SOP 的 `close_policy` 默认 `manual`。`auto` 和 `approve` 启用每轮�
 
 每轮 Claude 通过带令牌认证的回环 HTTP MCP 调用工具。工具审批和提问先保存会话并释放 Pod 租约，获授权的用户回复后由新进程恢复。通过 `jms_list_assets` 查询资产，向 `jms_shell` 传入 `commands` 数组完成批量巡检。生产审批通过后，`jms_job` 异步提交任务并返回链接，本轮结束。Delivery 记录终态并唤醒原 Issue 进行核验。`jms_job_status` 可查询当前会话所属的任务。
 
-### Stage 9 确定性 E2E
+### Stage 9 真实服务栈 SOP E2E
 
-`npm run e2e:smoke` 验收统一会话和异步生产审批闭环。`npm run e2e:offline` 使用回环 GitLab 与 git-http-backend。导出 `E2E_GITLAB_ADMIN_TOKEN` 后，`E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab` 使用独立命名空间和真实 GitLab CE 18.3.0 的 API、用户及 Webhook。两种目标共用缺能力引导、镜像同步、跨库双 MR、在线定制发版、热修复与关单审批、只读巡检和跨 Pod 环境变更场景。真实 Claude Code 使用本地 Anthropic SSE 替身，Jev、JumpServer 与外部 MCP 也使用回环替身。用 GitLab Issue、审批人身份、MySQL 状态和归档记录验收闭环。
+第 2 步将提供真实服务栈验收入口。依次使用 `npm run e2e:up` 启动测试环境、`npm run e2e` 构建并运行 SOP 场景、`npm run e2e:down` 拆除环境。场景通过真实 GitLab API 操作 Issue、审批和 MR，由 GitLab 投递 Webhook。关单时核对 GitLab 状态和审批人身份，以及 MySQL 会话终态和 Worktree 归档记录。
 
 ### Jev 命令风控
 
@@ -92,9 +92,9 @@ MR 编排器复用 TurnRuntime 租约、审批和恢复机制。分配给 Bot �
 
 MR 沙箱只检出源分支。SDK 与门禁共用工作区工具白名单，限于提交推送和两项 CI 查询。另提供当前 MR 的差异、讨论串和目标分支同步工具。推送时复核目录与当前分支。流水线先更新关联记录，再按 Hub 策略路由；无命中规则时，Bot 受理的 MR 可自动修复，未受理的关联 MR 向 Hub Issue 发通知。合并事件分别调度 MR 收尾与扩展处理器。
 
-### V6 双目标验收（Stage 12）
+### V6 MR 验收（Stage 12）
 
-Issue 与 MR 复用 NoteStreamer 折叠工具轨迹。双目标共用真实 Claude Code、MySQL 8.0 和 Delivery 入口，验证分配、单次提及、行内修复与双 MR 合并闭环。离线驱动额外投递带 Bot 身份的流水线失败与部署失败，验证策略在线切换、Hub 告警和轮中指示进入同一轮提交。真实 GitLab 通过 REST 操作触发自身的 Webhook。
+Issue 与 MR 复用 NoteStreamer 折叠工具轨迹。MR 验收通过 GitLab 分配、提及、行内评论和合并触发 Webhook，检查源分支提交、原讨论串回复和双 MR 合并后的会话终态。流水线与部署场景以 GitLab 实际产生的事件验证策略切换、轮中指示与 Hub 告警。
 
 `MR_MAX_AUTO_FIX_ATTEMPTS` 默认 3（0–10），`WATCHDOG_INTERVAL_MS` 默认 30000，`WATCHDOG_MAX_RECOVERIES` 默认 1（0–5）。既有库由初始化程序原子替换旧唯一键，升级 SQL 见[设计文档](docs/DESIGN.md#v6-mysql-upgrade)。
 

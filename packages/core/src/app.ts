@@ -25,7 +25,7 @@ export function createDetentApp(config: AppConfig, extensions: DetentExtensions 
   const capabilities = [...(extensions.capabilities ?? [])];
   const decision = extensions.decisionClient ?? createDecisionClient(config);
   const runner = new SdkClaudeRunner(config);
-  const orchestrator = new SessionOrchestrator(config, repo, client, runner, { ...extensions, capabilities, decisionClient: decision });
+  const orchestrator = new SessionOrchestrator(config, repo, client, runner, { ...extensions, capabilities });
   const report = (error: unknown) =>
     console.error(redactGitUrl(error instanceof Error ? error.message : String(error), configuredSecrets(config)));
   const mrs = new MergeRequestOrchestrator(config, repo, client, runner, { decision, onNotify: extensions.onNotify,

@@ -1,6 +1,3 @@
-import { bashOperands, bashWriteOperation, evaluateLocalBash, isHardGatedLocalBash } from '../decision/bash-guard.js';
-import type { DecisionClient } from '../decision/jev-client.js';
-import { lstat, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { PermissionResult } from '@anthropic-ai/claude-code';
@@ -11,14 +8,15 @@ import type { GitLabClient } from '../gitlab/client.js';
 import { configuredSecrets } from '../gitlab/redact.js';
 import { renderNote, renderStatus, renderToolApprovalCard } from '../gitlab/note-streamer.js';
 import type { ApprovalRequestRow, IssueSessionRow } from '../types.js';
-import { isHubScopePath } from '../workspace/hub-paths.js';
+import { contained } from '../workspace/contained-path.js';
+import { validateLocalSandboxBash } from '../decision/bash-guard.js';
 import { allowedInPlan, isWorkspaceTool, type ToolName } from '../workspace/mcp-tools.js';
 
 import type { SessionChannel } from '../orchestrator/channel.js';
 import { resolveApproval } from '../orchestrator/lifecycle.js';
 
 type Input = Record<string, unknown>;
-type GateResult = PermissionResult & { approvalId?: string; jevConfidence?: number };
+type GateResult = PermissionResult & { approvalId?: string };
 const deny = (message: string): PermissionResult => ({ behavior: 'deny', message });
 export class ToolDenied extends Error {}
 export class ColdHold extends Error {
@@ -28,113 +26,10 @@ export class ColdHold extends Error {
 }
 const fileTools = new Set(['Read', 'Edit', 'Write', 'Glob', 'Grep']);
 const readTools = new Set(['Read', 'Glob', 'Grep']);
-const branchQueryFlags = new Set(['--list', '-a', '--all', '--show-current', '-r', '--remotes', '-v', '-vv']);
-async function safeCommand(command: unknown, prefixes: string[], plan: boolean, workspaceRoot: string) {
-  // Only literal shell words qualify for automatic approval.
-  if (typeof command !== 'string' || /[^\w ./=:@%+,~^\t-]/.test(command)) return false;
-  const words = command.trim().split(/[ \t]+/);
-  if (words[0] === 'git' && words[1] === '-C') {
-    const [, , dir, subcommand] = words;
-    if (!dir || !/^[\w./-]+$/.test(dir) || dir.startsWith('/') || dir.includes('..')) return false;
-    if (!['status', 'diff', 'log', 'branch'].includes(subcommand) || !(await contained(workspaceRoot, dir, false)))
-      return false;
-    words.splice(1, 2); // Apply the configured prefix and argument checks to the same Git query.
-  }
-  const cmd = words.join(' ');
-  if (!prefixes.some((prefix) => cmd === prefix || cmd.startsWith(prefix + ' '))) return false;
-
-  const [program, subcommand, ...args] = words;
-  if (program === 'git') {
-    if (subcommand === 'branch') return args.every((arg) => branchQueryFlags.has(arg));
-    if (['diff', 'log', 'status'].includes(subcommand)) {
-      if (args.some((arg) => arg.startsWith('/') || arg.startsWith('~') || arg.split('/').includes('..')))
-        return false;
-      const separator = args.indexOf('--');
-      const options = separator < 0 ? args : args.slice(0, separator);
-      // Git accepts abbreviated long options. Keep file output and external helpers gated.
-      const unsafe = ['--output', '--ext-diff', '--textconv', '--no-index'];
-      return !options.some((arg) => {
-        const flag = arg.split('=', 1)[0];
-        return flag.startsWith('--') && unsafe.some((option) => option.startsWith(flag));
-      });
-    }
-  }
-  return !plan || cmd === 'ls' || cmd === 'pwd';
-}
-
-function allowedPath(root: string, target: string, write: boolean) {
-  const rel = path.relative(root, target);
-  if (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) return false;
-  if (!write) return true;
-  const parts = rel.toLowerCase().split(path.sep);
-  return !isHubScopePath(rel) &&
-    !parts.some(part => ['.git', '.claude', '.mcp.json'].includes(part));
-}
-
-async function contained(root: string, value: unknown, write: boolean) {
-  if (
-    typeof value !== 'string' ||
-    value.includes('\0') ||
-    value.startsWith('~') ||
-    value.split(path.sep).includes('..')
-  )
-    return false;
-  const target = path.resolve(root, value);
-  if (!allowedPath(root, target, write)) return false;
-  const resolved = await resolveWorkspacePath(root, target);
-  return resolved !== undefined && allowedPath(root, resolved, write);
-}
-
-async function resolveWorkspacePath(root: string, target: string) {
-  let prefix = target;
-  // Walk back only over missing components. A dangling symlink exists for lstat
-  // and must fail realpath instead of being treated as a new file.
-  while (prefix !== root) {
-    try {
-      await lstat(prefix);
-      break;
-    } catch (error) {
-      const { code } = error as NodeJS.ErrnoException;
-      // A linked Git worktree has a .git file. Resolve that existing prefix
-      // as well when a descendant cannot exist beneath a regular file.
-      if (code !== 'ENOENT' && code !== 'ENOTDIR') return undefined;
-      prefix = path.dirname(prefix);
-    }
-  }
-  try {
-    return path.join(await realpath(prefix), path.relative(prefix, target));
-  } catch {
-    return undefined;
-  }
-}
-
-async function blockedBashWrite(command: string, root: string) {
-  if (!bashWriteOperation.test(command)) return false;
-  for (const operand of new Set(bashOperands(command))) {
-    if (!operand) continue;
-    const target = path.resolve(root, operand);
-    if (isHubScopePath(path.relative(root, target))) return true;
-    if (!allowedPath(root, target, false)) continue;
-    const resolved = await resolveWorkspacePath(root, target);
-    if (resolved === undefined || isHubScopePath(path.relative(root, resolved))) return true;
-  }
-  return false;
-}
-// A rejected static path check (including a symlink into the host) must not
-// become eligible through the semantic fallback. Check quoted operands intact.
-async function bashOperandsContained(command: string, root: string) {
-  const write = bashWriteOperation.test(command);
-  for (const operand of new Set(bashOperands(command))) {
-    if (operand && operand !== '/dev/null' && !await contained(root, operand, write)) return false;
-  }
-  return true;
-}
-
 type GateChannel = Pick<SessionChannel, 'createNote' | 'syncStatusLabel'>;
 type GateContext = ({ channel: GateChannel } |
   { gitlab: Pick<GitLabClient, 'createIssueNote' | 'syncIssueStatusLabel'> }) & {
   allowedWorkspaceTools?: readonly ToolName[];
-  decision?: DecisionClient;
   config: AppConfig;
   repo: DetentRepository;
   session: IssueSessionRow;
@@ -208,17 +103,18 @@ export class PermissionGate {
     }
     return { behavior: 'allow', updatedInput: input };
   }
-  async preflight(name: string, input: Input): Promise<GateResult | 'ask' | { riskNote: string }> {
-    const { session: s, config, workspaceRoot, controller } = this.ctx;
+  async preflight(name: string, input: Input): Promise<GateResult | 'ask'> {
+    const { session: s, workspaceRoot, controller } = this.ctx;
     controller.signal.throwIfAborted();
-    // Prevent credential-bearing tool arguments from reaching an extension or an approval record.
-    const argumentsJson = JSON.stringify(input);
-    if (this.secrets.some(secret => argumentsJson.includes(JSON.stringify(secret).slice(1, -1))))
-      return deny('工具参数中含有服务端凭证，请移除后再试。');
     const effectiveReadOnly = s.permissionMode === 'plan' || this.readonly;
     const readOnlyReason = s.permissionMode === 'plan' && !this.readonly && s.sessionKind === 'issue'
       ? '尚未获批实施方案，请先调用 detent_submit_plan 提交方案供用户点 👍 批准。'
       : '当前模式仅允许只读操作';
+    if (name === 'Bash' && effectiveReadOnly) return deny(readOnlyReason);
+    // Prevent credential-bearing tool arguments from reaching an extension or an approval record.
+    const argumentsJson = JSON.stringify(input);
+    if (this.secrets.some(secret => argumentsJson.includes(JSON.stringify(secret).slice(1, -1))))
+      return deny('工具参数中含有服务端凭证，请移除后再试。');
     const allow: PermissionResult = { behavior: 'allow', updatedInput: input };
     const extension = this.extensionTools.get(name);
     if (extension) {
@@ -239,7 +135,11 @@ export class PermissionGate {
       if (!isWorkspaceTool(name) && name !== 'AskUserQuestion') return deny('未启用此工具');
     }
     if (isWorkspaceTool(name) && this.ctx.allowedWorkspaceTools && !this.ctx.allowedWorkspaceTools.includes(name)) return deny('未启用此工具');
-    if (name === 'Bash' && this.disableBash) return deny('当前角色禁用 Bash');
+    if (name === 'Bash') {
+      if (this.disableBash) return deny('当前角色禁用 Bash');
+      const reason = await validateLocalSandboxBash(input.command, workspaceRoot);
+      return reason ? deny('本地沙箱安全限制：' + reason) : allow;
+    }
     if (fileTools.has(name)) {
       const lookup = name === 'Glob' || name === 'Grep';
       if (
@@ -266,26 +166,9 @@ export class PermissionGate {
         return deny('此模式或路径不允许文件操作');
       return allow;
     }
-    if (name === 'Bash') {
-      const { command, description } = input;
-      if (typeof command === 'string' && await blockedBashWrite(command, workspaceRoot)) {
-        return deny('此路径不允许 Bash 写入');
-      }
-      if (!effectiveReadOnly && this.previousDecision(name, input)) return 'ask';
-      if (typeof command === 'string' && !isHardGatedLocalBash(command, workspaceRoot)) {
-        if (await safeCommand(command, config.safeBashPrefixes, effectiveReadOnly, workspaceRoot)) return allow;
-        if (this.ctx.decision && await bashOperandsContained(command, workspaceRoot)) {
-          const evaluation = await evaluateLocalBash(this.ctx.decision, command, description, effectiveReadOnly);
-          controller.signal.throwIfAborted();
-          if (evaluation.allowed) return { ...allow, jevConfidence: evaluation.confidence };
-          if (!effectiveReadOnly) return { riskNote: evaluation.riskNote };
-          return deny(readOnlyReason + ' ' + evaluation.riskNote);
-        }
-      }
-    }
     if (isWorkspaceTool(name) && (!effectiveReadOnly || allowedInPlan(name))) return allow;
     if (effectiveReadOnly && name !== 'AskUserQuestion') return deny(readOnlyReason);
-    if (name !== 'Bash' && name !== 'AskUserQuestion') return deny('未启用此工具');
+    if (name !== 'AskUserQuestion') return deny('未启用此工具');
     return 'ask';
   }
   private previousDecision(name: string, input: Input) {
@@ -294,7 +177,7 @@ export class PermissionGate {
   }
   private async decide(name: string, input: Input): Promise<GateResult> {
     const policy = await this.preflight(name, input);
-    if (policy !== 'ask' && !('riskNote' in policy)) return policy;
+    if (policy !== 'ask') return policy;
     const { session: s, repo, controller } = this.ctx;
     const extension = this.extensionTools.get(name);
     name = name.replace(/^mcp__detent__/, '');
@@ -312,7 +195,7 @@ export class PermissionGate {
     );
     try {
       const card = await extension?.renderApprovalCard?.(a.id, input, { ...this.extensionContext })
-        ?? renderToolApprovalCard({ ...a, toolInput: input }, this.ctx.workspaceRoot, policy === 'ask' ? undefined : policy.riskNote);
+        ?? renderToolApprovalCard(a);
       const note = await this.channel.createNote(renderNote(card, this.secrets));
       await repo.updateApprovalNoteId(a.id, note.id);
     } catch (error) {

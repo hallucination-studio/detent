@@ -68,14 +68,28 @@ export function redactSecrets(value: string, config: DeliveryConfig, ...addition
   return redactValues(value, [...authSecrets(config.jumpserverReadonlyAuth), ...authSecrets(config.jumpserverJobAuth), ...additionalSecrets]);
 }
 
-export function redactDeliveryOutput(value: string, config: DeliveryConfig, app: Partial<AppConfig>) {
-  return redactSecrets(redactGitUrl(value), config, app.gitlabToken ?? '', app.gitlabWebhookSecret ?? '', app.mysqlPassword ?? '',
-    app.jevApiKey ?? '', app.anthropicApiKey ?? '', ...Object.values(app.secrets ?? {}), ...(app.additionalSecrets ?? []));
+export function redactDeliveryOutput(value: string, config: DeliveryConfig, app: Partial<AppConfig>, truncated = false) {
+  if (truncated) value = value.replace(/(https?:\/\/oauth2:)[^\s/@]+$/i, '$1***');
+  return redactValues(redactGitUrl(value), [...authSecrets(config.jumpserverReadonlyAuth), ...authSecrets(config.jumpserverJobAuth),
+    app.gitlabToken ?? '', app.gitlabWebhookSecret ?? '', app.mysqlPassword ?? '', app.jevApiKey ?? '', app.anthropicApiKey ?? '', ...Object.values(app.secrets ?? {}), ...(app.additionalSecrets ?? [])], truncated);
 }
 
-export function redactValues(value: string, values: string[]) {
-  const forms = values.filter(Boolean).flatMap(secret => [secret, JSON.stringify(secret).slice(1, -1), encodeURIComponent(secret)]);
-  for (const form of [...new Set(forms)].sort((a, b) => b.length - a.length))
-    value = value.replaceAll(form, '***');
-  return value;
+export function redactValues(value: string, values: string[], truncated = false) {
+  const forms = [...new Set(values.filter(Boolean).flatMap(secret =>
+    [secret, JSON.stringify(secret).slice(1, -1), encodeURIComponent(secret)]))].sort((a, b) => b.length - a.length);
+  // Reserve enough lookahead to recognize a credential straddling the retained prefix.
+  // Track that boundary through replacements, including any mask spanning the boundary.
+  let end = truncated ? Math.max(0, value.length - (forms[0]?.length ?? 0)) : value.length;
+  for (const form of forms) {
+    if (!truncated) {
+      value = value.replaceAll(form, '***');
+      continue;
+    }
+    const previousEnd = end;
+    value = value.replaceAll(form, (_match, offset: number) => {
+      if (offset < previousEnd) end += 3 - Math.min(form.length, previousEnd - offset);
+      return '***';
+    });
+  }
+  return truncated ? value.slice(0, end) : value;
 }

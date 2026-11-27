@@ -192,41 +192,19 @@ node --env-file=.env packages/delivery/dist/server.js
 
 ---
 
-## Deterministic delivery E2E
+## Real-stack SOP E2E
 
-Both targets run the real bootstrap CLI, Delivery pods and Claude Code binary against MySQL 8.0. A loopback Anthropic SSE server scripts every model turn, and a local JumpServer fixture checks the uploaded playbook ZIP. Use Node.js 20.12+ and installed npm dependencies.
+Step 2 will supply the runners for these commands. The planned tests exercise Hub SOPs through real GitLab webhooks and check the resulting Issue and MR state against the session and approval records in MySQL.
 
 ```bash
-# Offline GitLab uses Git and git-http-backend
-npm run e2e:smoke
-npm run e2e:offline
-
-# Local GitLab CE 18.3.0 with E2E_GITLAB_ADMIN_TOKEN exported
-E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab
+npm run e2e:up    # Start the test stack
+npm run e2e       # Build Detent and run the SOP scenarios
+npm run e2e:down  # Tear down the test stack
 ```
 
-Each Claude turn connects to a token-authenticated MCP server on loopback HTTP. Tool approvals and questions checkpoint the transcript, release the Pod lease and resume in a fresh process after an authorized response. Use `jms_list_assets` to find hosts and `jms_shell` with a `commands` array to inspect them in one batch. After production approval, `jms_job` returns a job link and the turn ends. Delivery records the terminal result and wakes the same Issue for verification. `jms_job_status` can retrieve the result for a job owned by the session.
-
-Run `npm run e2e:offline -- --suite=jumpserver` for the JumpServer matrix, including a shell call lasting over 30 seconds. The other focused suites are `install`, `issues`, `mrs`, `concurrency`, and `security`.
-
-Set the live URL to the origin GitLab advertises for HTTP clones. Allow the GitLab container to send project webhooks to `host.docker.internal`. For another route, set `E2E_DETENT_PUBLIC_URL` to the address GitLab can reach and `E2E_POD_PORT` to the corresponding host listener port. Each live run leaves its own `e2e-*/workspace-hub` and three target projects for inspection and revokes its temporary tokens.
-
-The offline suite covers self-service repository onboarding alongside installation and upgrades, Issue workflows, MR workers, two-Pod concurrency, and security and event handling. The cluster shares MySQL and receives webhooks through a loopback proxy. The suite checks simultaneous SDK turns, competing approvals and watchdogs, credential redaction, and production guard denials.
-
-Both targets run bootstrap twice to verify Hub files, labels, hooks, and preservation of credentials and a customized SOP. They exercise Hub workflows and independent MR workers, including a newly onboarded payment repository.
-
-1. A missing capability produces guidance with zero model calls. An unlabeled Kafka investigation returns evidence. A follow-up in the same Issue produces a plan and, after approval, a configuration MR.
-2. Code delivery writes to two repositories. Closure is denied with two open MRs and again with one. The second merge triggers closure and archives both worktrees.
-3. A live edit to the release SOP publishes a pinned tag and Release after maintainer approval.
-4. A new hotfix SOP publishes only a tag and requires separate production-tier closure approval.
-5. Readonly audit verifies nginx on `web01` and closes with zero approval rows.
-6. Environment change resumes its plan after a pod restart. A human merges the Ansible MR and approves execution. The suite checks the pinned ZIP, successful execution audit, post-change inspection and empty sandbox.
-
-Both targets check inline review, MR progress traces, independent MR completion, and a standalone MR triggered by mention and assignment. Completed Issue workflows verify GitLab `closed` and `claude::done` alongside MySQL `DONE`. The offline driver also emits bot-triggered CI failures and a failed deployment to verify real branch pushes, live policy changes, mid-turn steering, and a Hub alert Issue.
-
-By default the suite starts a container from a locally cached `mysql:8.0` image. To use an existing local MySQL 8.0 instance, set `E2E_MYSQL_HOST=127.0.0.1`. The optional `E2E_MYSQL_PORT`, `E2E_MYSQL_USER`, `E2E_MYSQL_PASSWORD`, and `E2E_MYSQL_DATABASE` default to `3306`, `root`, an empty password, and `detent`. Use a dedicated test database. The harness creates the Detent tables and removes its session rows during teardown.
-
 ## Interactive Issue Workflow
+
+Each Claude turn connects to a token-authenticated MCP server on loopback HTTP. Tool approvals and questions checkpoint the transcript, release the Pod lease and resume in a fresh process after an authorized response. Use `jms_list_assets` to find hosts and `jms_shell` with a `commands` array to inspect them in one batch. After production approval, `jms_job` returns a job link and the turn ends. Delivery records the terminal result and wakes the same Issue for verification. `jms_job_status` can retrieve the result for a job owned by the session.
 
 ### Issue closure
 

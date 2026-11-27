@@ -1,8 +1,9 @@
+import { spawnSync } from 'node:child_process';
 import { expect, it, vi } from 'vitest';
 import type { DecisionClient } from '@detent/core';
 import { InMemoryDetentRepository } from '../../core/tests/memory-repository.js';
 import { loadDeliveryConfig } from '../src/config.js';
-import { isHardBlockedRemoteInspectCommand } from '../src/jumpserver/guards.js';
+import { buildBatchShellScript, isHardBlockedRemoteInspectCommand, validateShellCommands } from '../src/jumpserver/guards.js';
 import { createJumpServerTools } from '../src/jumpserver/tools.js';
 
 async function inspectGuard(choice = 'pure_readonly', noul = 0.79, score = 0.76, enableJev = true) {
@@ -10,13 +11,13 @@ async function inspectGuard(choice = 'pure_readonly', noul = 0.79, score = 0.76,
     effect: { type: 'choice', choice }, zero_side_effect: { type: 'noul', noul }, impact: { type: 'score', score },
   });
   const decision = enableJev ? { provider: 'bailian' as const, threshold: 0.9, decide } : undefined;
-  const client = { listAssets: vi.fn(), runReadonlyInspect: vi.fn(), runAnsibleJob: vi.fn(), getJobResult: vi.fn() };
+  const client = { listAssets: vi.fn(), runShell: vi.fn(), runAnsibleJob: vi.fn(), getJobResult: vi.fn() };
   const tools = createJumpServerTools({ client, config: loadDeliveryConfig({}), decision });
-  const guard = tools.find(tool => tool.name === 'jms_readonly_inspect')!.guard!;
+  const guard = tools.find(tool => tool.name === 'jms_shell')!.guard!;
   const repo = new InMemoryDetentRepository();
   const session = await repo.getOrCreateSession(1, 2, 'inspect');
   const ctx = { session, repo, workspaceRoot: '.', permissionMode: 'plan' as const, workflow: { allowPrefixes: ['kafka-topics.sh'] } };
-  return { decide, inspect: (command: string) => guard({ command, asset_ids: ['web01'] }, ctx) };
+  return { decide, inspect: (command: string) => guard({ commands: [command], asset_ids: ['web01'] }, ctx) };
 }
 
 const pipeline = 'ps -ef | grep -i kafka | grep -v grep';
@@ -54,4 +55,45 @@ it('hard-blocks unsafe commands before prefix matching and Jev', async () => {
     expect(await inspect(command), command).toMatchObject({ ok: false, reason: expect.stringContaining('硬性') });
   }
   expect(decide).not.toHaveBeenCalled();
+});
+
+it('starts every eligible Jev check together and preserves the order of the validated batch', async () => {
+  const verdict = {
+    effect: { type: 'choice', choice: 'pure_readonly' }, zero_side_effect: { type: 'noul', noul: 1 }, impact: { type: 'score', score: 0 },
+  } as const;
+  let release!: () => void;
+  const waiting = new Promise<void>(resolve => { release = resolve; });
+  const decide = vi.fn<DecisionClient['decide']>(async () => { await waiting; return verdict; });
+  const decision = { provider: 'custom' as const, threshold: 0.9, decide };
+  const quoted = "ps aux | grep 'two  words'";
+  const commands = ['  uptime ', 'date', 'df\t -h', quoted];
+  const result = validateShellCommands(commands, ['uptime', 'df -h'], decision);
+  expect(decide.mock.calls.map(([ctx]) => ctx)).toEqual(['date', quoted].map(command => ({ surface: 'remote_jumpserver_readonly_inspect', command })));
+  release();
+  expect(await result).toEqual({ ok: true, commands: ['uptime', 'date', 'df -h', quoted] });
+
+  decide.mockClear();
+  expect((await validateShellCommands(Array(10).fill('uptime'), ['uptime'], decision)).ok).toBe(true);
+  for (const batch of [[], Array(11).fill('uptime'), ['date', 'uptime', 'cat /etc/shadow']])
+    expect(await validateShellCommands(batch, ['uptime'], decision)).toMatchObject({ ok: false });
+  expect(decide).not.toHaveBeenCalled();
+  expect(await validateShellCommands(['uptime', 'date'], ['uptime'])).toMatchObject({ ok: false, reason: expect.stringContaining('date') });
+  decide.mockResolvedValueOnce(verdict).mockResolvedValueOnce({ ...verdict, effect: { type: 'choice', choice: 'ambiguous' } });
+  expect(await validateShellCommands(commands, ['uptime', 'df -h'], decision)).toMatchObject({
+    ok: false, reason: expect.stringContaining(`命令「${quoted}」未通过只读校验`),
+  });
+});
+
+it('quotes batch headers literally and preserves each exit status while continuing the batch', () => {
+  const quoted = "printf '%s\\n' 'space  and %s'";
+  expect(buildBatchShellScript([quoted])).toBe(quoted);
+  const script = buildBatchShellScript([quoted, 'false', 'true']);
+  expect(script).toMatch(/^set \+e\n/);
+  expect(script).toContain("printf '=== [%d/%d] %s ===\\n' 1 3 'printf '\\''%s");
+  const run = spawnSync('sh', ['-c', script], { encoding: 'utf8' });
+  expect(run.stderr).toBe('');
+  expect(run.status).toBe(1);
+  expect(run.stdout.split('\n')).toEqual([
+    `=== [1/3] ${quoted} ===`, 'space  and %s', '[rc=0]', '=== [2/3] false ===', '[rc=1]', '=== [3/3] true ===', '[rc=0]', '',
+  ]);
 });

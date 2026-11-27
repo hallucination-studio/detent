@@ -1,7 +1,10 @@
 import { logError, type DecisionClient } from '@detent/core';
 
 const deny = (reason: string) => ({ ok: false as const, reason });
-export const normalizeInspectCommand = (command: string) => command.trim().replace(/[ \t]+/g, ' ');
+export function normalizeShellCommand(command: string) {
+  // Whitespace inside a quoted argument is data.
+  return /['"]/.test(command) ? command.trim() : command.trim().replace(/[ \t]+/g, ' ');
+}
 
 function readonlyKubectlGet(args: string[]) {
   for (let i = 0; i < args.length; i++) {
@@ -46,14 +49,14 @@ export function validateReadonlyInspectCommand(command: string, allowPrefixes: r
   if (isHardBlockedRemoteInspectCommand(command))
     return { ...deny('巡检命令触发硬性安全限制（禁止危险操作、命令组合或读取敏感文件）'), hardBlocked: true as const };
   if (/[^\w ./=:@%+,^\t-]/.test(command)) return deny('巡检命令不匹配只读前缀');
-  const normalized = normalizeInspectCommand(command);
+  const normalized = normalizeShellCommand(command);
   const words = normalized.split(' ');
   const [executable, ...args] = words;
   const program = installedProgram(executable);
   if (!readonlyArguments([program, ...args])) return deny('巡检命令参数不在只读白名单');
 
   const allowed = allowPrefixes.some(value => {
-    const prefix = normalizeInspectCommand(value);
+    const prefix = normalizeShellCommand(value);
     if (!prefix) return false;
     const [prefixProgram, ...prefixArgs] = prefix.split(' ');
     if (prefixProgram !== executable && prefixProgram !== program) return false;
@@ -193,4 +196,33 @@ export async function evaluateRemoteInspectCommand(decision: DecisionClient, com
     const detail = logError('jumpserver-guard', error);
     return { allowed: false, reason: '只读巡检 Jev 评估失败：' + detail };
   }
+}
+
+export async function validateShellCommands(commands: readonly string[], allowPrefixes: readonly string[], decision?: DecisionClient) {
+  if (!Array.isArray(commands) || !commands.length || commands.length > 10) return deny('每次巡检必须传入 1 至 10 条命令');
+  const pending: string[] = [];
+  for (const command of commands) {
+    if (typeof command !== 'string') return deny('巡检命令必须为字符串');
+    const check = validateReadonlyInspectCommand(command, allowPrefixes);
+    if (check.ok) continue;
+    if ('hardBlocked' in check || !decision) return deny(`命令「${command}」未通过只读校验：${check.reason}`);
+    pending.push(normalizeShellCommand(command));
+  }
+  if (decision && pending.length) {
+    const results = await Promise.all(pending.map(cmd => evaluateRemoteInspectCommand(decision, cmd)));
+    for (const [i, res] of results.entries())
+      if (!res.allowed) return deny(`命令「${pending[i]}」未通过只读校验：${res.reason}`);
+  }
+  return { ok: true as const, commands: commands.map(normalizeShellCommand) };
+}
+
+export function buildBatchShellScript(commands: readonly string[]) {
+  if (commands.length === 1) return commands[0];
+  const lines = ['set +e', 'batch_rc=0'];
+  for (const [index, cmd] of commands.entries()) {
+    const quoted = "'" + cmd.replaceAll("'", "'\\''") + "'";
+    lines.push(`printf '=== [%d/%d] %s ===\\n' ${index + 1} ${commands.length} ${quoted}`,
+      '(', cmd, ')', 'rc=$?', `printf '[rc=%d]\\n' "$rc"`, '[ "$rc" -eq 0 ] || batch_rc=$rc');
+  }
+  return [...lines, 'exit "$batch_rc"'].join('\n');
 }

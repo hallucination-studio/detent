@@ -20,7 +20,6 @@ const ConfigSchema = z.object({
   mrMaxAutoFixAttempts: z.coerce.number().int().min(0).max(10).default(3),
   watchdogIntervalMs: z.coerce.number().int().refine(ms => ms === 0 || ms >= 15000).default(30000),
   watchdogMaxRecoveries: z.coerce.number().int().min(0).max(5).default(1),
-  hotHoldTimeoutMs: z.coerce.number().default(180_000),
 
   gitlabBaseUrl: z.string().url().default('http://localhost:8080'),
   detentPublicUrl: serviceUrl.transform(value => new URL(value).href.replace(/\/+$/, '').replace(/\/webhooks\/gitlab$/, '').replace(/\/+$/, '')).optional(),
@@ -78,7 +77,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     mrMaxAutoFixAttempts: env.MR_MAX_AUTO_FIX_ATTEMPTS?.trim() || undefined,
     watchdogIntervalMs: env.WATCHDOG_INTERVAL_MS?.trim() || undefined,
     watchdogMaxRecoveries: env.WATCHDOG_MAX_RECOVERIES?.trim() || undefined,
-    hotHoldTimeoutMs: env.HOT_HOLD_TIMEOUT_MS,
 
     gitlabBaseUrl: env.GITLAB_BASE_URL,
     detentPublicUrl: env.DETENT_PUBLIC_URL?.trim() || undefined,

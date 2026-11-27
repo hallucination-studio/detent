@@ -3,7 +3,6 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { AppConfig } from '../config.js';
 import type { DetentRepository } from '../db/repository.js';
 import type { ApprovalRequestRow, IssueSessionRow, ParsedUserIntent, SessionInboxRow } from '../types.js';
-import type { PermissionGate } from '../claude/permission-gate.js';
 import type { SessionLifecycleHooks } from '../extensions.js';
 import { configuredSecrets, redactGitUrl } from '../gitlab/redact.js';
 import { resolveApproval } from './lifecycle.js';
@@ -12,7 +11,7 @@ import type { SessionChannel } from './channel.js';
 
 export class SessionBusy extends Error {}
 export class StopTurn extends Error {}
-export type Active = { owner: string; controller: AbortController; ownsLease: boolean; gate?: PermissionGate };
+export type Active = { owner: string; controller: AbortController; ownsLease: boolean };
 
 export function formatInboxMessages(items: SessionInboxRow[], secret?: string | readonly string[]) {
   return redactGitUrl(items.map(item => `@${item.senderUsername ?? 'GitLab'}: ${item.content}`).join('\n\n'), secret);
@@ -90,12 +89,10 @@ export class TurnRuntime {
     if (!(await resolveApproval(
       this.repo, s, pending.id, status, intent.username, comment, this.hooks?.onApprovalResolved, this.secrets,
     ))) return;
-    if (await this.active.get(s.id)?.gate?.notify(pending.id)) return;
     const expected = pending.approvalType === 'PLAN' ? 'WAITING_PLAN' : 'WAITING_TOOL';
-    const stillWaiting = async (session: IssueSessionRow | null) =>
-      session?.status === expected && (await this.repo.getLatestApproval(s.id))?.id === pending.id;
+    const currentCard = async () => (await this.repo.getLatestApproval(s.id))?.id === pending.id;
     await this.withLease(s, async (session, active) => {
-      if (!(await stillWaiting(session))) return;
+      if (session.status !== expected || !await currentCard()) return;
       if (pending.approvalType === 'PLAN') {
         const approved = status === 'APPROVED';
         session.permissionMode = approved ? 'default' : 'plan';
@@ -107,7 +104,14 @@ export class TurnRuntime {
         const prompt = `GitLab 审批结果 ${status}，工具 ${decision.toolName}，参数 ${JSON.stringify(decision.toolInput)}。审批说明：${comment ?? ''}`;
         await run(session, active, prompt, decision);
       }
-    }, async () => stillWaiting(await this.repo.getSession(s.id)));
+    }, async () => {
+      const current = await this.repo.getSession(s.id);
+      if (!current) return false;
+      // A vote can arrive after the card appears but before its publisher saves WAITING_TOOL.
+      const publishing = s.lockedByPod && current.lockedByPod === s.lockedByPod &&
+        current.status === s.status && ['PLANNING', 'CODING'].includes(current.status);
+      return (current.status === expected || !!publishing) && await currentCard();
+    });
   }
   protected async expire(s: IssueSessionRow) {
     for (let pending = await this.repo.getLatestPendingApproval(s.id); pending; pending = await this.repo.getLatestPendingApproval(s.id)) {

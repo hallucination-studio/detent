@@ -220,3 +220,39 @@ it('dispatches an HTTP note into the inbox before the opening webhook releases i
     for (const mock of [schema, identity, lookup, inbox, lease, opened]) mock.mockRestore();
   }
 });
+
+it('deduplicates system callbacks and preserves the stored mode for system-only batches', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'detent-callback-'));
+  try {
+    const { repo, pod, other, run } = await setup(root);
+    const s = await repo.getOrCreateSession(1, 5, 'callback');
+    const mr = await repo.getOrCreateMrSession(1, 5, 'MR');
+    expect(await pod.deliverSystemEvent('missing', 'job/1', 'ignored')).toBe(false);
+    expect(await pod.deliverSystemEvent(mr.id, 'job/1', 'ignored')).toBe(false);
+    const turns: [string, string][] = [];
+    run.mockImplementation(async t => {
+      turns.push([t.prompt, t.session.permissionMode]);
+      if (turns.length === 1) {
+        expect(await other.deliverSystemEvent(s.id, 'job/2', 'private-key', { sender: 'worker' })).toBe(true);
+      }
+      return 'done';
+    });
+    await repo.updateSessionState(s.id, { status: 'IDLE', permissionMode: 'default' });
+    expect(await pod.deliverSystemEvent(s.id, 'job/1', 'completed private-key')).toBe(true);
+    expect(await other.deliverSystemEvent(s.id, 'job/1', 'duplicate')).toBe(false);
+    expect(turns).toEqual([['@detent: completed ***', 'default'], ['@worker: ***', 'default']]);
+
+    await repo.updateSessionState(s.id, { status: 'WAITING_TOOL', permissionMode: 'default' });
+    expect(await pod.deliverSystemEvent(s.id, 'job/3', 'queued')).toBe(true);
+    expect(run).toHaveBeenCalledTimes(2);
+    await repo.enqueueSessionInbox({ sessionId: s.id, eventId: 'human', sourceKind: 'note', senderUsername: 'dev', content: 'new request' });
+    await repo.updateSessionState(s.id, { status: 'IDLE' });
+    await pod.wakeSession(s, 'inbox');
+    expect(turns.at(-1)).toEqual(['@detent: queued\n\n@dev: new request', 'plan']);
+    await repo.updateSessionState(s.id, { status: 'DONE' });
+    expect(await pod.deliverSystemEvent(s.id, 'job/4', 'ignored')).toBe(false);
+    expect(await repo.drainSessionInbox(s.id)).toEqual([]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

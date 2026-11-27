@@ -61,7 +61,7 @@ it.each(['injected', 'http', 'disabled'] as const)('assembles %s tools alongside
   const config = loadConfig({ GITLAB_WEBHOOK_SECRET: 'test', DETENT_PUBLIC_URL: 'https://hub.example' });
   const deliveryConfig = loadDeliveryConfig(mode === 'http' ? { JUMPSERVER_BASE_URL: 'https://jms.test' } : {});
   const client: JumpServerClient = {
-    listAssets: vi.fn(), runReadonlyInspect: vi.fn(), runAnsibleJob: vi.fn(), getJobResult: vi.fn(),
+    listAssets: vi.fn(), runShell: vi.fn(), runAnsibleJob: vi.fn(), getJobResult: vi.fn(),
   };
   const custom = defineExtensionTool({ name: 'custom', description: 'test', policy: 'readonly', schema: {}, execute: vi.fn() });
   const tools = [custom];
@@ -78,7 +78,7 @@ it.each(['injected', 'http', 'disabled'] as const)('assembles %s tools alongside
     expect(release.tools.map(tool => tool.name)).toEqual(['detent_list_tags', 'detent_create_release']);
     expect(jumpserver).toMatchObject({ name: 'jumpserver', enabled: mode !== 'disabled', setupHint: expect.stringContaining('jumpserver.base_url') });
     expect(jumpserver.tools.map(tool => tool.name)).toEqual(mode === 'disabled' ? [] :
-      ['jms_list_assets', 'jms_readonly_inspect', 'jms_run_ansible_job', 'jms_get_job_result']);
+      ['jms_list_assets', 'jms_shell', 'jms_job', 'jms_job_status']);
   } finally {
     await app.close();
   }
@@ -293,7 +293,7 @@ it('rebuilds single-key capability packs from successive Hub revisions', async (
       resolver({ ...ctx, document: { present: true, invalid: false, entries } });
     expect((await resolve({ jumpserver: entry }))[0]).toMatchObject({ enabled: false, setupHint: expect.stringContaining('jumpserver.base_url') });
     entry.base_url = 'https://jms.test';
-    expect((await resolve({ jumpserver: entry }))[0]).toMatchObject({ enabled: true, tools: expect.arrayContaining([expect.objectContaining({ name: 'jms_readonly_inspect' })]) });
+    expect((await resolve({ jumpserver: entry }))[0]).toMatchObject({ enabled: true, tools: expect.arrayContaining([expect.objectContaining({ name: 'jms_shell' })]) });
     expect((await resolve({ jumpserver: { ...entry, auth: { token: '$secret:MISSING' } } }))[0].setupHint).toBe('服务端缺少密钥 DETENT_SECRET_MISSING');
     for (const override of [{ enabled: false }, { base_url: 'https://user:pass@jms.test' }, { block_failed_pipeline: 'false' }])
       expect((await resolve({ jumpserver: { ...entry, ...override } }))[0]).toMatchObject({ enabled: false, tools: [] });
@@ -301,4 +301,66 @@ it('rebuilds single-key capability packs from successive Hub revisions', async (
     expect((await resolve({ release }))[0]).toMatchObject({ name: 'release', enabled: true });
     expect((await resolve({ release: { ...release, enabled: false } }))[0]).toMatchObject({ enabled: false, tools: [] });
   } finally { await app.close(); }
+});
+
+it.each(['live Hub', 'static client', 'on-demand status'])('delivers one redacted callback through the %s and drains the poller on close', async mode => {
+  pool.query.mockResolvedValue([[], []]);
+  const config = loadConfig({ GITLAB_WEBHOOK_SECRET: 'hook-secret', DETENT_SECRET_JMS: 'hub-token' });
+  const row = {
+    id: 'id', sessionId: 'session', mrId: 'mr', approvalId: 'approval', agentProfile: 'env-change',
+    jumpserverJobId: 'job-123', jumpserverJobUrl: 'https://jms.test/ui/#/workbench/ops/executions/job-123', commitSha: 'abcde123',
+    playbookPath: 'deploy/run.yml', targetAssets: ['web'], status: 'RUNNING' as const, outputSummary: null, createdAt: new Date(), finishedAt: null,
+  };
+  let pending = true;
+  const tracker = {
+    recordExecution: vi.fn(), hasSessionJob: vi.fn(async () => true), listSessionExecutions: vi.fn(async () => [row]),
+    listPendingExecutions: vi.fn(async () => pending ? [row] : []),
+    acknowledgeCallback: vi.fn(async () => {}),
+    completeExecution: vi.fn(async () => { const won = pending; pending = false; return won; }),
+  };
+  const client = { listAssets: vi.fn(), runShell: vi.fn(), runAnsibleJob: vi.fn(), getJobResult: vi.fn(async () => ({
+    jobId: row.jumpserverJobId, jobUrl: row.jumpserverJobUrl, status: 'SUCCESS' as const, outputSummary: 'ready hub-token hook-secret',
+  })) };
+  const file = vi.spyOn(GitLabClient.prototype, 'getRepositoryFile').mockResolvedValue(mode === 'live Hub' ? JSON.stringify({
+    ops: { type: 'jumpserver', base_url: 'https://jms.test', auth: { token: '$secret:JMS' } },
+  }) : null);
+  vi.spyOn(GitLabClient.prototype, 'initBotIdentity').mockResolvedValue();
+  const deliver = vi.spyOn(SessionOrchestrator.prototype, 'deliverSystemEvent').mockResolvedValue(true);
+  const fetch = vi.fn<typeof globalThis.fetch>(async (url, init) => {
+    expect(String(url)).toMatch(/^https:\/\/jms\.test\/api\/v1\/ops\/job-execution\//);
+    expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer hub-token');
+    return Response.json(String(url).includes('task-detail') ? { status: 'success', summary: {} } : { result: { stdout: 'ready hub-token hook-secret' } });
+  });
+  vi.stubGlobal('fetch', fetch);
+  const cleanup = vi.fn();
+  const app = createDeliveryApp(config, {
+    executionTracker: tracker, jumpserverClient: mode === 'live Hub' ? undefined : client,
+    deliveryConfig: loadDeliveryConfig({ DELIVERY_JOB_POLL_INTERVAL_MS: mode === 'on-demand status' ? '0' : '10' }),
+    onReady: () => cleanup,
+  });
+  try {
+    await app.ready();
+    if (mode === 'on-demand status') {
+      const packs = vi.mocked(createDetentApp).mock.lastCall![1]!.capabilities!;
+      const status = packs.find(pack => pack.name === 'jumpserver')!.tools.find(tool => tool.name === 'jms_job_status')!;
+      const repo = new InMemoryDetentRepository();
+      const session = { ...await repo.getOrCreateSession(1, 2, 'check'), id: row.sessionId };
+      for (let i = 0; i < 2; i++) await status.execute({ job_id: row.jumpserverJobId }, { session, repo, workspaceRoot: '.', permissionMode: 'plan' });
+      expect(tracker.listPendingExecutions).not.toHaveBeenCalled();
+    }
+    await vi.waitFor(() => expect(deliver).toHaveBeenCalledOnce());
+    const [[session, event, message, options]] = deliver.mock.calls;
+    expect([session, event, options]).toEqual(['session', 'jms-job:job-123', { sender: 'jumpserver' }]);
+    for (const field of ['SUCCESS', row.jumpserverJobId, row.jumpserverJobUrl, row.playbookPath, row.commitSha, 'ready *** ***'])
+      expect(message).toContain(field);
+    expect(message).not.toMatch(/hub-token|hook-secret/);
+    if (mode === 'live Hub') expect(fetch).toHaveBeenCalledTimes(2);
+    else expect(fetch).not.toHaveBeenCalled();
+    if (mode !== 'on-demand status') expect(file).toHaveBeenCalledExactlyOnceWith(config.gitlabHubProjectId, 'capabilities.json', config.gitlabHubDefaultBranch);
+  } finally {
+    await app.close();
+    expect(cleanup).toHaveBeenCalledOnce();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  }
 });

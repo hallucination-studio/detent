@@ -12,7 +12,7 @@ const record: DeliveryExecutionRecord = {
 const row: DeliveryExecutionRow = { ...record, id: 'id', createdAt: new Date(), finishedAt: null, outputSummary: null };
 
 function setup() {
-  const query = vi.fn(), execute = vi.fn();
+  const query = vi.fn().mockResolvedValue([[{ Key_name: 'pending_executions' }]]), execute = vi.fn();
   const pool = { query, execute } as unknown as Pool;
   return { repo: new MySqlDeliveryAuditRepository(), query, execute, pool };
 }
@@ -27,7 +27,7 @@ it('attaches the shared pool only after all foreign keys and indexes are ready',
   ]) await expect(call()).rejects.toThrow('initialized');
   expect(execute).not.toHaveBeenCalled();
   await repo.init(pool);
-  const ddl = query.mock.lastCall![0];
+  const ddl = query.mock.calls.find(([sql]) => sql.startsWith('CREATE TABLE'))![0];
   for (const clause of ['CREATE TABLE IF NOT EXISTS delivery_executions', 'target_assets JSON NOT NULL',
     'REFERENCES issue_sessions(id)', 'REFERENCES session_merge_requests(id)', 'REFERENCES approval_requests(id)',
     'UNIQUE (session_id, jumpserver_job_id)', 'INDEX (session_id, created_at)', 'ENGINE=InnoDB', 'utf8mb4_bin'])
@@ -72,4 +72,28 @@ it('loads chronological executions with native or serialized JSON and renders au
     row.status, row.jumpserverJobUrl, row.approvalId]) expect(markdown).toContain(field);
   expect(markdown).not.toContain(row.commitSha);
   expect(formatDeliveryExecutionsStatus([])).toBeNull();
+});
+
+it('scans only the oldest 50 unfinished rows and completes them by session-scoped compare-and-set', async () => {
+  const { repo, pool, execute } = setup();
+  await repo.init(pool);
+  execute.mockResolvedValueOnce([[{ ...row, targetAssets: '["web01"]' }]])
+    .mockResolvedValueOnce([{ affectedRows: 1 }]).mockResolvedValueOnce([{ affectedRows: 0 }]);
+  expect(await repo.listPendingExecutions()).toEqual([row]);
+  expect(execute).toHaveBeenCalledWith(expect.stringContaining("WHERE status IN ('PENDING', 'RUNNING') OR callback_pending=TRUE ORDER BY created_at ASC LIMIT 50"), []);
+  expect(await repo.completeExecution('session', 'job', 'SUCCESS', 'ok')).toBe(true);
+  expect(await repo.completeExecution('session', 'job', 'FAILED', 'late')).toBe(false);
+  expect(execute).toHaveBeenLastCalledWith(expect.stringContaining(
+    "finished_at=COALESCE(finished_at, NOW(3)) WHERE session_id=? AND jumpserver_job_id=? AND status IN ('PENDING', 'RUNNING')",
+  ), ['FAILED', 'late', 'session', 'job']);
+});
+
+it('upgrades the scan index on existing installations and tolerates a second Pod creating it first', async () => {
+  const { repo, pool, query } = setup();
+  query.mockResolvedValueOnce([[], []]).mockResolvedValueOnce([[], []])
+    .mockRejectedValueOnce(Object.assign(Error('duplicate index'), { code: 'ER_DUP_KEYNAME' }));
+  await repo.init(pool);
+  expect(query).toHaveBeenCalledWith('ALTER TABLE delivery_executions ADD INDEX pending_executions (status, created_at)');
+  query.mockResolvedValueOnce([[], []]).mockResolvedValueOnce([[], []]).mockRejectedValueOnce(Error('DDL denied'));
+  await expect(repo.init(pool)).rejects.toThrow('DDL denied');
 });

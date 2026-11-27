@@ -236,7 +236,6 @@ export class MergeRequestOrchestrator extends TurnRuntime {
         profile: { readonly }, decision: this.options.decision, previousDecision, allowedWorkspaceTools: mrWorkspaceTools,
         extensionTools: createMrTools(this.gitlab, mr, host, sandbox, tree),
         checkpoint: async () => { await flush(); await host.checkpoint(sandbox!, s.id); } });
-      active.gate = gate;
       const pipeline = mr.head_pipeline ?? (await this.gitlab.listPipelines(s.hubProjectId, mr.iid))[0]
         ?? (await this.gitlab.listPipelines(mr.source_project_id, mr.source_branch))[0];
       const jobs = pipeline?.status === 'failed' ? await this.gitlab.getPipelineJobs(pipeline.project_id ?? mr.source_project_id, pipeline.id) : [];
@@ -292,7 +291,6 @@ export class MergeRequestOrchestrator extends TurnRuntime {
         }
       }
     } finally {
-      active.gate = undefined;
       if (sandbox) await host.destroy(sandbox);
     }
   }

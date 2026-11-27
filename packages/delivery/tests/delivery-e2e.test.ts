@@ -11,7 +11,7 @@ import { dispatchWebhook } from '../../core/src/gitlab/webhook.js';
 import { WebhookQueue } from '../../core/src/gitlab/webhook-queue.js';
 import { git } from '../../core/src/workspace/ephemeral-sandbox.js';
 import {
-  createDeliveryTurnProfileResolver, createJumpServerTools, formatDeliveryExecutionsStatus, matchMergeRequestWebhook,
+  DeliveryJobPoller, createDeliveryTurnProfileResolver, createJumpServerTools, formatDeliveryExecutionsStatus, matchMergeRequestWebhook,
   type DeliveryAuditRepository, type DeliveryExecutionRow,
 } from '../src/index.js';
 import { deliveryFixture, developer, hub, issue, maintainer, opened } from './delivery-fixture.js';
@@ -24,9 +24,13 @@ it('governs Issue #88 through inspection, Plan, MR !205, production approval, ex
       rows.push({ ...record, id: randomUUID(), createdAt: new Date(), finishedAt: null, outputSummary: null });
     },
     async hasSessionJob(session, job) { return rows.some(r => r.sessionId === session && r.jumpserverJobId === job); },
-    async updateExecutionResult(session, job, status, outputSummary) {
-      const row = rows.find(r => r.sessionId === session && r.jumpserverJobId === job)!;
+    async listPendingExecutions() { return rows.filter(r => r.status === 'PENDING' || r.status === 'RUNNING'); },
+    acknowledgeCallback: vi.fn(async () => {}),
+    async completeExecution(session, job, status, outputSummary) {
+      const row = rows.find(r => r.sessionId === session && r.jumpserverJobId === job);
+      if (!row || row.finishedAt) return false;
       Object.assign(row, { status, outputSummary, finishedAt: new Date() });
+      return true;
     },
     async listSessionExecutions(session) { return rows.filter(r => r.sessionId === session); },
   };
@@ -41,13 +45,13 @@ it('governs Issue #88 through inspection, Plan, MR !205, production approval, ex
   gitlab.createMergeRequest.mockResolvedValue({ iid: 205, title: issue.title, web_url: mrUrl,
     state: 'opened', source_branch: branch, target_branch: 'main' });
   const job = { target_project_id: 2, mr_iid: 205, playbook_path: playbook, asset_ids: ['web01'], commit_sha: '' };
-  const inspect = { asset_ids: job.asset_ids, command: 'systemctl status nginx' };
+  const inspect = { asset_ids: job.asset_ids, commands: ['systemctl status nginx'] };
   const planReport = 'Inspect web01, reload nginx after review, verify health and roll back on failure.';
   const finalReport = 'Reload verified on web01.';
   const run = vi.fn<(turn: TurnInput) => Promise<string>>()
     .mockImplementationOnce(async ({ gate }) => {
       expect(await gate.invokeExtension('mcp__detent__jms_list_assets', {})).toMatchObject([{ id: 'web01' }]);
-      expect(await gate.invokeExtension('mcp__detent__jms_readonly_inspect', inspect)).toMatchObject({ outputSummary: 'active' });
+      expect(await gate.invokeExtension('mcp__detent__jms_shell', inspect)).toMatchObject({ outputSummary: 'active' });
       expect(await gate.preflight('Bash', { command: 'git status' })).toMatchObject({ behavior: 'deny' });
       return planReport;
     })
@@ -60,15 +64,22 @@ it('governs Issue #88 through inspection, Plan, MR !205, production approval, ex
       await writeFile(file, '- hosts: all\n  tasks:\n    - ansible.builtin.service: { name: nginx, state: reloaded }\n');
       job.commit_sha = String(await tools.invoke('detent_commit_and_push', { directory_name: dir, commit_message: issue.title }));
       await tools.invoke('detent_create_mr', { project: 2, source_branch: branch, target_branch: 'main', title: issue.title });
-      await expect(gate.invokeExtension('mcp__detent__jms_run_ansible_job', job)).rejects.toThrow('尚未合并');
+      await expect(gate.invokeExtension('mcp__detent__jms_job', job)).rejects.toThrow('尚未合并');
       return 'Please review and merge ' + mrUrl;
     })
     .mockImplementationOnce(async ({ gate, prompt }) => {
       expect(prompt).toContain(job.commit_sha);
-      const result = await gate.invokeExtension('mcp__detent__jms_run_ansible_job', job);
-      expect(result).toMatchObject({ jobId: 'job-88', status: 'PENDING' });
-      expect(await gate.invokeExtension('mcp__detent__jms_get_job_result', { job_id: 'job-88' })).toMatchObject({ status: 'SUCCESS' });
-      expect(await gate.invokeExtension('mcp__detent__jms_readonly_inspect', inspect)).toMatchObject({ outputSummary: 'active' });
+      await gate.invokeExtension('mcp__detent__jms_job', job);
+      throw Error('Expected production approval hold');
+    })
+    .mockImplementationOnce(async ({ gate }) => {
+      const result = await gate.invokeExtension('mcp__detent__jms_job', job);
+      expect(result).toMatchObject({ jobId: 'job-88', status: 'PENDING', asyncCallback: true });
+      return 'Submitted https://jms.test/job-88';
+    })
+    .mockImplementationOnce(async ({ gate, prompt }) => {
+      expect(prompt).toContain('nginx reloaded');
+      expect(await gate.invokeExtension('mcp__detent__jms_shell', inspect)).toMatchObject({ outputSummary: 'active' });
       return finalReport;
     });
   const orchestrator = new SessionOrchestrator(config, repo, gitlab, {
@@ -138,11 +149,20 @@ it('governs Issue #88 through inspection, Plan, MR !205, production approval, ex
     await queue.drain();
     expect(client.runAnsibleJob).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ commitSha: job.commit_sha, playbookPath: playbook }));
     expect(await repo.getApproval(approval.id)).toMatchObject({ status: 'APPROVED', decidedBy: maintainer.username });
+    expect(rows[0].status).toBe('PENDING');
+    expect(client.getJobResult).not.toHaveBeenCalled();
+    const poller = new DeliveryJobPoller({
+      auditRepo: tracker, resolveClient: () => client, report,
+      async onCompleted(row, result) {
+        await orchestrator.deliverSystemEvent(row.sessionId, 'jms-job:' + row.jumpserverJobId, result.outputSummary, { sender: 'jumpserver' });
+      },
+    });
+    await poller.pollOnce();
     expect(rows).toMatchObject([{
       sessionId: session.id, mrId: mr.id, approvalId: approval.id, agentProfile: 'env-change', jumpserverJobId: 'job-88',
       playbookPath: playbook, commitSha: job.commit_sha, targetAssets: ['web01'], status: 'SUCCESS', outputSummary: 'nginx reloaded',
     }]);
-    expect(client.runReadonlyInspect).toHaveBeenCalledTimes(2);
+    expect(client.runShell).toHaveBeenCalledTimes(2);
     expect(await repo.getSession(session.id)).toMatchObject({ status: 'IDLE', lockedByPod: null });
     expect(notes.join('\n')).toContain(finalReport);
     await post({ object_kind: 'note', project: hub, issue, user: developer,
@@ -151,7 +171,7 @@ it('governs Issue #88 through inspection, Plan, MR !205, production approval, ex
     for (const value of ['ops/ansible!205', 'merged @ ' + job.commit_sha.slice(0, 8), '### 交付执行记录',
       'env-change', 'SUCCESS', playbook, rows[0].jumpserverJobUrl, approval.id]) expect(notes.at(-1)).toContain(value);
     expect(report).not.toHaveBeenCalled();
-    expect(run).toHaveBeenCalledTimes(3);
+    expect(run).toHaveBeenCalledTimes(5);
     expect(await readdir(config.ephemeralRoot)).toEqual([]);
   } finally {
     queue.stop();

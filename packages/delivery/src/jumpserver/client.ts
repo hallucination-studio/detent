@@ -1,8 +1,9 @@
-import { createHmac, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { loadConfig, redactGitUrl, type AppConfig } from '@detent/core';
+import { loadConfig, type AppConfig } from '@detent/core';
 import { z } from 'zod';
-import { redactSecrets, type DeliveryConfig } from '../config.js';
+import { redactDeliveryOutput, type DeliveryConfig } from '../config.js';
+import { buildBatchShellScript } from './guards.js';
 import { playbookUpload } from './playbook.js';
 
 export type JumpServerAuth =
@@ -11,8 +12,8 @@ export type JumpServerAuth =
 
 const asset = z.object({ id: z.string(), name: z.string(), address: z.string() });
 export type JumpServerAsset = z.infer<typeof asset>;
-interface AssetQuery { search?: string; nodeId?: string; limit?: number }
-export interface ReadonlyInspectRequest { assetIds: string[]; command: string; account?: string }
+export interface AssetQuery { search?: string; nodeId?: string; limit?: number }
+export interface ShellRequest { assetIds: string[]; commands: string[]; account?: string }
 export interface AnsibleJobRequest {
   account?: string;
   assetIds: string[];
@@ -34,7 +35,7 @@ export type ReadonlyInspectResult = JobResultResponse | {
 };
 export interface JumpServerClient {
   listAssets(query: AssetQuery): Promise<JumpServerAsset[]>;
-  runReadonlyInspect(request: ReadonlyInspectRequest): Promise<ReadonlyInspectResult>;
+  runShell(request: ShellRequest): Promise<ReadonlyInspectResult>;
   runAnsibleJob(request: AnsibleJobRequest): Promise<AnsibleJobSubmission>;
   getJobResult(jobId: string): Promise<JobResultResponse>;
 }
@@ -63,6 +64,12 @@ const resource = z.object({ id: z.string().min(1) });
 const jobDefinition = resource.extend({ variable: z.array(z.unknown()).nullish() });
 const task = z.object({ task_id: z.string().min(1) });
 
+const accountItems = z.array(z.union([z.string(), z.object({
+  username: z.string().nullish(), name: z.string().nullish(), alias: z.string().nullish(), is_active: z.boolean().optional(),
+})]));
+const accountPage = z.union([accountItems, z.object({ results: accountItems }).transform(page => page.results)]);
+const accountDetail = z.object({ permed_accounts: accountItems.optional(), accounts: accountItems.optional() });
+
 class HttpError extends Error {
   constructor(readonly status: number, snippet: string) {
     super('JumpServer HTTP ' + status + (snippet ? ': ' + snippet : ''));
@@ -71,21 +78,29 @@ class HttpError extends Error {
 
 export class HttpJumpServerClient implements JumpServerClient {
   private readonly base: string;
+  private accountsEndpointSupported = true;
+  private readonly accountCache = new Map<string, { accounts: string[]; expiresAt: number }>();
+
   constructor(
     private readonly config: DeliveryConfig,
-    private readonly gitlab: Pick<AppConfig, 'gitlabBaseUrl' | 'gitlabToken' | 'jevApiKey'> & Partial<Pick<AppConfig, 'secrets'>> = loadConfig(),
+    private readonly gitlab: Pick<AppConfig, 'gitlabBaseUrl' | 'gitlabToken'> & Partial<AppConfig> = loadConfig(),
   ) {
     if (!config.jumpserverBaseUrl) throw Error('JumpServer base URL is not configured');
     this.base = config.jumpserverBaseUrl.replace(/\/$/, '');
   }
 
   private redact(value: string) {
-    return redactSecrets(redactGitUrl(value), this.config, this.gitlab.gitlabToken, this.gitlab.jevApiKey ?? '', ...Object.values(this.gitlab.secrets ?? {}));
+    return redactDeliveryOutput(value, this.config, this.gitlab);
+  }
+
+  private requestSignal(budget?: AbortSignal) {
+    const timeout = AbortSignal.timeout(Math.min(15000, this.config.jumpserverTimeoutMs));
+    return budget ? AbortSignal.any([budget, timeout]) : timeout;
   }
 
   private async request<S extends z.ZodTypeAny>(
     auth: JumpServerAuth, path: string, schema: S, body?: object,
-    { signal = AbortSignal.timeout(this.config.jumpserverTimeoutMs), fallbackOn404 = false }: { signal?: AbortSignal; fallbackOn404?: boolean } = {},
+    { signal, fallbackOn404 = false }: { signal?: AbortSignal; fallbackOn404?: boolean } = {},
   ): Promise<z.output<S>> {
     const method = body ? 'POST' : 'GET';
     try {
@@ -102,7 +117,7 @@ export class HttpJumpServerClient implements JumpServerClient {
 
       if (body && !(body instanceof FormData)) headers.set('Content-Type', 'application/json');
       const response = await fetch(url, {
-        method, headers, signal, redirect: 'error', body: body instanceof FormData ? body : JSON.stringify(body),
+        method, headers, signal: this.requestSignal(signal), redirect: 'error', body: body instanceof FormData ? body : JSON.stringify(body),
       });
       if (!response.ok) {
         const safeSnippet = this.redact(await response.text().catch(error => {
@@ -113,15 +128,18 @@ export class HttpJumpServerClient implements JumpServerClient {
           console.error('[detent:jumpserver]', method, this.redact(path), response.status, safeSnippet);
         throw new HttpError(response.status, safeSnippet.slice(0, 300));
       }
-      const parsed = schema.safeParse(await response.json().catch(error => {
-        console.error('[detent:jumpserver]', method, this.redact(path), error instanceof SyntaxError ? 'Invalid JSON' : this.redact(String(error)));
-        throw Error('Invalid JumpServer response');
-      }));
-      if (!parsed.success) throw Error('Invalid JumpServer response');
+      const json = await response.json().catch(error => {
+        if (error instanceof SyntaxError) throw Error('Invalid JumpServer JSON');
+        throw error;
+      });
+      const parsed = schema.safeParse(json);
+      if (!parsed.success) throw Error('Invalid JumpServer response: ' + parsed.error.message);
       return parsed.data;
     } catch (error) {
       if (error instanceof HttpError) throw error;
-      throw Error(this.redact(error instanceof Error ? error.message : 'JumpServer request failed'));
+      const detail = this.redact(error instanceof Error ? error.message : String(error));
+      console.error('[detent:jumpserver]', method, this.redact(path), detail.slice(0, 1000));
+      throw Error(detail.slice(0, 300));
     }
   }
 
@@ -132,34 +150,48 @@ export class HttpJumpServerClient implements JumpServerClient {
     const scope = nodeId ? 'nodes/' + segment(nodeId) + '/' : '';
     const rows = await this.request(auth, 'perms/users/self/' + scope + 'assets/?' + query, assetPage);
     return rows.slice(0, limit).map(({ id, name, address }) => ({
-      id: redactSecrets(id, this.config), name: redactSecrets(name, this.config), address: redactSecrets(address, this.config),
+      id: this.redact(id), name: this.redact(name), address: this.redact(address),
     }));
   }
 
-  async listAssetAccounts(assetId: string, auth = requireAuth(this.config.jumpserverReadonlyAuth, 'readonly')): Promise<string[]> {
+  async listAssetAccounts(assetId: string, auth = requireAuth(this.config.jumpserverReadonlyAuth, 'readonly'), signal?: AbortSignal): Promise<string[]> {
     const path = 'perms/users/self/assets/' + segment(assetId) + '/';
-    const items = z.array(z.union([z.string(), z.object({
-      username: z.string().nullish(), name: z.string().nullish(), alias: z.string().nullish(), is_active: z.boolean().optional(),
-    })]));
-    let accounts: z.infer<typeof items>;
-    try {
-      accounts = await this.request(auth, path + 'accounts/', z.union([items, z.object({ results: items }).transform(page => page.results)]),
-        undefined, { fallbackOn404: true });
-    } catch (error) {
-      if (!(error instanceof HttpError) || error.status !== 404) throw error;
-      const detail = await this.request(auth, path, z.object({ permed_accounts: items.optional(), accounts: items.optional() }));
+    const principal = auth.kind === 'signature' ? 'key:' + auth.accessKeyId : 'token:' + createHash('sha256').update(auth.token).digest('hex');
+    const key = JSON.stringify([principal, assetId]);
+    const now = Date.now();
+    const cached = this.accountCache.get(key);
+    if (cached && now < cached.expiresAt) return [...cached.accounts];
+    // Entries are inserted in expiry order. Reclaim expired assets without a timer.
+    for (const [id, entry] of this.accountCache) {
+      if (entry.expiresAt > now) break;
+      this.accountCache.delete(id);
+    }
+    let accounts;
+    if (this.accountsEndpointSupported) {
+      try {
+        accounts = await this.request(auth, path + 'accounts/', accountPage, undefined, { signal, fallbackOn404: true });
+      } catch (error) {
+        if (!(error instanceof HttpError) || error.status !== 404) throw error;
+        this.accountsEndpointSupported = false;
+      }
+    }
+    if (!accounts) {
+      const detail = await this.request(auth, path, accountDetail, undefined, { signal });
       accounts = detail.permed_accounts ?? detail.accounts ?? [];
     }
     const usernames = accounts.map(item => typeof item === 'string' ? item.trim() :
       item.is_active === false ? '' : item.username?.trim() || item.name?.trim() || item.alias?.trim());
-    return [...new Set(usernames.filter((name): name is string => !!name && !name.startsWith('@')))];
+    const active = [...new Set(usernames.filter((name): name is string => !!name && !name.startsWith('@')))];
+    this.accountCache.delete(key);
+    this.accountCache.set(key, { accounts: active, expiresAt: Date.now() + 60000 });
+    return [...active];
   }
 
-  private async resolveAccountGroups(assetIds: string[], account: string | undefined, auth: JumpServerAuth) {
+  private async resolveAccountGroups(assetIds: string[], account: string | undefined, auth: JumpServerAuth, signal: AbortSignal) {
     if (!assetIds.length) throw Error('必须指定目标资产');
     const groups = new Map<string, string[]>();
     for (const id of new Set(assetIds)) {
-      const accounts = await this.listAssetAccounts(id, auth);
+      const accounts = await this.listAssetAccounts(id, auth, signal);
       if (!accounts.length) throw Error(`资产 ${id} 在 JumpServer 中未给当前 API Key 授权任何登录账号`);
       const selected = account ?? accounts[0];
       if (!accounts.includes(selected))
@@ -191,17 +223,19 @@ export class HttpJumpServerClient implements JumpServerClient {
       execution = await this.request(auth, 'ops/jobs/', task, { ...jobBody, instant: true }, { signal });
     }
     const jobId = execution.task_id;
-    if (redactSecrets(jobId, this.config) !== jobId) throw Error('Unsafe JumpServer execution ID');
+    if (this.redact(jobId) !== jobId) throw Error('Unsafe JumpServer execution ID');
     return { jobId, jobUrl: this.jobUrl(jobId), status: 'PENDING' };
   }
 
-  async runReadonlyInspect(request: ReadonlyInspectRequest): Promise<ReadonlyInspectResult> {
+  async runShell(request: ShellRequest): Promise<ReadonlyInspectResult> {
     const auth = requireAuth(this.config.jumpserverReadonlyAuth, 'readonly');
-    const groups = await this.resolveAccountGroups(request.assetIds, request.account, auth);
+    const signal = AbortSignal.timeout(this.config.jumpserverTimeoutMs);
+    const groups = await this.resolveAccountGroups(request.assetIds, request.account, auth, signal);
+    const script = buildBatchShellScript(request.commands);
     const results: InspectionGroup[] = [];
     const summaries: string[] = [];
     for (const [account, assetIds] of groups) {
-      const result = await this.inspectGroup(auth, assetIds, account, request.command);
+      const result = await this.inspectGroup(auth, assetIds, account, script, signal);
       if (groups.size === 1) return result;
       const { outputSummary, ...job } = result;
       results.push({ account, assetIds, ...job });
@@ -211,8 +245,7 @@ export class HttpJumpServerClient implements JumpServerClient {
       groups: results, outputSummary: summaries.join('\n\n') };
   }
 
-  private async inspectGroup(auth: JumpServerAuth, assetIds: string[], account: string, command: string) {
-    const signal = AbortSignal.timeout(this.config.jumpserverTimeoutMs);
+  private async inspectGroup(auth: JumpServerAuth, assetIds: string[], account: string, command: string, signal: AbortSignal) {
     const job = await this.submit(auth, {
       type: 'adhoc', module: 'shell', args: command, assets: assetIds,
       runas: account, runas_policy: 'skip', timeout: Math.ceil(this.config.jumpserverTimeoutMs / 1000),
@@ -228,10 +261,10 @@ export class HttpJumpServerClient implements JumpServerClient {
     const auth = requireAuth(this.config.jumpserverJobAuth, 'job');
     const signal = AbortSignal.timeout(this.config.jumpserverTimeoutMs);
     try {
-      const groups = await this.resolveAccountGroups(request.assetIds, request.account, auth);
+      const groups = await this.resolveAccountGroups(request.assetIds, request.account, auth, signal);
       if (groups.size !== 1) throw Error('目标资产的首个授权账号不同，请指定共同的 account 或按账号分组执行');
       const [account] = groups.keys();
-      const form = await playbookUpload(request, this.gitlab, signal).catch(error => {
+      const form = await playbookUpload(request, this.gitlab, this.requestSignal(signal)).catch(error => {
         const detail = this.redact(error instanceof Error ? error.message : String(error));
         console.error('[detent:playbook]', detail.slice(0, 1000));
         throw Error(detail.slice(0, 300));

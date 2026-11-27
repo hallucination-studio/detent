@@ -28,8 +28,6 @@ export interface Harness {
   bot: { id: number; username: string };
   hub: number;
   api: number;
-  isolationIssue: number;
-  standalone: Mr;
   sandbox: string;
 }
 

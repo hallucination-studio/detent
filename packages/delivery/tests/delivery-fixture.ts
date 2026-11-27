@@ -15,7 +15,7 @@ export const opened = { object_kind: 'issue' as const, project: hub, user: devel
 export async function deliveryFixture(labels: string[]) {
   const root = await mkdtemp('/tmp/detent-stage4-');
   onTestFinished(() => rm(root, { recursive: true, force: true }));
-  const config = loadConfig({ GITLAB_WEBHOOK_SECRET: 'fixture-webhook-key', EPHEMERAL_ROOT: path.join(root, 'turns'), HOT_HOLD_TIMEOUT_MS: '3000' });
+  const config = loadConfig({ GITLAB_WEBHOOK_SECRET: 'fixture-webhook-key', EPHEMERAL_ROOT: path.join(root, 'turns') });
   const repo = new InMemoryDetentRepository();
   const notes: string[] = [];
   const gitlab = {
@@ -33,7 +33,7 @@ export async function deliveryFixture(labels: string[]) {
   };
   const client: JumpServerClient = {
     listAssets: vi.fn<JumpServerClient['listAssets']>().mockResolvedValue([{ id: 'web01', name: 'web01', address: '192.0.2.1' }]),
-    runReadonlyInspect: vi.fn<JumpServerClient['runReadonlyInspect']>().mockResolvedValue({
+    runShell: vi.fn<JumpServerClient['runShell']>().mockResolvedValue({
       jobId: 'inspect', jobUrl: 'https://jms.test/inspect', status: 'SUCCESS', outputSummary: 'active',
     }),
     runAnsibleJob: vi.fn<JumpServerClient['runAnsibleJob']>().mockResolvedValue({

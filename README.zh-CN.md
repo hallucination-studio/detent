@@ -145,11 +145,16 @@ npm run bootstrap -- --env-out .env
 
 ```bash
 # 离线 GitLab 使用 Git 和 git-http-backend
+npm run e2e:smoke
 npm run e2e:offline
 
 # 本地 GitLab CE 18.3.0，预先导出 E2E_GITLAB_ADMIN_TOKEN
 E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab
 ```
+
+每轮 Claude 通过带令牌认证的回环 HTTP MCP 调用工具。工具审批和提问先保存会话并释放 Pod 租约，获授权的用户回复后由新进程恢复。通过 `jms_list_assets` 查询资产，向 `jms_shell` 传入 `commands` 数组完成批量巡检。生产审批通过后，`jms_job` 异步提交任务并返回链接，本轮结束。Delivery 记录终态并唤醒原 Issue 进行核验。`jms_job_status` 可查询当前会话所属的任务。
+
+运行 `npm run e2e:offline -- --suite=jumpserver` 可单独验收 JumpServer，包括超过 30 秒的巡检调用。其他套件为 `install`、`issues`、`mrs`、`concurrency` 与 `security`。
 
 离线套件验证仓库自助接入、安装升级、Issue 工作流、MR Worker、双 Pod 并发以及安全与事件处理。两个 Pod 共用 MySQL，通过回环代理接收 Webhook，验证并行 SDK 轮次、审批与恢复竞争、凭证脱敏和生产变更硬拦截。
 
@@ -251,7 +256,8 @@ Webhook 返回 `202` 表示事件已进入当前进程的内存队列。正常�
 | `JUMPSERVER_BASE_URL` / `JUMPSERVER_ORG_ID` | 旧环境配置的服务地址与可选组织 ID。 |
 | `JUMPSERVER_READONLY_TOKEN` 或 `JUMPSERVER_READONLY_ACCESS_KEY_ID` + `JUMPSERVER_READONLY_ACCESS_KEY_SECRET` | 旧环境配置的资产查询和巡检凭证。 |
 | `JUMPSERVER_JOB_TOKEN` 或 `JUMPSERVER_JOB_ACCESS_KEY_ID` + `JUMPSERVER_JOB_ACCESS_KEY_SECRET` | 旧环境配置的任务中心执行凭证。 |
-| `JUMPSERVER_READONLY_ACCOUNT` / `JUMPSERVER_TIMEOUT_MS` | 可显式指定旧模式巡检账号，请求超时默认为 30000 毫秒。 |
+| `JUMPSERVER_READONLY_ACCOUNT` / `JUMPSERVER_TIMEOUT_MS` | 可显式指定旧模式巡检账号，操作超时默认为 60000 毫秒。 |
+| `DELIVERY_JOB_POLL_INTERVAL_MS` | Delivery 任务扫描间隔，默认 3000 毫秒，设为 0 可停用定时扫描。 |
 | `JUMPSERVER_INSPECT_ALLOW_PREFIXES` | 逗号分隔的只读命令前缀，默认清单见 `.env.example`。命令参数仍须通过只读校验。 |
 | `JUMPSERVER_BLOCKED_ASSETS` / `JUMPSERVER_BLOCK_FAILED_PIPELINE` | 禁用资产 ID 列表默认空。失败流水线默认阻止执行，可用 `false` 或 `0` 关闭。 |
 | `DELIVERY_PROD_APPROVERS` | 逗号分隔的 GitLab 用户名，忽略大小写。配置名单时，生产审批人还须达到 Hub 项目的 `GITLAB_MIN_ACCESS_LEVEL`。 |

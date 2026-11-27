@@ -19,7 +19,6 @@ import { resolveApproval } from '../orchestrator/lifecycle.js';
 
 type Input = Record<string, unknown>;
 type GateResult = PermissionResult & { approvalId?: string; jevConfidence?: number };
-type Decision = 'APPROVED' | 'REJECTED';
 const deny = (message: string): PermissionResult => ({ behavior: 'deny', message });
 export class ToolDenied extends Error {}
 export class ColdHold extends Error {
@@ -150,7 +149,6 @@ type GateContext = ({ channel: GateChannel } |
 }
 export class PermissionGate {
   private queue: Promise<unknown> = Promise.resolve();
-  private pending?: { id: string; wake: () => void; handled: Promise<boolean> };
   readonly extensionTools = new Map<string, AnyDetentExtensionTool>();
   readonly readonly: boolean;
   readonly disableBash: boolean;
@@ -177,7 +175,7 @@ export class PermissionGate {
       this.extensionTools.set(id, tool);
     }
   }
-  // MCP supplies schema-validated input. Both hot and replayed approvals pass through this handler.
+  // MCP supplies schema-validated input. Approved tools recheck their guard immediately before execution.
   async invokeExtension(id: string, input: Input) {
     const tool = this.extensionTools.get(id);
     if (!tool) throw Error('未启用此工具');
@@ -196,19 +194,6 @@ export class PermissionGate {
     const next = this.queue.then(() => this.decide(name, input));
     this.queue = next.catch(() => {});
     return next;
-  }
-  async resolvePendingApproval(status: Decision, user = 'GitLab', comment = '') {
-    const pending = this.pending;
-    if (!pending) return false;
-    const { repo, session, onApprovalResolved } = this.ctx;
-    if (!(await resolveApproval(repo, session, pending.id, status, user, comment, onApprovalResolved, this.secrets))) return false;
-    pending.wake();
-    return true;
-  }
-  notify(id: string) {
-    if (this.pending?.id !== id) return false;
-    this.pending.wake();
-    return this.pending.handled;
   }
   private result(a: ApprovalRequestRow, input: Input, extension?: AnyDetentExtensionTool): GateResult {
     if (a.status !== 'APPROVED') return deny(a.decisionComment || '操作已拒绝');
@@ -310,8 +295,7 @@ export class PermissionGate {
   private async decide(name: string, input: Input): Promise<GateResult> {
     const policy = await this.preflight(name, input);
     if (policy !== 'ask' && !('riskNote' in policy)) return policy;
-    const { session: s, config, repo, controller } = this.ctx;
-    const plan = s.permissionMode === 'plan';
+    const { session: s, repo, controller } = this.ctx;
     const extension = this.extensionTools.get(name);
     name = name.replace(/^mcp__detent__/, '');
     const previous = this.previousDecision(name, input);
@@ -338,45 +322,8 @@ export class PermissionGate {
     await repo.updateSessionState(s.id, { status: 'WAITING_TOOL' });
     s.status = 'WAITING_TOOL';
     await this.channel.syncStatusLabel('WAITING_TOOL');
-    const deadline = Date.now() + config.hotHoldTimeoutMs;
-    let finish!: (handled: boolean) => void;
-    const handled = new Promise<boolean>((resolve) => {
-      finish = resolve;
-    });
-    let consumed = false;
-    let wake!: () => void;
-    this.pending = { id: a.id, wake: () => wake(), handled };
-    try {
-      while (true) {
-        controller.signal.throwIfAborted();
-        // Latch notifications before reading so a local decision during the query wakes us too.
-        const notified = new Promise<void>((resolve) => {
-          wake = resolve;
-        });
-        const stored = await repo.getApproval(a.id);
-        if (stored && stored.status !== 'PENDING') {
-          const status = plan ? 'PLANNING' : 'CODING';
-          await repo.updateSessionState(s.id, { status });
-          s.status = status;
-          await this.channel.syncStatusLabel(status);
-          consumed = true;
-          return this.result(stored, input, extension);
-        }
-        if (Date.now() >= deadline) {
-          const hold = new ColdHold(a);
-          controller.abort(hold);
-          throw hold;
-        }
-        const timer = setTimeout(wake, Math.min(2000, deadline - Date.now()));
-        controller.signal.addEventListener('abort', wake, { once: true });
-        if (controller.signal.aborted) wake();
-        await notified;
-        clearTimeout(timer);
-        controller.signal.removeEventListener('abort', wake);
-      }
-    } finally {
-      this.pending = undefined;
-      finish(consumed);
-    }
+    const hold = new ColdHold(a);
+    controller.abort(hold);
+    throw hold;
   }
 }

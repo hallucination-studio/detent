@@ -59,15 +59,25 @@ export async function runConcurrency(h: Harness, cluster: Cluster, web: number) 
   await steer(false);
   const planTitle = 'Cluster plan decision';
   const openPlan = () => h.openIssue(planTitle, '', 'delivery::code');
-  const { value: first } = await cluster.pinned('a', e => e.object_attributes?.title === planTitle, openPlan);
-  const firstCard = await h.pendingCard(first, 'Plan', ['Cluster plan ready.']);
-  await cluster.pinned('b', e => e.object_kind === 'emoji', () => gitlab.awardThumbsUp(hub, first, firstCard.gitlab_note_id, 'dev'));
-  const resumed = await h.state(first, 'IDLE');
-  assert.deepEqual((await records(resumed.id, 'approval_requests')).map(r => r.status), ['APPROVED']);
-  assert.equal((await gitlab.listIssueNotes(hub, first)).filter(n => n.body.includes('Cluster plan executed.')).length, 1);
-  console.log('C-1 passed: Pod B acknowledged steering under Pod A\'s lease and resumed its plan.');
+  const { value: first } = await cluster.pinned('a', e => e.object_attributes?.title === 'Select service port',
+    () => h.openIssue('Select service port', '', 'delivery::code'));
+  const firstCard = await h.pendingCard(first, 'Plan', ['Confirm the deployment port.']);
+  await cluster.pinned('a', e => e.object_kind === 'emoji', () => gitlab.awardThumbsUp(hub, first, firstCard.gitlab_note_id, 'dev'));
+  const questionCard = await h.pendingCard(first, 'AskUserQuestion', ['Which service port?']);
+  const suspended = await h.state(first, 'WAITING_TOOL');
+  assert.equal(suspended.locked_by_pod, null);
+  for (const dir of cluster.sandboxes) assert.deepEqual(await readdir(dir), []);
+  await cluster.pinned('b', e => e.object_attributes?.note === 'Use port 6380', () => gitlab.postNote(hub, first, 'Use port 6380'));
+  const resumed = await h.state(first, 'IDLE', suspended.last_message_seq);
+  assert.equal(resumed.claude_session_id, suspended.claude_session_id);
+  const decisions = await records(resumed.id, 'approval_requests');
+  assert.equal(decisions.length, 2);
+  assert.ok(decisions.every(a => a.status === 'APPROVED'));
+  assert.equal(decisions.find(a => a.id === questionCard.id)?.decision_comment, 'Use port 6380');
+  assert.equal((await gitlab.listIssueNotes(hub, first)).filter(n => n.body.includes('Confirmed port 6380.')).length, 1);
+  console.log('C-1 passed: Pod B delivered steering and cold-resumed the question suspended on Pod A.');
 
-  // Seed distinct real branches. Main already contains the fixes from the earlier phases.
+  // Seed independent broken branches for simultaneous repairs.
   await gitlab.upsertFile(web, 'ci/ready.txt', 'broken\n', 'Break readiness', 'storm-ci', 'main');
   const ci = h.trackMr(await gitlab.openMr(web, 'storm-ci', 'Storm CI repair', bot.id));
   const beforeCI = await h.mrState(web, ci.iid, 'IDLE', 0);

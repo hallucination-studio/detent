@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import type { RowDataPacket } from 'mysql2/promise';
 import { randomUUID } from 'node:crypto';
 import { checkSession, type Harness } from './harness.js';
-type Mr = Harness['standalone'];
+type Mr = Awaited<ReturnType<Harness['gitlab']['getMr']>>;
 
-export async function runMrScenarios(h: Harness) {
+export async function runMrScenarios(h: Harness & { standalone: Mr; isolationIssue: number }) {
   const { gitlab, admin, api, hub, bot, standalone, anthropic, until, rows, records, mrState, trackMr } = h;
   const synthetic = gitlab.synthetic;
   const mrPath = (iid: number) => '/projects/' + api + '/merge_requests/' + iid;
@@ -155,7 +155,8 @@ export async function runMrScenarios(h: Harness) {
   const status = await discuss('/status');
   await until('MR /status reply', async () => (await threadNotes(status.id)).some(n => n.author.username === bot.username && n.body.includes('⏸️ **等待方案确认**')));
   await gitlab.awardMrThumbsUp(api, config.iid, plan.gitlab_note_id, 'dev');
-  await mrState(api, config.iid, 'WAITING_TOOL');
+  const suspended = await mrState(api, config.iid, 'WAITING_TOOL');
+  assert.equal(suspended.locked_by_pod, null);
   const tool = (await approvals()).find(a => a.approval_type === 'TOOL_USE');
   assert.ok(tool && tool.tool_name === 'Bash' && tool.status === 'PENDING');
   assert.match((await mrNotes()).find(n => n.id === tool.gitlab_note_id)?.body ?? '', /命令执行审批[\s\S]*printf config-loader-ok/);
@@ -165,6 +166,7 @@ export async function runMrScenarios(h: Harness) {
   assert.equal((await approvals()).find(a => a.id === tool.id)?.status, 'PENDING');
   await gitlab.awardMrThumbsUp(api, config.iid, tool.gitlab_note_id, 'dev');
   const implemented = await mrState(api, config.iid, 'IDLE', planned.last_message_seq);
+  assert.equal(implemented.claude_session_id, suspended.claude_session_id);
   assert.deepEqual((await approvals()).map(a => [a.status, a.decided_by]), Array(2).fill(['APPROVED', gitlab.devUsername]));
   assert.ok((await mrNotes()).some(n => n.body.includes('Approved config loader check returned config.')));
   assert.ok(h.jev.requests.includes('printf config-loader-ok | cut -c 1-6'));

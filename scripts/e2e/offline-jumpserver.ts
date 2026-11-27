@@ -20,11 +20,11 @@ export function offlineJumpServer({ ansibleRepo = 'ops/ansible-infra' } = {}) {
   });
   const inspections: string[] = [], executions: string[] = [], uploads: string[] = [];
   let definition: { id: string; assets: string[]; principal: string } | undefined;
-  const tasks = new Map<string, { principal: string; assets: string[]; playbook: boolean; command?: string }>();
+  const tasks = new Map<string, { principal: string; assets: string[]; playbook: boolean; command?: string; readyAt: number }>();
   const forbidden = () => new Response(null, { status: 403 });
   function execute(principal: string, assets: string[], playbook: boolean, command?: string) {
     const id = randomUUID();
-    tasks.set(id, { principal, assets, playbook, command });
+    tasks.set(id, { principal, assets, playbook, command, readyAt: Date.now() + (!playbook && slowShell ? 31_000 : 0) });
     if (playbook) executions.push(id);
     return Response.json({ task_id: id });
   }
@@ -38,6 +38,8 @@ export function offlineJumpServer({ ansibleRepo = 'ops/ansible-infra' } = {}) {
     ).digest('base64');
     if (authorization === `Signature keyId="${accessKeyId}",algorithm="hmac-sha256",headers="(request-target) accept date",signature="${signature}"`) return 'shared';
   }
+  let holdPlaybooks = false;
+  let slowShell = false;
   const paths: string[] = [], jobErrors: number[] = [];
   async function handle(req: Request) {
 
@@ -110,10 +112,15 @@ export function offlineJumpServer({ ansibleRepo = 'ops/ansible-infra' } = {}) {
     if (req.method === 'GET' && id) {
       const task = tasks.get(id);
       if (task?.principal !== role) return forbidden();
+      if (match?.[1] === 'task-detail' && ((holdPlaybooks && task.playbook) || Date.now() < task.readyAt))
+        return Response.json({ status: 'running', summary: {} });
       const failed = task.playbook && task.assets.includes('web02');
       if (match?.[1] === 'task-detail') return Response.json(failed
         ? { status: 'failed', summary: { failed: 1 } } : { status: 'success', summary: { success: 1 } });
       const output = failed ? 'service check failed on web02' : task.playbook ? 'nginx reloaded\n' + securityReport :
+        task.command?.startsWith('set +e') ? task.command.split('\n').flatMap(line =>
+          line.startsWith('ps -ef') ? ['1201 java kafka.Kafka'] : line === 'ss -lntp' ? ['LISTEN localhost:9092'] :
+            line.startsWith('/opt/kafka/') ? ['dev-orders'] : []).join('\n') :
         task.command?.startsWith('ps -ef') ? '1201 java kafka.Kafka' :
         task.command === 'ss -lntp' ? 'nginx active; LISTEN localhost:9092' :
         task.command?.startsWith('/opt/kafka/') ? 'dev-orders' : 'nginx active';
@@ -123,5 +130,5 @@ export function offlineJumpServer({ ansibleRepo = 'ops/ansible-infra' } = {}) {
     }
     return new Response(null, { status: 404 });
   }
-  return { runAs, playbookRuns, accessKeyId, accessKeySecret, securityReport, jobErrors, paths, getCalls: () => paths.length, handle, readonly, job, inspections, uploads, executions };
+  return { holdPlaybooks(value: boolean) { holdPlaybooks = value; }, slowShell(value: boolean) { slowShell = value; }, runAs, playbookRuns, accessKeyId, accessKeySecret, securityReport, jobErrors, paths, getCalls: () => paths.length, handle, readonly, job, inspections, uploads, executions };
 }

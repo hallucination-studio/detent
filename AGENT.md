@@ -21,7 +21,7 @@
 5. **生产变更三道门禁与父进程权限隔离（`@detent/delivery` 合规铁律）**
    - **第一道（Plan 方案审批）**：变更前必须先通过只读工具巡检现状并输出方案，未经审批不得进入实施阶段。
    - **第二道（MR 人工合并硬校验）**：调用 JumpServer 执行 Ansible 变更前，必须由硬代码 `guard()` 校验目标 MR 在 MySQL 中已是 `merged` 且 `merge_commit_sha` 与执行版本一致，绝不依赖 Prompt 软约束。
-   - **第三道（执行前生产审批）**：`jms_run_ansible_job` 治理级别必须为 `always_approve`；父进程按 `mode: readonly` 隐藏执行工具，巡检先硬拒绝危险命令，再检查允许前缀或交 Jev 评估。生产执行要求 `prod` 审批。JumpServer 推荐共用一把 AccessKey，仅由父进程持有；高敏感交付 Agent 禁用裸连 SSH / 本地直跑 Ansible。
+   - **第三道（执行前生产审批）**：`jms_job` 治理级别必须为 `always_approve`；父进程按 `mode: readonly` 隐藏执行工具，巡检先硬拒绝危险命令，再检查允许前缀或交 Jev 评估。生产执行要求 `prod` 审批。JumpServer 推荐共用一把 AccessKey，仅由父进程持有；高敏感交付 Agent 禁用裸连 SSH / 本地直跑 Ansible。
 6. **严格防止 GitLab Bot 无限自环（Loop Prevention）与脱敏**
    - 收到任何 GitLab Webhook 时，必须校验 `X-Gitlab-Token` 并第一时间通过 `isBotUser` 过滤 Bot 自身的人为操作事件。pipeline、build、deployment 保留 Bot 触发的状态变化；所有评论与错误日志必须经过 `redactGitUrl` 脱敏。
 
@@ -46,7 +46,7 @@ Stage 3 的只读和自动工具在 `preflight` 执行守卫。生产任务在�
 
 `npm run bootstrap` 只补齐缺失的 Hub 规范、流程、Issue 模板和标签，复用同一输出文件内的凭证。
 
-`jms_run_ansible_job` 与 `detent_create_release` 的待审单仅能在当前流程非只读且显式启用该工具时获批。两者始终校验生产审批人，`approver_tier: prod` 的流程对所有工具审批执行同样校验。方案审批沿用普通项目权限。生产审批要求 `DELIVERY_PROD_APPROVERS` 名单加项目成员门槛，或在名单为空时满足 `DELIVERY_PROD_MIN_ACCESS_LEVEL`（默认 40）。
+`jms_job` 与 `detent_create_release` 的待审单仅能在当前流程非只读且显式启用该工具时获批。两者始终校验生产审批人，`approver_tier: prod` 的流程对所有工具审批执行同样校验。方案审批沿用普通项目权限。生产审批要求 `DELIVERY_PROD_APPROVERS` 名单加项目成员门槛，或在名单为空时满足 `DELIVERY_PROD_MIN_ACCESS_LEVEL`（默认 40）。
 
 `delivery_executions` 通过 `onInitSchema(pool)` 在 Core 表之后、调用方建表之前初始化。所有权、执行状态和审批单关联均以仓储为准，审批卡渲染也从仓储读取 MR。禁止 Delivery 另建池或在 Pod 内缓存业务状态。结果查询更新审计，`renderStatusExtra` 将当前会话的执行记录加入 `/status`。环境变量全集与 Hub 规范见 [.env.example](.env.example) 和 [工作区示例](examples/hub-workspace/CLAUDE.md)。
 
@@ -54,9 +54,11 @@ Stage 3 的只读和自动工具在 `preflight` 执行守卫。生产任务在�
 
 Hub SOP 的 `close_policy` 默认 `manual`。`auto` 和 `approve` 启用每轮的 `detent_close_issue`，其中 `approve` 按流程审批人等级发卡。readonly 角色使用 SDK default 模式，禁用 Edit/Write，在 disableBash 时禁用 Bash；PermissionGate 与 WorkspaceTools 始终强制工作区只读。关单工具仅登记本轮请求。编排器在轮次成功、transcript 与工作区已保存后复核方案、待审单、未合并 MR 和 `TurnProfile.canCloseIssue`，先归档 Worktree，再刷新最终评论，随后关闭 Issue 并同步 `DONE` / `claude::done`。Delivery 要求最新执行记录为 `SUCCESS`。人工关单同样归档并进入 `DONE`。
 
+每轮 Claude 通过带令牌认证的回环 HTTP MCP 调用工具。工具审批和提问先保存会话并释放 Pod 租约，获授权的用户回复后由新进程恢复。通过 `jms_list_assets` 查询资产，向 `jms_shell` 传入 `commands` 数组完成批量巡检。生产审批通过后，`jms_job` 异步提交任务并返回链接，本轮结束。Delivery 记录终态并唤醒原 Issue 进行核验。`jms_job_status` 可查询当前会话所属的任务。
+
 ### Stage 9 确定性 E2E
 
-`npm run e2e:offline` 使用回环 GitLab 与 git-http-backend。导出 `E2E_GITLAB_ADMIN_TOKEN` 后，`E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab` 使用独立命名空间和真实 GitLab CE 18.3.0 的 API、用户及 Webhook。两种目标共用缺能力引导、镜像同步、跨库双 MR、在线定制发版、热修复与关单审批、只读巡检和跨 Pod 环境变更场景。真实 Claude Code 使用本地 Anthropic SSE 替身，Jev、JumpServer 与外部 MCP 也使用回环替身。用 GitLab Issue、审批人身份、MySQL 状态和归档记录验收闭环。
+`npm run e2e:smoke` 验收统一会话和异步生产审批闭环。`npm run e2e:offline` 使用回环 GitLab 与 git-http-backend。导出 `E2E_GITLAB_ADMIN_TOKEN` 后，`E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab` 使用独立命名空间和真实 GitLab CE 18.3.0 的 API、用户及 Webhook。两种目标共用缺能力引导、镜像同步、跨库双 MR、在线定制发版、热修复与关单审批、只读巡检和跨 Pod 环境变更场景。真实 Claude Code 使用本地 Anthropic SSE 替身，Jev、JumpServer 与外部 MCP 也使用回环替身。用 GitLab Issue、审批人身份、MySQL 状态和归档记录验收闭环。
 
 ### Jev 命令风控
 
@@ -106,7 +108,7 @@ Hub 和 MR 的 `/help` 在检查成员权限后直接发评论，禁止创建会
 
 能力缺失时直接列出所需能力与已就绪流程，管理员配置提示来自 `setupHint`。Hub 示例只提供协作规范，仓库与资产以实时查询为准。
 
-Issue 与 MR 的普通回复只可回答当前待审的 `ASK_USER`，沿用审批身份校验与热唤醒或冷恢复。`TOOL_USE` 保留显式审批。审批时按待审类型和工具名复核当前流程，已撤销授权的工具保持静默。生产审批权限不足的项目成员收到去重提示，外部人员无反馈。Issue 与 MR 的折叠工具轨迹逐次展示所有工具的名称、原始路径与参数，原位更新执行结果、错误或拒绝原因。参数和结果先脱敏再截断。超过 60 步时展示首尾各 30 步及省略数量，无工具调用时省略轨迹。
+Issue 与 MR 的普通回复只可回答当前待审的 `ASK_USER`，沿用审批身份校验与冷恢复。`TOOL_USE` 保留显式审批。审批时按待审类型和工具名复核当前流程，已撤销授权的工具保持静默。生产审批权限不足的项目成员收到去重提示，外部人员无反馈。Issue 与 MR 的折叠工具轨迹逐次展示所有工具的名称、原始路径与参数，原位更新执行结果、错误或拒绝原因。参数和结果先脱敏再截断。超过 60 步时展示首尾各 30 步及省略数量，无工具调用时省略轨迹。
 
 ## 二、 质量门禁：本地提交前检查与推送前 OpenCodeReview 委托审查（必须遵守）
 

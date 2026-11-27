@@ -126,6 +126,12 @@ export interface DetentExtensions {
   capabilities?: readonly DetentCapabilityPack[];
   mcpCapabilities?: readonly McpCapabilityConfig[];
   renderStatusExtra?(session: IssueSessionRow): Promise<string | null | undefined>;
+  onReady?(ctx: {
+    orchestrator: SessionOrchestrator;
+    repo: DetentRepository;
+    gitlab: GitLabClient;
+    report: (error: unknown) => void;
+  }): void | (() => void | Promise<void>) | Promise<void | (() => void | Promise<void>)>;
   onInitSchema?(pool: Pool): Promise<void>;
   resolveTurnProfile?: TurnProfileResolver;
   hooks?: SessionLifecycleHooks;

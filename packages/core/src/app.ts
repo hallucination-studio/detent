@@ -18,8 +18,7 @@ import { normalizeHubValue } from './workflows/hub-frontmatter.js';
 
 export function createDetentApp(config: AppConfig, extensions: DetentExtensions = {}): FastifyInstance {
   if (!config.gitlabWebhookSecret) throw Error('GITLAB_WEBHOOK_SECRET is required');
-  if (config.leaseTtlSeconds < 1 || config.hotHoldTimeoutMs < 0)
-    throw Error('Invalid lease or hold duration');
+  if (config.leaseTtlSeconds < 1) throw Error('Invalid lease duration');
   const pool = createMySqlPool(config);
   const client = new GitLabClient(config);
   const repo = new MySqlDetentRepository(pool);
@@ -43,6 +42,7 @@ export function createDetentApp(config: AppConfig, extensions: DetentExtensions 
     extensions.matchWebhookEvent,
     event => matchHubEvent(client, config, event, decision, extensions.onNotify),
   );
+  let stopExtension: void | (() => void | Promise<void>);
   app.addHook('onReady', async () => {
     if (config.mcpCapabilitiesFile || extensions.mcpCapabilities?.length) {
       const fileConfigs = config.mcpCapabilitiesFile ? await loadMcpCapabilitiesFile(config.mcpCapabilitiesFile) : [];
@@ -58,12 +58,23 @@ export function createDetentApp(config: AppConfig, extensions: DetentExtensions 
     await extensions.onInitSchema?.(pool);
     await client.initBotIdentity();
     watchdog.start();
+    try {
+      stopExtension = await extensions.onReady?.({ orchestrator, repo, gitlab: client, report });
+    } catch (error) {
+      await watchdog.stop();
+      throw error;
+    }
   });
   app.addHook('onClose', async () => {
     queue.stop();
-    await Promise.all([watchdog.stop(), queue.drain()]);
-    await mrs.drain();
-    await pool.end();
+    const stopped = watchdog.stop();
+    try {
+      await stopExtension?.();
+    } finally {
+      await Promise.all([stopped, queue.drain()]);
+      await mrs.drain();
+      await pool.end();
+    }
   });
   return app;
 }

@@ -19,7 +19,7 @@ async function setup() {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), 'detent-claude-')));
   const gitlab = { createIssueNote: vi.fn(async () => ({ id: 20 })), syncIssueStatusLabel: vi.fn() };
   const ctx = {
-    config: loadConfig({ HOT_HOLD_TIMEOUT_MS: '5000' }),
+    config: loadConfig({}),
     repo,
     session,
     workspaceRoot: root,
@@ -149,29 +149,31 @@ it('automatically allows every registered workspace tool after plan approval', a
     await rm(root, { recursive: true, force: true });
   }
 });
-it.each(['APPROVED', 'REJECTED'] as const)('persists and wakes a hot tool approval %s', async (status) => {
+it.each(['APPROVED', 'REJECTED'] as const)('suspends and replays a tool approval %s', async (status) => {
   const { repo, session, ctx, gate, root } = await setup();
   try {
     session.permissionMode = 'default';
-    const promise = gate.canUseTool('Bash', { command: 'npm install ioredis' });
-    await vi.waitFor(() => expect(ctx.gitlab.createIssueNote).toHaveBeenCalledOnce());
+    const input = { command: 'npm install ioredis' };
+    await expect(gate.canUseTool('Bash', input)).rejects.toBeInstanceOf(ColdHold);
+    expect(ctx.controller.signal.reason).toBeInstanceOf(ColdHold);
     expect(ctx.checkpoint).toHaveBeenCalledOnce();
     expect(await repo.getApprovalByNoteId(session.id, 20)).toMatchObject({
       status: 'PENDING',
       approvalType: 'TOOL_USE',
     });
-    await gate.resolvePendingApproval(status, 'dev', 'because');
-    expect(await promise).toMatchObject(
+    const row = (await repo.getLatestPendingApproval(session.id))!;
+    await repo.resolveApprovalRequest(row.id, status, 'dev', 'because');
+    const resumed = new PermissionGate({ ...ctx, controller: new AbortController(), previousDecision: (await repo.getApproval(row.id))! });
+    expect(await resumed.canUseTool('Bash', input)).toMatchObject(
       status === 'APPROVED' ? { behavior: 'allow' } : { behavior: 'deny', message: 'because' },
     );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
-it('aborts on timeout and retains the pending question for another pod', async () => {
+it('suspends immediately and retains the pending question for another pod', async () => {
   const { repo, session, ctx, gate, root } = await setup();
   try {
-    ctx.config.hotHoldTimeoutMs = 1;
     await expect(
       gate.canUseTool('AskUserQuestion', { questions: [{ question: 'Which branch?' }] }),
     ).rejects.toBeInstanceOf(ColdHold);

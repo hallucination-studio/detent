@@ -1,7 +1,7 @@
 import { expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { createGitLabReleaseCapability, createGitLabReleaseTools, type ReleaseGitLab } from '../src/index.js';
-import { PermissionGate } from '../src/claude/permission-gate.js';
+import { ColdHold, PermissionGate } from '../src/claude/permission-gate.js';
 import { loadConfig } from '../src/config.js';
 import { InMemoryDetentRepository } from './memory-repository.js';
 
@@ -121,15 +121,17 @@ it('requires approval and writes exactly one tag or release at the pinned SHA', 
 it('rechecks the tag after a human approves the card', async () => {
   const { release, ctx, gitlab } = await setup();
   const notes = { createIssueNote: vi.fn().mockResolvedValue({ id: 41 }), syncIssueStatusLabel: vi.fn() };
-  const gate = new PermissionGate({
+  const context = {
     ...ctx, gitlab: notes, extensionTools: [release], checkpoint: vi.fn(),
-    config: loadConfig({ HOT_HOLD_TIMEOUT_MS: '5000' }), controller: new AbortController(),
-  });
-  const pending = gate.invokeExtension('mcp__detent__detent_create_release', input);
-  await vi.waitFor(() => expect(notes.createIssueNote).toHaveBeenCalledOnce());
+    config: loadConfig({}), controller: new AbortController(),
+  };
+  const tool = 'mcp__detent__detent_create_release';
+  await expect(new PermissionGate(context).invokeExtension(tool, input)).rejects.toBeInstanceOf(ColdHold);
   gitlab.getTag.mockResolvedValue(tag);
-  expect(await gate.resolvePendingApproval('APPROVED')).toBe(true);
-  await expect(pending).rejects.toThrow('已存在');
+  const approval = (await ctx.repo.getLatestPendingApproval(ctx.session.id))!;
+  await ctx.repo.resolveApprovalRequest(approval.id, 'APPROVED', 'dev');
+  const resumed = new PermissionGate({ ...context, controller: new AbortController(), previousDecision: (await ctx.repo.getApproval(approval.id))! });
+  await expect(resumed.invokeExtension(tool, input)).rejects.toThrow('已存在');
   expect(gitlab.createRelease).not.toHaveBeenCalled();
   expect(gitlab.createTag).not.toHaveBeenCalled();
 });

@@ -198,11 +198,16 @@ Both targets run the real bootstrap CLI, Delivery pods and Claude Code binary ag
 
 ```bash
 # Offline GitLab uses Git and git-http-backend
+npm run e2e:smoke
 npm run e2e:offline
 
 # Local GitLab CE 18.3.0 with E2E_GITLAB_ADMIN_TOKEN exported
 E2E_GITLAB_URL=http://127.0.0.1:8080 npm run e2e:gitlab
 ```
+
+Each Claude turn connects to a token-authenticated MCP server on loopback HTTP. Tool approvals and questions checkpoint the transcript, release the Pod lease and resume in a fresh process after an authorized response. Use `jms_list_assets` to find hosts and `jms_shell` with a `commands` array to inspect them in one batch. After production approval, `jms_job` returns a job link and the turn ends. Delivery records the terminal result and wakes the same Issue for verification. `jms_job_status` can retrieve the result for a job owned by the session.
+
+Run `npm run e2e:offline -- --suite=jumpserver` for the JumpServer matrix, including a shell call lasting over 30 seconds. The other focused suites are `install`, `issues`, `mrs`, `concurrency`, and `security`.
 
 Set the live URL to the origin GitLab advertises for HTTP clones. Allow the GitLab container to send project webhooks to `host.docker.internal`. For another route, set `E2E_DETENT_PUBLIC_URL` to the address GitLab can reach and `E2E_POD_PORT` to the corresponding host listener port. Each live run leaves its own `e2e-*/workspace-hub` and three target projects for inspection and revokes its temporary tokens.
 
@@ -276,7 +281,8 @@ An unlabeled Issue has one engineering session with every ready capability pack.
 | `JUMPSERVER_BASE_URL` / `JUMPSERVER_ORG_ID` | Legacy environment-only service URL and optional organization ID. |
 | `JUMPSERVER_READONLY_TOKEN` or `JUMPSERVER_READONLY_ACCESS_KEY_ID` + `JUMPSERVER_READONLY_ACCESS_KEY_SECRET` | Legacy role credentials for asset lookup and read-only inspection. |
 | `JUMPSERVER_JOB_TOKEN` or `JUMPSERVER_JOB_ACCESS_KEY_ID` + `JUMPSERVER_JOB_ACCESS_KEY_SECRET` | Legacy role credentials for Job Center execution. |
-| `JUMPSERVER_READONLY_ACCOUNT` / `JUMPSERVER_TIMEOUT_MS` | Optional legacy inspection account and HTTP timeout (default 30000 ms). |
+| `JUMPSERVER_READONLY_ACCOUNT` / `JUMPSERVER_TIMEOUT_MS` | Optional legacy inspection account and overall operation timeout (default 60000 ms). |
+| `DELIVERY_JOB_POLL_INTERVAL_MS` | Delivery job scan interval in milliseconds. Defaults to 3000. Set to 0 to disable scheduled scans. |
 | `JUMPSERVER_INSPECT_ALLOW_PREFIXES` | Comma-separated allowlisted read-only command prefixes (see [`.env.example`](./.env.example)); arguments are still validated for read-only safety. |
 | `JUMPSERVER_BLOCKED_ASSETS` / `JUMPSERVER_BLOCK_FAILED_PIPELINE` | Blocked asset IDs (default: empty). Failed MR pipelines block execution by default (`false` or `0` to disable). |
 | `DELIVERY_PROD_APPROVERS` | Comma-separated GitLab usernames (case-insensitive) allowed to approve production execution; listed users must also meet `GITLAB_MIN_ACCESS_LEVEL`. |

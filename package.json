@@ -17,6 +17,7 @@
     "dev": "tsx watch packages/core/src/server.ts",
     "bootstrap": "tsx scripts/bootstrap.ts",
     "e2e:gitlab": "npm run build && tsx scripts/e2e/run-offline-e2e.ts",
+    "e2e:smoke": "npm run build && tsx scripts/e2e/run-offline-e2e.ts --suite=smoke",
     "e2e:offline": "npm run build && tsx scripts/e2e/run-offline-e2e.ts"
   },
   "devDependencies": {

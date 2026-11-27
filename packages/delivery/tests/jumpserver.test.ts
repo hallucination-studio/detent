@@ -5,7 +5,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { loadConfig, type DecisionClient, type PermissionMode } from '@detent/core';
 import { SdkClaudeRunner } from '../../core/src/claude/runner.js';
-import { PermissionGate } from '../../core/src/claude/permission-gate.js';
+import { PermissionGate, ColdHold } from '../../core/src/claude/permission-gate.js';
 import { GitLabClient } from '../../core/src/gitlab/client.js';
 import { EphemeralSandbox } from '../../core/src/workspace/ephemeral-sandbox.js';
 import { WorkspaceTools } from '../../core/src/workspace/mcp-tools.js';
@@ -40,12 +40,12 @@ const request: AnsibleJobRequest = {
 };
 const submission = { jobId: 'task-123', status: 'PENDING' as const, jobUrl: base + '/ui/#/workbench/ops/executions/task-123' };
 const result = { ...submission, status: 'SUCCESS' as const, outputSummary: 'healthy' };
-const inspect = { assetIds: ['web01'], command: 'uptime', account: 'readonly' };
+const inspect = { assetIds: ['web01'], commands: ['uptime'], account: 'readonly' };
 const asTool = (name: string) => 'mcp__detent__jms_' + name;
 
 it('validates role-specific configuration and parses list, timeout and pipeline settings', () => {
   expect(loadDeliveryConfig({})).toEqual({
-    enableReleaseTools: true, prodApprovers: [], prodMinAccessLevel: 40, jumpserverTimeoutMs: 30000, blockedAssets: [], blockFailedPipeline: true,
+    enableReleaseTools: true, prodApprovers: [], prodMinAccessLevel: 40, jumpserverTimeoutMs: 60000, deliveryJobPollIntervalMs: 3000, blockedAssets: [], blockFailedPipeline: true,
     inspectAllowPrefixes: ['systemctl status', 'nginx -t', 'df -h', 'free -m', 'uptime', 'ss -tlnp', 'kubectl get', 'cat /etc/nginx'],
   });
   expect(loadDeliveryConfig({ ...env, JUMPSERVER_TIMEOUT_MS: '4500', JUMPSERVER_READONLY_ACCOUNT: 'audit',
@@ -65,6 +65,8 @@ it('validates role-specific configuration and parses list, timeout and pipeline 
   for (const value of ['false', '0']) expect(loadDeliveryConfig({ JUMPSERVER_BLOCK_FAILED_PIPELINE: value }).blockFailedPipeline).toBe(false);
   expect(() => loadDeliveryConfig({ JUMPSERVER_BASE_URL: 'invalid' })).toThrow();
   expect(() => loadDeliveryConfig({ JUMPSERVER_TIMEOUT_MS: '0' })).toThrow();
+  expect(loadDeliveryConfig({ DELIVERY_JOB_POLL_INTERVAL_MS: '0' }).deliveryJobPollIntervalMs).toBe(0);
+  expect(() => loadDeliveryConfig({ DELIVERY_JOB_POLL_INTERVAL_MS: '-1' })).toThrow();
 });
 
 function http() {
@@ -98,7 +100,7 @@ it('fails before I/O if the required credential is missing, and never changes ro
   const config = loadDeliveryConfig(env);
   const jobOnly = new HttpJumpServerClient({ ...config, jumpserverReadonlyAuth: undefined });
   await expect(jobOnly.listAssets({})).rejects.toThrow('readonly');
-  await expect(jobOnly.runReadonlyInspect(inspect)).rejects.toThrow('readonly');
+  await expect(jobOnly.runShell(inspect)).rejects.toThrow('readonly');
   const readOnly = new HttpJumpServerClient({ ...config, jumpserverJobAuth: undefined });
   await expect(readOnly.runAnsibleJob(request)).rejects.toThrow('job');
   await expect(new HttpJumpServerClient(loadDeliveryConfig({ JUMPSERVER_BASE_URL: base })).getJobResult('1')).rejects.toThrow('credentials');
@@ -108,11 +110,11 @@ it('fails before I/O if the required credential is missing, and never changes ro
   reply({ id: 'definition', task_id: 'execution' });
   reply({ status: { value: 'success', label: 'Success' }, summary: { ok: ['web01'] } });
   reply({ result: { stdout: 'load average' } });
-  expect(await new HttpJumpServerClient(config).runReadonlyInspect(inspect)).toMatchObject({
+  expect(await new HttpJumpServerClient(config).runShell(inspect)).toMatchObject({
     jobId: 'execution', status: 'SUCCESS', outputSummary: expect.stringContaining('load average'),
   });
   expect(JSON.parse(String(fetch.mock.calls[1][1]?.body))).toEqual({
-    instant: true, is_periodic: false, type: 'adhoc', module: 'shell', args: 'uptime', assets: ['web01'], runas: 'readonly', runas_policy: 'skip', timeout: 30,
+    instant: true, is_periodic: false, type: 'adhoc', module: 'shell', args: 'uptime', assets: ['web01'], runas: 'readonly', runas_policy: 'skip', timeout: 60,
   });
   reply({ status: 'running', summary: {} });
   await readOnly.getJobResult('execution');
@@ -152,10 +154,9 @@ it.each([3, 4])('runs the SHA-pinned playbook with native job parameters on v%s'
     expect(new Headers(init?.headers).get('authorization')).toBe('Bearer ' + env.JUMPSERVER_JOB_TOKEN);
     expect(new Headers(init?.headers).has('private-token')).toBe(false);
   }
-  reply(['@SPEC', 'ops-first', 'root']);
   fetch.mockResolvedValueOnce(new Response(Uint8Array.from(zipSync(files))));
   await expect(client.runAnsibleJob({ ...request, playbookPath: 'other.yml' })).rejects.toThrow('missing');
-  expect(fetch).toHaveBeenCalledTimes(7);
+  expect(fetch).toHaveBeenCalledTimes(6);
 });
 
 it('redacts GitLab and JumpServer credentials when the playbook archive fetch fails', async () => {
@@ -228,7 +229,7 @@ async function setup(mode: PermissionMode = 'default', config: DeliveryConfig = 
   };
   const client = {
     listAssets: vi.fn<JumpServerClient['listAssets']>().mockResolvedValue([]),
-    runReadonlyInspect: vi.fn<JumpServerClient['runReadonlyInspect']>().mockResolvedValue(result),
+    runShell: vi.fn<JumpServerClient['runShell']>().mockResolvedValue(result),
     runAnsibleJob: vi.fn<JumpServerClient['runAnsibleJob']>().mockResolvedValue(submission),
     getJobResult: vi.fn<JumpServerClient['getJobResult']>().mockResolvedValue(result),
   };
@@ -236,39 +237,46 @@ async function setup(mode: PermissionMode = 'default', config: DeliveryConfig = 
   const gitlab = { createIssueNote: vi.fn(async (_p: number, _i: number, _card: string) => ({ id: 12 })), syncIssueStatusLabel: vi.fn() };
   const core = loadConfig({});
   const controller = new AbortController();
-  const gate = new PermissionGate({ config: core, repo, session, gitlab, checkpoint: vi.fn(), controller,
-    workspaceRoot: '/workspace', extensionTools: tools });
+  const context = { config: core, repo, session, gitlab, checkpoint: vi.fn(), controller, workspaceRoot: '/workspace', extensionTools: tools };
+  const gate = new PermissionGate(context);
+  async function replay(args: Record<string, unknown>, status: 'APPROVED' | 'REJECTED' = 'APPROVED') {
+    const pending = (await repo.getLatestPendingApproval(session.id))!;
+    await repo.resolveApprovalRequest(pending.id, status, 'ops', 'declined');
+    const previousDecision = (await repo.getApproval(pending.id))!;
+    const nextGate = new PermissionGate({ ...context, controller: new AbortController(), previousDecision });
+    return { gate: nextGate, result: await nextGate.invokeExtension(asTool('job'), args) };
+  }
   const mr = { sessionId: session.id, targetProjectId: 7, mrIid: 8, mrState: 'merged' as const,
     mrWebUrl: 'https://git.test/ops/site/-/merge_requests/8', mrTitle: 'Deploy', targetProjectPath: 'ops/site',
     mergeCommitSha: sha, mergedBy: 'reviewer', worktreeId: null, sourceBranch: 'change', targetBranch: 'main',
     latestPipelineStatus: 'success', latestPipelineId: 1 };
-  return { gate, client, session, repo, mr, gitlab, tracker, records, core, tools, controller };
+  return { replay, gate, client, session, repo, mr, gitlab, tracker, records, core, tools, controller };
 }
 
 it.each(['plan', 'default'] as const)('gates readonly inspection and lists assets in %s mode', async mode => {
   const { client, gate, gitlab, tools } = await setup(mode);
   await gate.invokeExtension(asTool('list_assets'), { node_id: 'node', search: 'web', limit: 3 });
   expect(client.listAssets).toHaveBeenCalledExactlyOnceWith({ nodeId: 'node', search: 'web', limit: 3 });
-  for (const command of safeCommands) await gate.invokeExtension(asTool('readonly_inspect'), { asset_ids: ['web01'], command });
-  expect(client.runReadonlyInspect).toHaveBeenCalledTimes(safeCommands.length);
+  for (const command of safeCommands) await gate.invokeExtension(asTool('shell'), { asset_ids: ['web01'], commands: [command] });
+  expect(client.runShell).toHaveBeenCalledTimes(safeCommands.length);
   for (const command of unsafeCommands) {
-    const args = { asset_ids: ['web01'], command };
-    expect(await gate.canUseTool(asTool('readonly_inspect'), args), command).toMatchObject({ behavior: 'deny' });
-    await expect(gate.invokeExtension(asTool('readonly_inspect'), args)).rejects.toThrow();
+    const args = { asset_ids: ['web01'], commands: [command] };
+    expect(await gate.canUseTool(asTool('shell'), args), command).toMatchObject({ behavior: 'deny' });
+    await expect(gate.invokeExtension(asTool('shell'), args)).rejects.toThrow();
   }
-  await expect(gate.invokeExtension(asTool('readonly_inspect'), { asset_ids: ['RESTRICTED'], command: 'uptime' })).rejects.toThrow('黑名单');
-  expect(client.runReadonlyInspect).toHaveBeenCalledTimes(safeCommands.length);
-  await gate.invokeExtension(asTool('readonly_inspect'), { asset_ids: ['web01'], command: '  systemctl\t status  nginx ' });
-  expect(client.runReadonlyInspect).toHaveBeenLastCalledWith({ assetIds: ['web01'], account: undefined, command: 'systemctl status nginx' });
-  const schema = z.object(tools.find(tool => tool.name === 'jms_readonly_inspect')!.schema);
-  expect(schema.safeParse({ asset_ids: ['web01'], command: 'uptime\n' }).success).toBe(false);
+  await expect(gate.invokeExtension(asTool('shell'), { asset_ids: ['RESTRICTED'], commands: ['uptime'] })).rejects.toThrow('黑名单');
+  expect(client.runShell).toHaveBeenCalledTimes(safeCommands.length);
+  await gate.invokeExtension(asTool('shell'), { asset_ids: ['web01'], commands: ['  systemctl\t status  nginx '] });
+  expect(client.runShell).toHaveBeenLastCalledWith({ assetIds: ['web01'], account: undefined, commands: ['systemctl status nginx'] });
+  const schema = z.object(tools.find(tool => tool.name === 'jms_shell')!.schema);
+  expect(schema.safeParse({ asset_ids: ['web01'], commands: ['uptime\n'] }).success).toBe(false);
   expect(gitlab.createIssueNote).not.toHaveBeenCalled();
 });
 
 it('denies jobs in plan mode before looking up the MR', async () => {
   const { gate, client, gitlab, repo } = await setup('plan');
   const list = vi.spyOn(repo, 'listSessionMergeRequests');
-  await expect(gate.invokeExtension(asTool('run_ansible_job'), input)).rejects.toThrow('detent_submit_plan');
+  await expect(gate.invokeExtension(asTool('job'), input)).rejects.toThrow('detent_submit_plan');
   expect(list).not.toHaveBeenCalled(); expect(gitlab.createIssueNote).not.toHaveBeenCalled(); expect(client.runAnsibleJob).not.toHaveBeenCalled();
 });
 
@@ -284,19 +292,19 @@ it.each([
 ] as const)('hard-denies %s before posting a card or contacting JumpServer', async (_case, change, args, reason) => {
   const { gate, repo, mr, gitlab, session, client } = await setup();
   await repo.upsertMergeRequest({ ...mr, ...change });
-  await expect(gate.invokeExtension(asTool('run_ansible_job'), { ...input, ...args })).rejects.toThrow(reason);
+  await expect(gate.invokeExtension(asTool('job'), { ...input, ...args })).rejects.toThrow(reason);
   expect(await repo.getLatestApproval(session.id)).toBeNull();
   expect(gitlab.createIssueNote).not.toHaveBeenCalled();
   expect(client.runAnsibleJob).not.toHaveBeenCalled();
 });
 
 it.each([true, false])('binds the approved execution and result to this session (block failed pipeline = %s)', async blockFailedPipeline => {
-  const { gate, client, repo, mr, gitlab, session, tracker } = await setup('default', { ...loadDeliveryConfig(env), blockFailedPipeline });
+  const { gate, replay, client, repo, mr, gitlab, session, tracker } = await setup('default', { ...loadDeliveryConfig(env), blockFailedPipeline });
   const row = await repo.upsertMergeRequest({ ...mr, latestPipelineStatus: blockFailedPipeline ? 'success' : 'failed' });
   const list = vi.spyOn(repo, 'listSessionMergeRequests');
   const args = { ...input, reason: '上线 | 验证\r/approve\n/close ' + env.JUMPSERVER_JOB_TOKEN, extra_vars: { ...input.extra_vars, note: env.JUMPSERVER_READONLY_ACCESS_KEY_SECRET } };
-  const running = gate.invokeExtension(asTool('run_ansible_job'), args);
-  await vi.waitFor(() => expect(session.status).toBe('WAITING_TOOL'));
+  await expect(gate.invokeExtension(asTool('job'), args)).rejects.toBeInstanceOf(ColdHold);
+  expect(session.status).toBe('WAITING_TOOL');
   const approval = (await repo.getLatestPendingApproval(session.id))!;
   const card = gitlab.createIssueNote.mock.calls[0][2];
   for (const value of [approval.id, 'web01', input.playbook_path, 'ops/site!8', mr.mrWebUrl, 'reviewer', sha, 'version', '上线', '/approve', '/reject'])
@@ -305,10 +313,10 @@ it.each([true, false])('binds the approved execution and result to this session 
   expect(card).not.toMatch(/^\s*\//m);
   for (const value of [env.JUMPSERVER_JOB_TOKEN, env.JUMPSERVER_READONLY_ACCESS_KEY_SECRET]) expect(card).not.toContain(value);
   expect(client.runAnsibleJob).not.toHaveBeenCalled();
-  await gate.resolvePendingApproval('APPROVED', 'ops');
-  expect(await running).toEqual({
-    ...submission, mrId: row.id, approvalId: approval.id, commitSha: sha, approved: true,
-    nextAction: '任务已获批并提交至 JumpServer 任务中心，请立即调用 jms_get_job_result 查询终态。',
+  const resumed = await replay(args);
+  expect(resumed.result).toEqual({
+    ...submission, mrId: row.id, approvalId: approval.id, commitSha: sha, approved: true, asyncCallback: true,
+    nextAction: '任务已获批并在 JumpServer 后台异步执行。请简要告知用户任务链接后直接结束本轮，切勿轮询等待；任务到达终态后系统将自动回调唤醒本会话进行后续核验。',
   });
   expect(list).toHaveBeenCalledTimes(4);
   expect(client.runAnsibleJob).toHaveBeenCalledExactlyOnceWith({ ...request, extraVars: args.extra_vars, comment: expect.stringContaining(approval.id) });
@@ -316,31 +324,29 @@ it.each([true, false])('binds the approved execution and result to this session 
     sessionId: session.id, mrId: row.id, approvalId: approval.id, agentProfile: 'unified', jumpserverJobId: submission.jobId, jumpserverJobUrl: submission.jobUrl,
     playbookPath: request.playbookPath, commitSha: sha, targetAssets: input.asset_ids, status: submission.status,
   });
-  expect(await gate.invokeExtension(asTool('get_job_result'), { job_id: submission.jobId })).toEqual(result);
+  expect(client.getJobResult).not.toHaveBeenCalled();
+  expect(await resumed.gate.invokeExtension(asTool('job_status'), { job_id: submission.jobId })).toEqual(result);
   expect(client.getJobResult).toHaveBeenCalledExactlyOnceWith(submission.jobId);
   expect(tracker.updateExecutionResult).toHaveBeenCalledExactlyOnceWith(session.id, submission.jobId, 'SUCCESS', result.outputSummary);
 });
 
 it.each(['reject', 'pipeline changes', 'merge changes at dispatch'])('aborts submission when %s', async scenario => {
-  const { gate, client, session, repo, mr, tracker } = await setup();
+  const { gate, replay, client, repo, mr, tracker } = await setup();
   const row = await repo.upsertMergeRequest(mr);
-  const run = gate.invokeExtension(asTool('run_ansible_job'), input);
-  await vi.waitFor(() => expect(session.status).toBe('WAITING_TOOL'));
+  await expect(gate.invokeExtension(asTool('job'), input)).rejects.toBeInstanceOf(ColdHold);
   if (scenario === 'pipeline changes') await repo.updateMergeRequestPipeline(row.id, 2, 'failed');
   if (scenario === 'merge changes at dispatch') vi.spyOn(repo, 'listSessionMergeRequests').mockResolvedValueOnce([row]).mockResolvedValueOnce([]);
-  await gate.resolvePendingApproval(scenario === 'reject' ? 'REJECTED' : 'APPROVED', 'ops', 'declined');
-  await expect(run).rejects.toThrow(scenario === 'reject' ? 'declined' : scenario === 'pipeline changes' ? '流水线' : '不属于');
+  await expect(replay(input, scenario === 'reject' ? 'REJECTED' : 'APPROVED')).rejects.toThrow(scenario === 'reject' ? 'declined' : scenario === 'pipeline changes' ? '流水线' : '不属于');
   expect(client.runAnsibleJob).not.toHaveBeenCalled();
   expect(tracker.recordExecution).not.toHaveBeenCalled();
 });
 
 it('reports the submitted job when tracking fails without resubmitting or exposing the storage error', async () => {
-  const { gate, repo, mr, tracker, client, session } = await setup();
+  const { gate, replay, repo, mr, tracker, client } = await setup();
   await repo.upsertMergeRequest(mr);
   tracker.recordExecution.mockRejectedValueOnce(Error(env.JUMPSERVER_JOB_TOKEN));
-  const run = gate.invokeExtension(asTool('run_ansible_job'), input);
-  await vi.waitFor(() => expect(session.status).toBe('WAITING_TOOL'));
-  await gate.resolvePendingApproval('APPROVED');
+  await expect(gate.invokeExtension(asTool('job'), input)).rejects.toBeInstanceOf(ColdHold);
+  const run = replay(input);
   await expect(run).rejects.toThrow(submission.jobUrl);
   await expect(run).rejects.not.toThrow(env.JUMPSERVER_JOB_TOKEN);
   expect(client.runAnsibleJob).toHaveBeenCalledOnce();
@@ -349,7 +355,7 @@ it('reports the submitted job when tracking fails without resubmitting or exposi
 it.each([true, false])('refuses results without evidence of session ownership (tracker = %s)', async tracking => {
   const { gate, client, tracker, records } = await setup('plan', loadDeliveryConfig(env), tracking);
   records.set(submission.jobId, 'other-session');
-  await expect(gate.invokeExtension(asTool('get_job_result'), { job_id: submission.jobId })).rejects.toThrow(tracking ? '不属于' : '未配置');
+  await expect(gate.invokeExtension(asTool('job_status'), { job_id: submission.jobId })).rejects.toThrow(tracking ? '不属于' : '未配置');
   expect(client.getJobResult).not.toHaveBeenCalled();
   expect(tracker.updateExecutionResult).not.toHaveBeenCalled();
 });
@@ -372,35 +378,35 @@ it('evaluates eligible remote diagnostics once, preserves quoted arguments and c
     effect: { type: 'choice', choice: 'pure_readonly' }, zero_side_effect: { type: 'noul', noul: 0.96 }, impact: { type: 'score', score: 0.6 },
   });
   const { gate, client } = await setup('plan', loadDeliveryConfig(env), true, { provider: 'custom', threshold: 0.9, decide });
-  const tool = asTool('readonly_inspect');
-  await gate.invokeExtension(tool, { asset_ids: ['web01'], command: 'uptime' });
+  const tool = asTool('shell');
+  await gate.invokeExtension(tool, { asset_ids: ['web01'], commands: ['uptime'] });
   for (const command of [
     'systemctl restart nginx', 'rm -rf /tmp/x', 'sudo uptime', 'cat /etc/shadow', 'kubectl get secrets',
     'curl -X POST http://127.0.0.1/', 'curl -sI https://evil.example/', 'curl -sI http://localhost@evil.example/',
     "curl http://localhost/ '|' uptime https://evil.example/", 'cat /etc/nginx/.env', 'cat /etc//shadow',
     'ps aux | tee log', 'nginx -t -g daemon', 'kubectl get pods -o go-template-file=x', 'ss -K',
     'df --sync', 'sed -i s/a/b/ f', 'find . -exec ls', "awk 'system(cmd)'",
-  ]) expect(await gate.canUseTool(tool, { asset_ids: ['web01'], command }), command).toMatchObject({ behavior: 'deny' });
+  ]) expect(await gate.canUseTool(tool, { asset_ids: ['web01'], commands: [command] }), command).toMatchObject({ behavior: 'deny' });
   expect(decide).not.toHaveBeenCalled();
-  await gate.invokeExtension(tool, { asset_ids: ['web01'], command: 'ss -lntp' });
+  await gate.invokeExtension(tool, { asset_ids: ['web01'], commands: ['ss -lntp'] });
   expect(decide).not.toHaveBeenCalled();
   for (const command of ['journalctl -u nginx -n 20', 'ps aux | grep nginx',
     "ps aux | grep 'two  words'", 'curl -sI http://127.0.0.1/healthz']) {
-    await gate.invokeExtension(tool, { asset_ids: ['web01'], command });
+    await gate.invokeExtension(tool, { asset_ids: ['web01'], commands: [command] });
     expect(decide.mock.lastCall?.[0]).toEqual({ surface: 'remote_jumpserver_readonly_inspect', command });
-    expect(client.runReadonlyInspect).toHaveBeenLastCalledWith({ assetIds: ['web01'], account: undefined, command });
+    expect(client.runShell).toHaveBeenLastCalledWith({ assetIds: ['web01'], account: undefined, commands: [command] });
   }
   expect(decide).toHaveBeenCalledTimes(4);
-  await expect(gate.invokeExtension(tool, { asset_ids: ['restricted'], command: 'ss -lntp' })).rejects.toThrow('黑名单');
+  await expect(gate.invokeExtension(tool, { asset_ids: ['restricted'], commands: ['ss -lntp'] })).rejects.toThrow('黑名单');
   for (const [choice, noul, score] of [['state_mutating', 1, 0], ['pure_readonly', 0.74, 0], ['pure_readonly', 1, 1.4]] as const) {
     decide.mockResolvedValueOnce({ effect: { type: 'choice', choice }, zero_side_effect: { type: 'noul', noul }, impact: { type: 'score', score } });
-    await expect(gate.invokeExtension(tool, { asset_ids: ['web01'], command: 'date' })).rejects.toThrow(`Jev: choice=${choice}, noul=${noul}, impact=${score}`);
+    await expect(gate.invokeExtension(tool, { asset_ids: ['web01'], commands: ['date'] })).rejects.toThrow(`Jev: choice=${choice}, noul=${noul}, impact=${score}`);
   }
   decide.mockResolvedValueOnce({ effect: { type: 'choice', choice: 'pure_readonly' }, zero_side_effect: { type: 'noul', noul: 0.75 }, impact: { type: 'score', score: 1.35 } });
-  await gate.invokeExtension(tool, { asset_ids: ['web01'], command: 'date' });
+  await gate.invokeExtension(tool, { asset_ids: ['web01'], commands: ['date'] });
   decide.mockRejectedValueOnce(Error('provider timeout'));
-  await expect(gate.invokeExtension(tool, { asset_ids: ['web01'], command: 'date' })).rejects.toThrow('provider timeout');
-  expect(client.runReadonlyInspect).toHaveBeenCalledTimes(7);
+  await expect(gate.invokeExtension(tool, { asset_ids: ['web01'], commands: ['date'] })).rejects.toThrow('provider timeout');
+  expect(client.runShell).toHaveBeenCalledTimes(7);
 });
 
 it('lists real, active accounts in server order and falls back to asset detail only on 404', async () => {
@@ -410,21 +416,28 @@ it('lists real, active accounts in server order and falls back to asset detail o
     { username: ' ops ' }, 'root', 'ops', { name: 'backup' }, { alias: 'worker' }] });
   expect(await client.listAssetAccounts('host/id')).toEqual(['ops', 'root', 'backup', 'worker']);
   expect(String(fetch.mock.calls[0][0])).toBe(base + '/api/v1/perms/users/self/assets/host%2Fid/accounts/');
-  for (const key of ['permed_accounts', 'accounts']) {
-    reply({}, 404);
-    reply({ [key]: ['@USER', 'ubuntu'] });
-    expect(await client.listAssetAccounts('host')).toEqual(['ubuntu']);
-    expect(String(fetch.mock.lastCall?.[0])).toBe(base + '/api/v1/perms/users/self/assets/host/');
-  }
-  reply({}, 403);
-  await expect(client.listAssetAccounts('host')).rejects.toThrow('403');
-  expect(fetch).toHaveBeenCalledTimes(6);
+  reply({}, 404);
+  reply({ permed_accounts: ['@USER', 'ubuntu'] });
+  expect(await client.listAssetAccounts('host')).toEqual(['ubuntu']);
+  expect(await client.listAssetAccounts('host')).toEqual(['ubuntu']);
+  expect(fetch).toHaveBeenCalledTimes(3);
+  reply({ accounts: ['ops'] });
+  expect(await client.listAssetAccounts('host', { kind: 'bearer', token: 'other' })).toEqual(['ops']);
+  const now = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 60001);
+  try {
+    reply({ accounts: ['rotated'] });
+    expect(await client.listAssetAccounts('host')).toEqual(['rotated']);
+    reply({}, 403);
+    await expect(client.listAssetAccounts('unavailable')).rejects.toThrow('403');
+  } finally { now.mockRestore(); }
+  expect(fetch.mock.calls.slice(2).map(([url]) => String(url))).toEqual(
+    ['host', 'host', 'host', 'unavailable'].map(id => base + '/api/v1/perms/users/self/assets/' + id + '/'));
 });
 
 it('rejects unauthorized explicit accounts before any job is submitted', async () => {
   const { reply, fetch } = http();
   const client = new HttpJumpServerClient(loadDeliveryConfig(env));
-  for (const call of [() => client.runReadonlyInspect({ ...inspect, account: 'ghost' }),
+  for (const call of [() => client.runShell({ ...inspect, account: 'ghost' }),
     () => client.runAnsibleJob({ ...request, account: 'ghost' })]) {
     reply(['@INPUT', 'ops-hub', 'audit-ro']);
     await expect(call()).rejects.toThrow('资产 web01 未授权账号 ghost；可用授权账号：ops-hub、audit-ro');
@@ -443,12 +456,13 @@ it('groups inspection by the first active real account and reports every group�
     reply({ status, summary: {} });
     reply({ result: { stdout: id + '-output' } });
   }
-  const grouped = await client.runReadonlyInspect({ assetIds: ['a', 'b', 'c'], command: 'uptime' });
+  const grouped = await client.runShell({ assetIds: ['a', 'b', 'c'], commands: ['uptime', 'df -h'] });
   const jobs = fetch.mock.calls.filter(([, init]) => init?.method === 'POST').map(([, init]) => JSON.parse(String(init?.body)));
   expect(jobs).toEqual([
     expect.objectContaining({ assets: ['a', 'c'], runas: 'ops-first', runas_policy: 'skip' }),
     expect.objectContaining({ assets: ['b'], runas: 'ops-second', runas_policy: 'skip' }),
   ]);
+  for (const job of jobs) expect(job.args).toMatch(/set \+e[\s\S]*uptime[\s\S]*df -h/);
   expect(grouped).toMatchObject({ status: 'FAILED', groups: [
     { assetIds: ['a', 'c'], account: 'ops-first', jobId: 'first', status: 'SUCCESS' },
     { assetIds: ['b'], account: 'ops-second', jobId: 'second', status: 'FAILED' },
@@ -463,7 +477,8 @@ it('requires a common account for playbooks and rejects empty authorizations bef
   reply(['@INPUT', 'ops-second', 'root']);
   await expect(client.runAnsibleJob({ ...request, assetIds })).rejects.toThrow(/共同的 account.*分组执行/);
   for (const account of [undefined, 'root']) {
-    for (const invoke of [() => client.runReadonlyInspect({ ...inspect, account, assetIds }),
+    const client = new HttpJumpServerClient(loadDeliveryConfig(env));
+    for (const invoke of [() => client.runShell({ ...inspect, account, assetIds }),
       () => client.runAnsibleJob({ ...request, account, assetIds })]) {
       reply(['root']);
       reply(['@USER', '@ANON', { username: 'root', is_active: false }]);

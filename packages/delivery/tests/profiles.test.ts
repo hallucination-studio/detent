@@ -36,7 +36,7 @@ async function resolve(labels: string[], env = {}, capabilities?: DetentCapabili
 }
 
 it('requires a listed project member or the configured production level, keeping normal Plan permissions', async () => {
-  const approve = { projectId: 1, userId: 30, username: 'SrE', approvalType: 'TOOL_USE' as const, toolName: 'jms_run_ansible_job' };
+  const approve = { projectId: 1, userId: 30, username: 'SrE', approvalType: 'TOOL_USE' as const, toolName: 'jms_job' };
   const { profile, gitlab } = await resolve([], { DELIVERY_PROD_APPROVERS: ' oncall, SRE , ' }, [jumpserver]);
   expect(await profile.canApprove!({ ...approve, username: 'other', userId: 40 })).toBe(false);
   expect(gitlab.hasApprovalPermission).not.toHaveBeenCalled();
@@ -56,8 +56,8 @@ it('requires a listed project member or the configured production level, keeping
 it('completes inspections without Plan approval and enforces readonly on a default-mode resume', async () => {
   const { repo, gitlab, notes, config, deliveryConfig, client } = await deliveryFixture(['delivery::audit']);
   const run = vi.fn(async ({ gate, tools, sandbox }: TurnInput) => {
-    await gate.invokeExtension('mcp__detent__jms_readonly_inspect', { asset_ids: ['web01'], command: 'uptime' });
-    for (const name of ['Write', 'Edit', 'Bash', 'mcp__detent__detent_create_mr', 'mcp__detent__jms_run_ansible_job'])
+    await gate.invokeExtension('mcp__detent__jms_shell', { asset_ids: ['web01'], commands: ['uptime'] });
+    for (const name of ['Write', 'Edit', 'Bash', 'mcp__detent__detent_create_mr', 'mcp__detent__jms_job'])
       expect(await gate.preflight(name, { file_path: sandbox.workspaceRoot + '/file', command: 'git status' })).toMatchObject({ behavior: 'deny' });
     await expect(tools.invoke('detent_create_mr', {})).rejects.toThrow('read-only');
     return 'Diagnostic report';
@@ -72,7 +72,7 @@ it('completes inspections without Plan approval and enforces readonly on a defau
   await orchestrator.resumeSession(s.id, 'inspect again', { permissionMode: 'default' });
   expect(await repo.getSession(s.id)).toMatchObject({ status: 'IDLE', permissionMode: 'default' });
   expect(await repo.getLatestApproval(s.id)).toBeNull();
-  expect(client.runReadonlyInspect).toHaveBeenCalledTimes(2);
+  expect(client.runShell).toHaveBeenCalledTimes(2);
   expect(client.runAnsibleJob).not.toHaveBeenCalled();
   expect(notes.at(-1)).toContain('Diagnostic report');
 });
@@ -87,7 +87,7 @@ function tool(name: string, policy: 'readonly' | 'always_approve') {
 const release = { name: 'gitlab-release', enabled: true,
   tools: [tool('detent_list_tags', 'readonly'), tool('detent_create_release', 'always_approve')] };
 const jumpserver = { name: 'jumpserver', enabled: true,
-  tools: [tool('jms_readonly_inspect', 'readonly'), tool('jms_run_ansible_job', 'always_approve')] };
+  tools: [tool('jms_shell', 'readonly'), tool('jms_job', 'always_approve')] };
 const disabled = { ...jumpserver, enabled: false, setupHint: '请配置 JUMPSERVER_BASE_URL' };
 const approve = { projectId: 1, userId: 30, username: 'dev', approvalType: 'TOOL_USE' as const, toolName: 'Bash' };
 
@@ -184,7 +184,7 @@ it('lists available Hub routes and gives setup instructions and ready alternativ
   expect(profile).toMatchObject({ readonly: true, disableBash: true, enabledExtensionTools: [] });
   for (const text of ['jumpserver', disabled.setupHint, '### ⚪ 当前能力尚未开通', 'delivery::release', 'delivery::code', 'agent::image-sync'])
     expect(profile.blockedMessage).toContain(text);
-  expect(await profile.canApprove!({ ...approve, userId: 50, toolName: 'jms_run_ansible_job' })).toBe(false);
+  expect(await profile.canApprove!({ ...approve, userId: 50, toolName: 'jms_job' })).toBe(false);
   const { profile: unified, currentProfile } = await resolve([], {}, [release, disabled], agentTemplates);
   expect(unified).toMatchObject({ name: 'unified', readonly: false, disableBash: false, closePolicy: 'manual',
     enabledExtensionTools: ['detent_list_tags', 'detent_create_release'] });
@@ -230,7 +230,7 @@ it('fits workflow display names into the execution audit column and retains the 
 });
 
 it.each([
-  ['agent::onboarding', 'detent_onboard_project'], ['delivery::release', 'detent_create_release'], ['delivery::env-change', 'jms_run_ansible_job'],
+  ['agent::onboarding', 'detent_onboard_project'], ['delivery::release', 'detent_create_release'], ['delivery::env-change', 'jms_job'],
 ])('enforces the production gate and rechecks pending cards after a label switch for %s', async (label, toolName) => {
   const labels = [label];
   const files = Object.fromEntries(Object.entries(agentTemplates).map(([name, content]) => [name, content.replace('approver_tier: prod', 'approver_tier: standard')]));

@@ -18,11 +18,14 @@ export async function runKafkaSession(h: Pick<Harness, 'gitlab' | 'hub' | 'openI
   const audit = await h.state(iid, 'IDLE', 0);
   const notes = () => gitlab.listIssueNotes(hub, iid);
   const report = (await notes()).find(n => n.body.includes('🔍 工具调用轨迹'))?.body ?? '';
-  for (const field of ['Read', 'agents/audit/AGENT.md', 'jms_list_assets', 'jms_readonly_inspect', ...kafkaCommands])
+  for (const field of ['Read', 'agents/audit/AGENT.md', 'jms_list_assets', 'jms_shell', ...kafkaCommands])
     assert.ok(report.includes(field), 'Missing audit trace field ' + field);
   assert.doesNotMatch(report, /\bTask\b|实施方案审批/);
   assert.match(report.split('<details>')[0], /kafka\.Kafka.*9092.*dev-orders/s);
-  assert.deepEqual(service.runAs.slice(start).map(r => r.command), kafkaCommands);
+  const submitted = service.runAs.slice(start);
+  assert.equal(submitted.length, 1);
+  assert.deepEqual(submitted[0].command.split('\n').filter(line => kafkaCommands.some(command => line === command)), kafkaCommands);
+  assert.equal(report.match(/\*\*`jms_shell`\*\*/g)?.length, 1);
   assert.deepEqual(h.jev.requests.slice(decisions), [kafkaCommands[0], kafkaCommands[2]]);
   assert.deepEqual(await h.records(audit.id, 'approval_requests'), []);
   assert.deepEqual((await gitlab.getIssue(hub, iid)).labels, ['claude::idle']);

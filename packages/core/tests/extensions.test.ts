@@ -1,7 +1,8 @@
 import { expect, expectTypeOf, it, vi } from 'vitest';
-import { createSdkMcpServer, query } from '@anthropic-ai/claude-code';
+import { turnMcpClient } from './turn-mcp-client.js';
+import { query } from '@anthropic-ai/claude-code';
 import { z } from 'zod';
-import { PermissionGate } from '../src/claude/permission-gate.js';
+import { PermissionGate, ColdHold } from '../src/claude/permission-gate.js';
 import { SdkClaudeRunner } from '../src/claude/runner.js';
 import { loadConfig } from '../src/config.js';
 import { createDetentApp, defineExtensionTool, SessionBusy } from '../src/index.js';
@@ -17,7 +18,6 @@ vi.mock('@anthropic-ai/claude-code', async (original) => {
   const sdk = await original<typeof import('@anthropic-ai/claude-code')>();
   return {
     ...sdk,
-    createSdkMcpServer: vi.fn(sdk.createSdkMcpServer),
     query: vi.fn(async function* () {
       yield { type: 'result', subtype: 'success', session_id: 'session', result: 'done' };
     }),
@@ -103,15 +103,15 @@ it('blocks before creating an approval and before a previously approved operatio
   expect(ctx.gitlab.createIssueNote).not.toHaveBeenCalled();
   expect(await ctx.repo.getLatestApproval(ctx.session.id)).toBeNull();
 
-  const result = gate.invokeExtension(toolId, input);
-  await vi.waitFor(() => expect(ctx.gitlab.createIssueNote).toHaveBeenCalledOnce());
+  await expect(gate.invokeExtension(toolId, input)).rejects.toBeInstanceOf(ColdHold);
   const approval = (await ctx.repo.getApprovalByNoteId(ctx.session.id, 20))!;
   expect(ctx.gitlab.createIssueNote).toHaveBeenCalledWith(1, 42, approval.id + ' / sample / https://oauth2:***@git/sample');
   expect(ctx.checkpoint).toHaveBeenCalledOnce();
   expect(execute).not.toHaveBeenCalled();
   guard.mockResolvedValue({ ok: false, reason: 'state changed' });
-  await gate.resolvePendingApproval('APPROVED');
-  await expect(result).rejects.toThrow('state changed');
+  await ctx.repo.resolveApprovalRequest(approval.id, 'APPROVED', 'dev');
+  const replay = new PermissionGate({ ...ctx, controller: new AbortController(), previousDecision: (await ctx.repo.getApproval(approval.id))! });
+  await expect(replay.invokeExtension(toolId, input)).rejects.toThrow('state changed');
   expect(guard).toHaveBeenCalledTimes(3);
   expect(execute).not.toHaveBeenCalled();
 });
@@ -120,56 +120,50 @@ it('replays a cold approval for matching input only and consumes it once', async
   const { ctx, execute, guard } = await setup('acceptEdits', 'always_approve');
   const row = await ctx.repo.createApprovalRequest(ctx.session.id, 'TOOL_USE', 'example', input);
   await ctx.repo.resolveApprovalRequest(row.id, 'APPROVED', 'dev');
-  const gate = new PermissionGate({ ...ctx, previousDecision: (await ctx.repo.getApproval(row.id))! });
-  const mismatch = gate.invokeExtension(toolId, { item: 'changed' });
-  await vi.waitFor(() => expect(ctx.gitlab.createIssueNote).toHaveBeenCalledOnce());
-  await gate.resolvePendingApproval('REJECTED', 'dev', 'different input');
-  await expect(mismatch).rejects.toThrow('different input');
+  const replay = async () => new PermissionGate({
+    ...ctx, controller: new AbortController(), previousDecision: (await ctx.repo.getApproval(row.id))!,
+  });
+  await expect((await replay()).invokeExtension(toolId, { item: 'changed' })).rejects.toBeInstanceOf(ColdHold);
   expect(execute).not.toHaveBeenCalled();
+  const gate = await replay();
   await expect(gate.invokeExtension(toolId, input)).resolves.toBe('SAMPLE');
   expect(guard).toHaveBeenCalledTimes(2);
   expect(guard).toHaveBeenLastCalledWith(input, expect.objectContaining({ approvalId: row.id }));
   expect(execute).toHaveBeenCalledWith(input, expect.objectContaining({ approvalId: row.id }));
   expect(ctx.gitlab.createIssueNote).toHaveBeenCalledOnce();
   ctx.gitlab.createIssueNote.mockClear();
-  const next = gate.invokeExtension(toolId, input);
-  await vi.waitFor(() => expect(ctx.gitlab.createIssueNote).toHaveBeenCalledOnce());
-  await gate.resolvePendingApproval('REJECTED', 'dev', 'declined');
-  await expect(next).rejects.toThrow('declined');
+  await expect(gate.invokeExtension(toolId, input)).rejects.toBeInstanceOf(ColdHold);
+  expect(ctx.gitlab.createIssueNote).toHaveBeenCalledOnce();
   expect(execute).toHaveBeenCalledOnce();
 });
 
 it('registers only enabled extensions with the SDK and disables Bash in both layers', async () => {
-  const { gate, ctx, execute, guard } = await setup('default', 'always_approve', {
+  const { ctx, execute, guard } = await setup('default', 'always_approve', {
     enabledExtensionTools: ['example', 'count'], disableBash: true,
   });
   const { config, controller, session, workspaceRoot } = ctx;
+  const approval = await ctx.repo.createApprovalRequest(session.id, 'TOOL_USE', 'example', input);
+  await ctx.repo.resolveApprovalRequest(approval.id, 'APPROVED', 'dev');
+  const gate = new PermissionGate({ ...ctx, previousDecision: (await ctx.repo.getApproval(approval.id))! });
   const sandbox = { workspaceRoot, rootDir: '/', claudeHome: '/home' };
   const tools = new WorkspaceTools(new EphemeralSandbox(config, ctx.repo, ctx.gitlab), sandbox, session.id);
   const progress = vi.fn();
+  vi.mocked(query).mockImplementationOnce(({ options }) => (async function* () {
+    const client = turnMcpClient(options!);
+    expect(await client.list()).not.toContain('other');
+    expect(options!.disallowedTools).toContain('Bash');
+    expect(await gate.canUseTool('Bash', { command: 'git status' })).toMatchObject({ behavior: 'deny' });
+    await expect(gate.invokeExtension('mcp__detent__other', input)).rejects.toThrow('未启用');
+    expect(await client.call('count', { entries: [4, 5] })).toMatchObject({ content: [{ type: 'text', text: '2' }] });
+    await options!.canUseTool!(toolId, input, { signal: controller.signal });
+    expect(await client.call('example', input)).toMatchObject({ content: [{ type: 'text', text: '"SAMPLE"' }] });
+    yield { type: 'result', subtype: 'success', session_id: 'session', result: 'finished' };
+  })() as ReturnType<typeof query>);
   await new SdkClaudeRunner(config).run({
-    gate, controller, session, sandbox, tools, resume: false, prompt: 'go', systemPrompt: '', progress,
+    gate, controller, session, sandbox, tools, resume: true, prompt: 'go', systemPrompt: '', progress,
   });
-  const options = vi.mocked(query).mock.calls.at(-1)![0].options!;
-  expect(options.disallowedTools).toContain('Bash');
-  expect(await gate.canUseTool('Bash', { command: 'git status' })).toMatchObject({ behavior: 'deny' });
-  const registered = vi.mocked(createSdkMcpServer).mock.calls.at(-1)![0].tools!;
-  expect(registered.map(t => t.name)).not.toContain('other');
-  await expect(gate.invokeExtension('mcp__detent__other', input)).rejects.toThrow('未启用');
-  const handler = registered.find(t => t.name === 'example')!.handler;
-  const count = registered.find(t => t.name === 'count')!;
-  expect(await count.handler({ entries: [4, 5] }, {})).toMatchObject({ content: [{ type: 'text', text: '2' }] });
-  await options.canUseTool!(toolId, input, { signal: controller.signal });
-  const response = handler(input, {});
-  await vi.waitFor(() => expect(ctx.gitlab.createIssueNote).toHaveBeenCalledOnce());
-  const approval = (await ctx.repo.getApprovalByNoteId(session.id, 20))!;
-  expect(guard.mock.calls[0][1]).not.toHaveProperty('approvalId');
-  await gate.resolvePendingApproval('APPROVED');
-  expect(await response).toMatchObject({ content: [{ type: 'text', text: '"SAMPLE"' }] });
-  expect(guard).toHaveBeenCalledTimes(2);
-  expect(guard).toHaveBeenLastCalledWith(input, expect.objectContaining({ approvalId: approval.id }));
-  expect(execute).toHaveBeenCalledWith(input, guard.mock.calls[1][1]);
-  expect(execute).toHaveBeenCalledOnce();
+  expect(guard).toHaveBeenCalledExactlyOnceWith(input, expect.objectContaining({ approvalId: approval.id }));
+  expect(execute).toHaveBeenCalledExactlyOnceWith(input, guard.mock.calls[0][1]);
   expect(progress.mock.calls.map(([{ name, input, result }]) => [name, input, result])).toEqual([
     ['count', '{"entries":[4,5]}', '⏳ 执行中…'], ['count', '{"entries":[4,5]}', '2'],
     ['example', '{"item":"sample"}', '⏳ 执行中…'], ['example', '{"item":"sample"}', 'SAMPLE'],
@@ -209,17 +203,16 @@ it('correlates SDK permissions, MCP handlers, hooks and streamed errors without 
     yield { type: 'user', session_id: 'session', message: { content: ['first', 'denied', 'invalid'].map(tool_use_id => ({
       type: 'tool_result', tool_use_id, is_error: true, content: 'failed private-value',
     })) } };
-    const handler = vi.mocked(createSdkMcpServer).mock.lastCall![0].tools!.find(t => t.name === 'example')!.handler;
+    const client = turnMcpClient(options!);
     for (const id of ['success', 'error', 'blocked']) {
       await before(id, toolId, input);
-      const meta = { _meta: { 'claudecode/toolUseId': id } };
       if (id === 'success') {
-        await handler(input, meta);
+        await client.call('example', input, id);
         await after(id, toolId, input, 'SDK private-value');
       } else {
         if (id === 'error') execute.mockRejectedValueOnce(Error('error private-value'));
         else guard.mockResolvedValueOnce({ ok: false, reason: 'denied private-value' });
-        await expect(handler(input, meta)).rejects.toThrow('***');
+        await expect(client.call('example', input, id)).rejects.toThrow('***');
       }
     }
     yield { type: 'result', subtype: 'success', session_id: 'session', result: 'finished' };
@@ -307,4 +300,32 @@ it.each(['plan', 'default'] as const)('uses the default SDK mode and locks reado
   }
   expect(await gate.preflight('Bash', { command: 'git status' })).toMatchObject({ behavior: 'allow' });
   expect(await gate.preflight('Bash', { command: 'npm test' })).toMatchObject({ behavior: 'deny' });
+});
+
+it('starts the extension after schema and identity initialization and awaits its cleanup on close', async () => {
+  const events: string[] = [];
+  const schema = vi.spyOn(mysql, 'initMySqlSchema').mockImplementation(async () => { events.push('schema'); });
+  const identity = vi.spyOn(GitLabClient.prototype, 'initBotIdentity').mockImplementation(async () => { events.push('identity'); });
+  const app = createDetentApp(loadConfig({ GITLAB_WEBHOOK_SECRET: 'test' }), {
+    async onInitSchema() { events.push('extension schema'); },
+    async onReady({ orchestrator, repo, gitlab, report }) {
+      expect(orchestrator.repo).toBe(repo);
+      expect(orchestrator.gitlab).toBe(gitlab);
+      expect(report).toBeTypeOf('function');
+      events.push('ready');
+      return async () => {
+        await Promise.resolve();
+        events.push('stopped');
+      };
+    },
+  });
+  try {
+    await app.ready();
+    expect(events).toEqual(['schema', 'extension schema', 'identity', 'ready']);
+  } finally {
+    await app.close();
+    schema.mockRestore();
+    identity.mockRestore();
+  }
+  expect(events.at(-1)).toBe('stopped');
 });

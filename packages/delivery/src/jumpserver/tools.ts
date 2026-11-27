@@ -2,7 +2,7 @@ import { defineExtensionTool, escapeMarkdownCell, logError, neutralizeQuickActio
 import { z } from 'zod';
 import { authSecrets, redactSecrets, type DeliveryConfig } from '../config.js';
 import type { JobResultResponse, JumpServerClient } from './client.js';
-import { evaluateRemoteInspectCommand, findBlockedAssets, normalizeInspectCommand, validatePlaybookPath, validateReadonlyInspectCommand } from './guards.js';
+import { findBlockedAssets, normalizeShellCommand, validatePlaybookPath, validateShellCommands } from './guards.js';
 
 export interface DeliveryExecutionRecord {
   sessionId: string;
@@ -43,8 +43,9 @@ async function verifyMerge(input: JobInput, ctx: ExtensionToolContext, blockFail
   return { ok: true as const, mr };
 }
 
-export function createJumpServerTools({ client, config, tracker, decision, defaultAccount }: {
+export function createJumpServerTools({ client, config, tracker, decision, defaultAccount, onTerminalResult }: {
   client: JumpServerClient; config: DeliveryConfig; tracker?: DeliveryExecutionTracker; decision?: DecisionClient; defaultAccount?: string;
+  onTerminalResult?: (sessionId: string, jobId: string, result: JobResultResponse) => Promise<void>;
 }): AnyDetentExtensionTool[] {
   const checkAssets = (ids: string[]) => findBlockedAssets(ids, config.blockedAssets).length
     ? deny('目标资产在黑名单中，禁止操作') : allow;
@@ -56,29 +57,28 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
       execute: input => client.listAssets({ search: input.search, nodeId: input.node_id, limit: input.limit }),
     }),
     defineExtensionTool({
-      name: 'jms_readonly_inspect', description: '在授权资产上执行通过只读校验的巡检命令', policy: 'readonly',
+      name: 'jms_shell', description: '在授权资产上批量执行只读巡检命令（一次可传入多条命令合并执行）', policy: 'readonly',
       // Validate raw characters/length before trim can discard a newline or an oversized suffix.
-      schema: { asset_ids: assets(50), command: z.string().max(512).regex(/^[^\r\n\0]+$/).trim().min(1) },
+      schema: { asset_ids: assets(50), commands: z.array(z.string().max(512).regex(/^[^\r\n\0]+$/).trim().min(1)).min(1).max(10) },
       async guard(input, ctx) {
+        const targets = checkAssets(input.asset_ids);
+        if (!targets.ok) return targets;
         const prefixes = [...config.inspectAllowPrefixes, ...(ctx.workflow?.allowPrefixes ?? [])];
-        const command = validateReadonlyInspectCommand(input.command, prefixes);
-        if (!command.ok) {
-          if (!decision || 'hardBlocked' in command) return command;
-          const evaluation = await evaluateRemoteInspectCommand(decision, input.command);
-          if (!evaluation.allowed) return deny(evaluation.reason + '。变更操作请使用 delivery::env-change 提交 Ansible MR 并审批。');
-        }
-        return checkAssets(input.asset_ids);
+        const checked = await validateShellCommands(input.commands, prefixes, decision);
+        return checked.ok ? allow : checked;
       },
       execute(input, ctx) {
-        return client.runReadonlyInspect({
-          assetIds: input.asset_ids, command: decision ? input.command.trim() : normalizeInspectCommand(input.command), account: ctx.workflow?.account ?? defaultAccount ?? config.jumpserverReadonlyAccount,
+        return client.runShell({
+          assetIds: input.asset_ids, commands: input.commands.map(normalizeShellCommand),
+          account: ctx.workflow?.account ?? defaultAccount ?? config.jumpserverReadonlyAccount,
         });
       },
     }),
     defineExtensionTool({
-      name: 'jms_run_ansible_job', description: '审批后执行当前会话已合并的 Ansible Playbook', policy: 'always_approve',
+      name: 'jms_job', description: '审批后异步执行当前会话已合并的 Ansible Playbook，终态自动唤醒本会话', policy: 'always_approve',
       schema: jobSchema,
       async guard(input, ctx) {
+        if (!tracker) return deny('未配置交付执行追踪仓储');
         const path = validatePlaybookPath(input.playbook_path);
         if (!path.ok) return path;
         const targets = checkAssets(input.asset_ids);
@@ -112,6 +112,7 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
       },
       async execute(input, ctx) {
         const { approvalId } = ctx;
+        if (!tracker) throw Error('未配置交付执行追踪仓储');
         if (!approvalId) throw Error('生产变更缺少审批单');
         const verified = await verifyMerge(input, ctx, config.blockFailedPipeline);
         if (!verified.ok) throw Error(verified.reason);
@@ -122,24 +123,25 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
           comment: `Detent ${ctx.session.id} / ${mr.targetProjectPath}!${mr.mrIid} / ${input.commit_sha} / ${approvalId}`,
         });
         try {
-          await tracker?.recordExecution({
+          await tracker.recordExecution({
             sessionId: ctx.session.id, mrId: mr.id, approvalId, agentProfile: ctx.profileName ?? 'unified',
             jumpserverJobId: job.jobId, jumpserverJobUrl: job.jobUrl,
-            playbookPath: input.playbook_path, commitSha: input.commit_sha, targetAssets: input.asset_ids, status: job.status,
+            playbookPath: input.playbook_path, commitSha: input.commit_sha, targetAssets: input.asset_ids,
+            status: job.status === 'PENDING' ? 'PENDING' : 'RUNNING',
           });
         } catch (error) {
           const detail = logError('delivery-audit', error, [...authSecrets(config.jumpserverJobAuth), ...authSecrets(config.jumpserverReadonlyAuth)]);
           throw Error(redactSecrets(`任务 ${job.jobId} 已提交（${job.jobUrl}），审批单 ${approvalId} 的追踪记录写入失败：${detail}。请核对已有任务，避免重复提交。`, config));
         }
         return {
-          jobId: job.jobId, status: job.status, approved: true,
-          nextAction: '任务已获批并提交至 JumpServer 任务中心，请立即调用 jms_get_job_result 查询终态。',
+          jobId: job.jobId, status: job.status, approved: true, asyncCallback: true,
+          nextAction: '任务已获批并在 JumpServer 后台异步执行。请简要告知用户任务链接后直接结束本轮，切勿轮询等待；任务到达终态后系统将自动回调唤醒本会话进行后续核验。',
           jobUrl: job.jobUrl, mrId: mr.id, approvalId, commitSha: input.commit_sha,
         };
       },
     }),
     defineExtensionTool({
-      name: 'jms_get_job_result', description: '查询当前会话已登记的任务结果', policy: 'readonly',
+      name: 'jms_job_status', description: '查询当前会话已登记的任务结果', policy: 'readonly',
       schema: { job_id: text(128) },
       async guard(input, ctx) {
         if (!tracker) return deny('未配置交付执行追踪仓储，禁止查询任务结果');
@@ -148,7 +150,10 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
       },
       async execute(input, ctx) {
         const result = await client.getJobResult(input.job_id);
-        await tracker?.updateExecutionResult?.(ctx.session.id, input.job_id, result.status, result.outputSummary);
+        if (result.status === 'SUCCESS' || result.status === 'FAILED') {
+          if (onTerminalResult) await onTerminalResult(ctx.session.id, input.job_id, result);
+          else await tracker?.updateExecutionResult?.(ctx.session.id, input.job_id, result.status, result.outputSummary);
+        }
         return result;
       },
     }),

@@ -33,7 +33,7 @@ function setup() {
 it.each(['inspection', 'instant playbook', 'parameterized playbook'])('submits %s with is_periodic=false', async kind => {
   const { client, fetch } = setup();
   if (kind === 'inspection') {
-    await client.runReadonlyInspect({ assetIds: ['web01'], command: 'uptime' });
+    await client.runShell({ assetIds: ['web01'], commands: ['uptime'] });
   } else {
     await client.runAnsibleJob({
       assetIds: ['web01'], repository: 'ops/ansible-infra', commitSha: 'a'.repeat(40),
@@ -58,7 +58,7 @@ it('preserves the HTTP status and redacts the body before truncating either diag
   fetch.mockResolvedValueOnce(Response.json(['root'])).mockResolvedValueOnce(
     Response.json({ ...scheduleError, detail: echoed, padding: 'x'.repeat(1100) }, { status: 400 }),
   );
-  await expect(client.runReadonlyInspect({ assetIds: ['web01'], command: 'uptime' })).rejects.toMatchObject({
+  await expect(client.runShell({ assetIds: ['web01'], commands: ['uptime'] })).rejects.toMatchObject({
     status: 400, message: 'JumpServer HTTP 400: ' + safe.slice(0, 300),
   });
   expect(log.mock.calls).toEqual([['[detent:jumpserver]', 'POST', 'ops/jobs/', 400, safe.slice(0, 1000)]]);
@@ -67,7 +67,7 @@ it('preserves the HTTP status and redacts the body before truncating either diag
 it('uses asset detail and the ANSI log after HTML 404s, removing NUL padding from the summary', async () => {
   const { client, server, fetch } = setup();
   const log = vi.spyOn(console, 'error').mockImplementation(() => {});
-  const outcome = await client.runReadonlyInspect({ assetIds: ['web02'], command: 'uptime' });
+  const outcome = await client.runShell({ assetIds: ['web02'], commands: ['uptime'] });
   expect(server.runAs).toMatchObject([{ account: 'ops-second' }]);
   expect(outcome).toMatchObject({ status: 'SUCCESS', outputSummary: '{"success":1}\n\x1b[32mnginx active\x1b[0m' });
   if (!('jobId' in outcome)) throw Error('Expected one inspection job');
@@ -91,7 +91,7 @@ it('uses asset detail and the ANSI log after HTML 404s, removing NUL padding fro
 it('names the asset and API key authorization when permed_accounts is empty', async () => {
   const { client, fetch } = setup();
   const log = vi.spyOn(console, 'error').mockImplementation(() => {});
-  await expect(client.runReadonlyInspect({ assetIds: ['web03'], command: 'uptime' })).rejects.toThrow(
+  await expect(client.runShell({ assetIds: ['web03'], commands: ['uptime'] })).rejects.toThrow(
     '资产 web03 在 JumpServer 中未给当前 API Key 授权任何登录账号',
   );
   expect(fetch.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([accountsPath + 'web03/accounts/', accountsPath + 'web03/']);
@@ -115,4 +115,40 @@ it.each([{}, { is_periodic: true }, { is_periodic: 'false' }])('rejects unschedu
   expect(response.status).toBe(400);
   expect(await response.json()).toEqual(scheduleError);
   expect(server.runAs).toHaveLength(0);
+});
+
+it('reuses the resolved account across shell jobs and refreshes the detail lookup after 60 seconds', async () => {
+  const { client, fetch } = setup();
+  const request = { assetIds: ['web02'], commands: ['uptime'] };
+  const lookups = () => fetch.mock.calls.map(([url]) => new URL(String(url)).pathname).filter(path => path.startsWith(accountsPath));
+  await client.runShell(request);
+  await client.runShell(request);
+  expect(lookups()).toEqual([accountsPath + 'web02/accounts/', accountsPath + 'web02/']);
+  vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 60001);
+  await client.runShell(request);
+  expect(lookups()).toEqual([accountsPath + 'web02/accounts/', accountsPath + 'web02/', accountsPath + 'web02/']);
+});
+
+it.each([4500, 60000])('caps each HTTP request separately from the %d ms overall shell budget', async budget => {
+  const { fetch } = setup();
+  const client = new HttpJumpServerClient(loadDeliveryConfig({ JUMPSERVER_BASE_URL: base, JUMPSERVER_READONLY_TOKEN: 'reader',
+    JUMPSERVER_TIMEOUT_MS: String(budget) }), gitlab);
+  const timeouts = vi.spyOn(AbortSignal, 'timeout');
+  fetch.mockResolvedValueOnce(Response.json(['ops'])).mockResolvedValueOnce(Response.json({ task_id: 'job' }))
+    .mockResolvedValueOnce(Response.json({ status: 'success', summary: {} })).mockResolvedValueOnce(Response.json({ result: {} }));
+  await client.runShell({ assetIds: ['web01'], commands: ['uptime'] });
+  expect(timeouts.mock.calls.map(([ms]) => ms)).toEqual([budget, ...Array(4).fill(Math.min(budget, 15000))]);
+});
+
+it('logs transport, malformed JSON and invalid responses without exposing credentials', async () => {
+  const { client, fetch } = setup();
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  fetch.mockRejectedValueOnce(Error('transport ' + gitlab.gitlabToken));
+  await expect(client.listAssets({})).rejects.toThrow('transport ***');
+  fetch.mockResolvedValueOnce(new Response('invalid-' + gitlab.gitlabToken));
+  await expect(client.listAssets({})).rejects.toThrow('Invalid JumpServer JSON');
+  fetch.mockResolvedValueOnce(Response.json({ status: gitlab.gitlabToken, summary: {} }));
+  await expect(client.getJobResult('job')).rejects.toThrow('Invalid JumpServer response');
+  expect(log).toHaveBeenCalledTimes(3);
+  expect(JSON.stringify(log.mock.calls)).not.toContain(gitlab.gitlabToken);
 });

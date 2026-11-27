@@ -23,7 +23,7 @@ async function setup(profile: TurnProfile) {
     getIssue: vi.fn(), hasApprovalPermission: vi.fn(async () => true),
   };
   const run = vi.fn<ClaudeRunner['run']>();
-  const config = { ...loadConfig({ EPHEMERAL_ROOT: path.join(root, 'turns') }), hotHoldTimeoutMs: 0 };
+  const config = loadConfig({ EPHEMERAL_ROOT: path.join(root, 'turns') });
   const pod = new SessionOrchestrator(config, repo, gitlab, { run }, {
     resolveTurnProfile: () => ({ ...profile, enabledExtensionTools: [] }),
   });

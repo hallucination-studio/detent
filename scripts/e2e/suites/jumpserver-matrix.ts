@@ -7,15 +7,15 @@ const hardDenials = ['rm -rf /', 'systemctl restart kafka', 'cat /etc/shadow', '
 
 // Each comment drives the real SDK to issue these calls. Assertions use separate
 // HTTP, Jev, Pod, GitLab and database observations.
-export const matrixTurns: Record<string, { asset_ids: string[]; command: string }[]> = {
-  'Batch inspect': [{ asset_ids: ['web01', 'web02'], command: 'hostname' }],
-  'Group inspect': [{ asset_ids: ['web01', 'web02'], command: 'date' }],
-  'Empty accounts': [{ asset_ids: ['web01', 'web03'], command: 'uptime' }],
-  'Hard denials': hardDenials.map(command => ({ asset_ids: ['web01'], command })),
-  'Jev denials': ['hostname -s', 'date -u'].map(command => ({ asset_ids: ['web01'], command })),
-  'Blocked host': [{ asset_ids: ['web01'], command: 'uptime' }],
-  'Check clock': [{ asset_ids: ['web01'], command: 'date' }],
-  'Upstream errors': [400, 403, 500].map(() => ({ asset_ids: ['web01'], command: 'uptime' })),
+export const matrixTurns: Record<string, { asset_ids: string[]; commands: string[] }[]> = {
+  'Batch inspect': [{ asset_ids: ['web01', 'web02'], commands: ['hostname'] }],
+  'Group inspect': [{ asset_ids: ['web01', 'web02'], commands: ['date'] }],
+  'Empty accounts': [{ asset_ids: ['web01', 'web03'], commands: ['uptime'] }],
+  'Hard denials': hardDenials.map(command => ({ asset_ids: ['web01'], commands: [command] })),
+  'Jev denials': ['hostname -s', 'date -u'].map(command => ({ asset_ids: ['web01'], commands: [command] })),
+  'Blocked host': [{ asset_ids: ['web01'], commands: ['uptime'] }],
+  'Check clock': [{ asset_ids: ['web01'], commands: ['date'] }],
+  'Upstream errors': [400, 403, 500].map(() => ({ asset_ids: ['web01'], commands: ['uptime'] })),
 };
 
 export async function runJumpServerMatrix(h: MatrixHarness, jms: ReturnType<typeof offlineJumpServer>,
@@ -87,7 +87,13 @@ export async function runJumpServerMatrix(h: MatrixHarness, jms: ReturnType<type
     settings.enabled = true;
     settings.blocked_assets = [];
     await publish();
-    await turn('Check clock');
+    jms.slowShell(true);
+    try {
+      const started = performance.now();
+      const clock = await turn('Check clock');
+      assert.ok(performance.now() - started >= 30_000);
+      assert.match(clock, /nginx active/);
+    } finally { jms.slowShell(false); }
     assert.equal(jms.runAs.at(-1)?.command, 'date');
     assert.equal(jev.requests.length, decisions + 2);
 
@@ -119,19 +125,26 @@ export async function verifyFailedPlaybook(h: Pick<Harness, 'hub' | 'gitlab' | '
   const coding = await h.state(iid, 'IDLE');
   const [mr] = await h.records(coding.id, 'session_merge_requests');
   const sha = await gitlab.mergeMergeRequest(mr.target_project_id, mr.mr_iid);
-  const mixed = await h.pendingCard(iid, 'jms_run_ansible_job', [sha, 'web01', 'web02']);
+  const mixed = await h.pendingCard(iid, 'jms_job', [sha, 'web01', 'web02']);
   const baseline = jms.paths.length;
   await gitlab.awardThumbsUp(hub, iid, mixed.gitlab_note_id, 'sre');
   const single = await h.until('second production approval', async () => (await h.records(coding.id, 'approval_requests'))
-    .find(a => a.id !== mixed.id && a.tool_name === 'jms_run_ansible_job' && a.status === 'PENDING' && a.gitlab_note_id));
+    .find(a => a.id !== mixed.id && a.tool_name === 'jms_job' && a.status === 'PENDING' && a.gitlab_note_id));
   const lookups = jms.paths.slice(baseline);
   assert.deepEqual(lookups, ['GET /api/v1/perms/users/self/assets/web01/accounts/',
     'GET /api/v1/perms/users/self/assets/web02/accounts/', 'GET /api/v1/perms/users/self/assets/web02/']);
+  await h.state(iid, 'WAITING_TOOL');
+  jms.holdPlaybooks(true);
   await gitlab.awardThumbsUp(hub, iid, single.gitlab_note_id, 'sre');
-  await h.state(iid, 'IDLE', coding.last_message_seq);
+  const submitted = await h.state(iid, 'IDLE', coding.last_message_seq);
+  assert.equal((await h.records(coding.id, 'delivery_executions'))[0].status, 'PENDING');
+  jms.holdPlaybooks(false);
+  await h.state(iid, 'IDLE', submitted.last_message_seq);
   const audits = await h.records(coding.id, 'delivery_executions');
   assert.equal(audits.length, 1);
   assert.equal(audits[0].status, 'FAILED');
+  const callbacks = (await h.records(coding.id, 'session_inbox')).filter(r => r.event_id === 'jms-job:' + audits[0].jumpserver_job_id);
+  assert.deepEqual(callbacks.map(r => [r.source_kind, r.status]), [['system', 'CONSUMED']]);
   assert.equal(audits[0].approval_id, single.id);
   assert.match(audits[0].output_summary, /service check failed on web02/);
   assert.ok(!audits[0].output_summary.includes('\u0000'));

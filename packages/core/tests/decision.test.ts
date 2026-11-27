@@ -159,7 +159,7 @@ async function setup(mode: 'plan' | 'default' = 'default', readonly = false, wor
   const decide = vi.fn<DecisionClient['decide']>().mockResolvedValue(answers());
   const createIssueNote = vi.fn(async (_p: number, _i: number, _body: string) => ({ id: 1 }));
   const gate = new PermissionGate({
-    session, repo, config: loadConfig({ HOT_HOLD_TIMEOUT_MS: '0', JEV_API_KEY: secret }), workspaceRoot,
+    session, repo, config: loadConfig({ JEV_API_KEY: secret }), workspaceRoot,
     gitlab: { createIssueNote, syncIssueStatusLabel: vi.fn() }, profile: { readonly },
     controller: new AbortController(), checkpoint: vi.fn(), decision: { provider: 'custom', threshold: 0.9, decide },
   });

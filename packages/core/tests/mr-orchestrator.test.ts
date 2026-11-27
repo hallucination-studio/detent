@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { expect, it, onTestFinished, vi } from 'vitest';
 import { SdkClaudeRunner, type TurnInput } from '../src/claude/runner.js';
-import { query, createSdkMcpServer } from '@anthropic-ai/claude-code';
+import { turnMcpClient } from './turn-mcp-client.js';
+import { query } from '@anthropic-ai/claude-code';
 import { loadConfig } from '../src/config.js';
 import { createWebhookApp, dispatchWebhook } from '../src/gitlab/webhook.js';
 import { WebhookQueue } from '../src/gitlab/webhook-queue.js';
@@ -19,7 +20,7 @@ import { InMemoryDetentRepository } from './memory-repository.js';
 
 vi.mock('@anthropic-ai/claude-code', async original => {
   const sdk = await original<typeof import('@anthropic-ai/claude-code')>();
-  return { ...sdk, query: vi.fn(), createSdkMcpServer: vi.fn(sdk.createSdkMcpServer) };
+  return { ...sdk, query: vi.fn() };
 });
 
 const bot = { id: 9, username: 'bot', name: 'Bot' };
@@ -38,10 +39,10 @@ const emoji = (id: number, name: string, actor = user) => ({
   object_kind: 'emoji', project_id: 2, user: actor, note: { noteable_type: 'MergeRequest' },
   object_attributes: { awardable_type: 'Note', awardable_id: id, action: 'award', name },
 });
-async function setup(hotHoldTimeoutMs = 0) {
+async function setup() {
   const root = await mkdtemp(path.join(tmpdir(), 'detent-stage11-'));
-  const config = { ...loadConfig({ EPHEMERAL_ROOT: path.join(root, 'turns'), GITLAB_WEBHOOK_SECRET: 'hook',
-    JEV_API_KEY: 'test-secret' }), hotHoldTimeoutMs };
+  const config = loadConfig({ EPHEMERAL_ROOT: path.join(root, 'turns'), GITLAB_WEBHOOK_SECRET: 'hook',
+    JEV_API_KEY: 'test-secret' });
   const projects = await bareProjects(root);
   for (const id of [1, 2, 3]) await git(['branch', 'feature', 'main'], path.join(root, id + '.git'), root);
   const repo = new InMemoryDetentRepository();
@@ -112,11 +113,6 @@ it('checks out the assigned source, registers only MR tools, resolves a real sha
     expect(t.systemPrompt).not.toContain('test-secret');
     const allowed = ['detent_commit_and_push', 'detent_get_pipeline_status', 'detent_get_pipeline_job_log'];
     const extensions = ['detent_get_mr_diff', 'detent_list_mr_discussions', 'detent_sync_target_branch'];
-    vi.mocked(query).mockReturnValueOnce((async function* () {
-      yield { type: 'result', session_id: t.session.claudeSessionId, subtype: 'success', result: 'ok' };
-    })() as ReturnType<typeof query>);
-    await new SdkClaudeRunner(config).run(t);
-    expect(vi.mocked(createSdkMcpServer).mock.lastCall![0].tools!.map(tool => tool.name)).toEqual([...allowed, ...extensions, 'AskUserQuestion']);
     for (const tool of ['detent_create_mr', 'detent_close_issue', 'detent_checkout_worktree', 'detent_close_worktree', 'detent_list_projects', 'detent_create_release', 'external__run'])
       expect(await t.gate.preflight('mcp__detent__' + tool, {})).toMatchObject({ behavior: 'deny' });
     const invoke = (tool: string) => t.gate.invokeExtension('mcp__detent__' + tool, {});
@@ -136,10 +132,13 @@ it('checks out the assigned source, registers only MR tools, resolves a real sha
     expect(await readFile(path.join(dir, 'tracked'), 'utf8')).toContain('<<<<<<<');
     expect(await t.gate.preflight('Edit', { file_path: path.join(dir, 'tracked') })).toMatchObject({ behavior: 'allow' });
     await writeFile(path.join(dir, 'tracked'), 'resolved');
-    const registered = vi.mocked(createSdkMcpServer).mock.lastCall![0].tools!;
-    await registered.find(tool => tool.name === 'detent_commit_and_push')!.handler({
-      directory_name: tree.directoryName, commit_message: 'resolve conflict',
-    }, {});
+    vi.mocked(query).mockImplementationOnce(({ options }) => (async function* () {
+      const client = turnMcpClient(options!);
+      expect(await client.list()).toEqual([...allowed, ...extensions, 'AskUserQuestion']);
+      await client.call('detent_commit_and_push', { directory_name: tree.directoryName, commit_message: 'resolve conflict' });
+      yield { type: 'result', session_id: t.session.claudeSessionId, subtype: 'success', result: 'ok' };
+    })() as ReturnType<typeof query>);
+    await new SdkClaudeRunner(config).run(t);
     return 'CI fixed';
   });
   expect((await send(opened)).statusCode).toBe(202);
@@ -304,8 +303,8 @@ it('checks fork write permission and uses read-only suggestions while retaining 
   expect(gitlab.updateMergeRequestNote).toHaveBeenCalledWith(2, 1, expect.any(Number), expect.stringMatching(/^Suggested patch\n\n> 💡/));
 });
 
-it.each([0, 10000])('binds MR emoji decisions to the approval note and handles tool approval with hot hold %i', async timeout => {
-  const { run, gitlab, repo, post, send, drain, session } = await setup(timeout);
+it.each([true, false])('binds MR emoji decisions to the note and replays approval (approved=%s)', async approved => {
+  const { run, gitlab, repo, post, send, drain, session } = await setup();
   const input = { questions: [{ question: 'Which file?' }] };
   let outcome;
   run.mockImplementation(async t => {
@@ -314,7 +313,7 @@ it.each([0, 10000])('binds MR emoji decisions to the approval note and handles t
   });
   await post(opened);
   await vi.waitFor(async () => expect(await session()).toMatchObject({ status: 'WAITING_TOOL' }));
-  if (!timeout) await drain();
+  await drain();
   const s = await session();
   const card = (await repo.getLatestPendingApproval(s.id))!;
   expect(gitlab.createMergeRequestNote).toHaveBeenCalledWith(2, 1, expect.stringContaining('Which file?'));
@@ -323,10 +322,10 @@ it.each([0, 10000])('binds MR emoji decisions to the approval note and handles t
   await post(emoji(card.gitlabNoteId!, 'thumbsup', { id: 3, username: 'reporter' }));
   await post({ ...emoji(card.gitlabNoteId!, 'thumbsup'), object_attributes: { ...emoji(card.gitlabNoteId!, 'thumbsup').object_attributes, action: 'revoke' } });
   expect(await repo.getLatestPendingApproval(s.id)).toMatchObject({ id: card.id });
-  await send(emoji(card.gitlabNoteId!, timeout ? 'thumbsup' : 'thumbsdown'));
-  expect(await repo.getApproval(card.id)).toMatchObject({ status: timeout ? 'APPROVED' : 'REJECTED', decidedBy: user.username });
-  expect(outcome).toMatchObject({ behavior: timeout ? 'allow' : 'deny' });
-  expect(run).toHaveBeenCalledTimes(timeout ? 1 : 2);
+  await send(emoji(card.gitlabNoteId!, approved ? 'thumbsup' : 'thumbsdown'));
+  expect(await repo.getApproval(card.id)).toMatchObject({ status: approved ? 'APPROVED' : 'REJECTED', decidedBy: user.username });
+  expect(outcome).toMatchObject({ behavior: approved ? 'allow' : 'deny' });
+  expect(run).toHaveBeenCalledTimes(2);
   expect((await session()).status).toBe('IDLE');
   expect(gitlab.syncIssueStatusLabel).not.toHaveBeenCalled();
 });

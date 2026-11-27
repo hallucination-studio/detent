@@ -2,7 +2,8 @@ import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createSdkMcpServer, query } from '@anthropic-ai/claude-code';
+import { turnMcpClient } from './turn-mcp-client.js';
+import { query } from '@anthropic-ai/claude-code';
 import { afterEach, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import {
@@ -20,11 +21,10 @@ vi.mock('@anthropic-ai/claude-code', async original => {
   const sdk = await original<typeof import('@anthropic-ai/claude-code')>();
   return {
     ...sdk,
-    createSdkMcpServer: vi.fn(sdk.createSdkMcpServer),
-    query: vi.fn(async function* ({ options }: Parameters<typeof sdk.query>[0]) {
+    query: vi.fn(({ options }: Parameters<typeof sdk.query>[0]) => Object.assign((async function* () {
       const result = await sdkTurn(options);
       yield { type: 'result', subtype: 'success', session_id: options?.extraArgs?.['session-id'], result };
-    }),
+    })(), { interrupt: async () => {} })),
   };
 });
 
@@ -485,11 +485,9 @@ it('wires onReady packs into profile resolution and permits an MCP mutation only
   const ephemerals = join(root, 'turns');
   const config = loadConfig({
     DETENT_MCP_CAPABILITIES_FILE: configFile, GITLAB_WEBHOOK_SECRET: 'hook', EPHEMERAL_ROOT: ephemerals,
-    HOT_HOLD_TIMEOUT_MS: '2500',
   });
   const explicit = { name: ' SHADOW ', enabled: true, tools: [] };
-  let capture!: (orchestrator: SessionOrchestrator) => void;
-  const orchestratorReady = new Promise<SessionOrchestrator>(resolve => { capture = resolve; });
+  let orchestrator!: SessionOrchestrator;
   const readName = 'remote-pack__read_status';
   const writeName = 'remote-pack__apply_change';
   const app = createDetentApp(config, {
@@ -500,7 +498,7 @@ it('wires onReady packs into profile resolution and permits an MCP mutation only
         type: 'streamable-http', url: server.url, headers: { 'X-Api-Key': '${UNCONFIGURED_MCP_TOKEN}' },
       } }),
     ],
-    matchWebhookEvent: () => ({ key: 'bridge', async handle(orchestrator) { capture(orchestrator); } }),
+    onReady: ctx => { orchestrator = ctx.orchestrator; },
     resolveTurnProfile({ capabilities }) {
       expect(capabilities).toMatchObject([
         explicit, { name: 'remote-pack', enabled: true }, { name: 'inline', enabled: true },
@@ -513,26 +511,19 @@ it('wires onReady packs into profile resolution and permits an MCP mutation only
   sdkTurn.mockImplementation(async (options: NonNullable<Parameters<typeof query>[0]['options']>) => {
     expect(options.env).not.toHaveProperty('MCP_TOKEN');
     expect(Object.values(options.env!)).not.toContain(token);
-    const handlers = vi.mocked(createSdkMcpServer).mock.lastCall![0].tools!;
-    const readonly = handlers.find(tool => tool.name === readName)!;
-    const mutation = handlers.find(tool => tool.name === writeName)!;
+    const client = turnMcpClient(options);
     const result = { content: [{ type: 'text', text: '{"status":"ok","echoed":"***"}' }] };
     if (options.permissionMode === 'plan') {
-      await expect(readonly.handler({ target: 'item' }, {})).resolves.toEqual(result);
-      await expect(mutation.handler({ target: 'item' }, {})).rejects.toThrow('detent_submit_plan');
+      await expect(client.call(readName, { target: 'item' })).resolves.toEqual(result);
+      await expect(client.call(writeName, { target: 'item' })).rejects.toThrow('detent_submit_plan');
       return 'Plan complete';
     }
-    await expect(mutation.handler({ target: 'item' }, {})).resolves.toEqual(result);
+    expect(await client.call(writeName, { target: 'item' })).toEqual(result);
     return 'Approved change applied';
   });
   try {
     await app.ready();
     expect(server.requests.map(request => request.url)).not.toContain('/mcp/shadow');
-    const captureResponse = await app.inject({
-      method: 'POST', url: '/webhooks/gitlab', headers: { 'x-gitlab-token': 'hook' }, payload: { object_kind: 'bridge' },
-    });
-    expect(captureResponse.statusCode).toBe(202);
-    const orchestrator = await orchestratorReady;
     const session = await repo.getOrCreateSession(1, 42, 'Bridge test');
     const actor = { userId: 40, username: 'maintainer' };
     await orchestrator.handleUserIntent(1, 42, { type: 'PLAN', ...actor });
@@ -540,18 +531,14 @@ it('wires onReady packs into profile resolution and permits an MCP mutation only
     expect(await repo.getLatestPendingApproval(session.id)).toMatchObject({ approvalType: 'PLAN' });
     expect(calls().map(request => request.rpc.params?.name)).toEqual(['read.status']);
 
-    const coding = orchestrator.handleUserIntent(1, 42, { type: 'APPROVE', ...actor });
-    try {
-      await vi.waitFor(async () => expect(await repo.getSession(session.id)).toMatchObject({ status: 'WAITING_TOOL' }));
-      const approval = (await repo.getLatestPendingApproval(session.id))!;
-      expect(approval).toMatchObject({ approvalType: 'TOOL_USE', toolName: writeName, toolInput: { target: 'item' } });
-      const card = notes[approval.gitlabNoteId! - 1];
-      for (const text of [approval.id, 'remote-pack', 'apply:change', '"target": "item"']) expect(card).toContain(text);
-      expect(calls()).toHaveLength(1);
-      await orchestrator.handleUserIntent(1, 42, { type: 'APPROVE', ...actor, targetNoteId: approval.gitlabNoteId! });
-    } finally {
-      await coding;
-    }
+    await orchestrator.handleUserIntent(1, 42, { type: 'APPROVE', ...actor });
+    expect(await repo.getSession(session.id)).toMatchObject({ status: 'WAITING_TOOL', lockedByPod: null });
+    const approval = (await repo.getLatestPendingApproval(session.id))!;
+    expect(approval).toMatchObject({ approvalType: 'TOOL_USE', toolName: writeName, toolInput: { target: 'item' } });
+    const card = notes[approval.gitlabNoteId! - 1];
+    for (const text of [approval.id, 'remote-pack', 'apply:change', '"target": "item"']) expect(card).toContain(text);
+    expect(calls()).toHaveLength(1);
+    await orchestrator.handleUserIntent(1, 42, { type: 'APPROVE', ...actor, targetNoteId: approval.gitlabNoteId! });
     expect(calls().map(request => request.rpc.params)).toEqual([
       { name: 'read.status', arguments: { target: 'item' } }, { name: 'apply:change', arguments: { target: 'item' } },
     ]);

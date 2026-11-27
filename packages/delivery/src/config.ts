@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { redactGitUrl, type AppConfig } from '@detent/core';
 import type { JumpServerAuth } from './jumpserver/client.js';
 
 const list = (value: string) => value.split(',').map(item => item.trim()).filter(Boolean);
@@ -13,7 +14,8 @@ const schema = z.object({
     return url && ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password && !url.search && !url.hash;
   }, 'Expected an HTTP(S) service URL').optional(),
   jumpserverOrgId: z.string().trim().min(1).optional(),
-  jumpserverTimeoutMs: z.coerce.number().int().positive().max(2147483647).default(30000),
+  jumpserverTimeoutMs: z.coerce.number().int().positive().max(2147483647).default(60000),
+  deliveryJobPollIntervalMs: z.coerce.number().int().min(0).max(2147483647).default(3000),
   jumpserverReadonlyAccount: z.string().trim().min(1).regex(/^[\w.@-]+$/).optional(),
   jumpserverReadonlyAuth: auth.optional(),
   jumpserverJobAuth: auth.optional(),
@@ -43,6 +45,7 @@ export function loadDeliveryConfig(env: NodeJS.ProcessEnv = process.env): Delive
   return schema.parse({
     jumpserverBaseUrl: env.JUMPSERVER_BASE_URL,
     jumpserverOrgId: env.JUMPSERVER_ORG_ID,
+    deliveryJobPollIntervalMs: env.DELIVERY_JOB_POLL_INTERVAL_MS,
     jumpserverTimeoutMs: env.JUMPSERVER_TIMEOUT_MS,
     jumpserverReadonlyAccount: env.JUMPSERVER_READONLY_ACCOUNT,
     jumpserverReadonlyAuth: credential(env, 'READONLY'),
@@ -63,6 +66,11 @@ export function authSecrets(auth?: JumpServerAuth) {
 
 export function redactSecrets(value: string, config: DeliveryConfig, ...additionalSecrets: string[]) {
   return redactValues(value, [...authSecrets(config.jumpserverReadonlyAuth), ...authSecrets(config.jumpserverJobAuth), ...additionalSecrets]);
+}
+
+export function redactDeliveryOutput(value: string, config: DeliveryConfig, app: Partial<AppConfig>) {
+  return redactSecrets(redactGitUrl(value), config, app.gitlabToken ?? '', app.gitlabWebhookSecret ?? '', app.mysqlPassword ?? '',
+    app.jevApiKey ?? '', app.anthropicApiKey ?? '', ...Object.values(app.secrets ?? {}), ...(app.additionalSecrets ?? []));
 }
 
 export function redactValues(value: string, values: string[]) {

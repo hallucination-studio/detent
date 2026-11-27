@@ -4,7 +4,7 @@ import {
 } from '@detent/core';
 import type { DeliveryConfig } from '../config.js';
 
-const prodTools = new Set(['jms_run_ansible_job', 'detent_create_release', 'detent_onboard_project']);
+const prodTools = new Set(['jms_job', 'detent_create_release', 'detent_onboard_project']);
 
 type WorkflowProfile = TurnProfile & { approverTier?: WorkflowApproverTier };
 type ResolverContext = Parameters<TurnProfileResolver>[0];

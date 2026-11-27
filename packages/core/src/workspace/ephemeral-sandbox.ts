@@ -284,7 +284,7 @@ export class EphemeralSandbox {
     });
   }
   async destroy(s: TurnSandbox) {
-    await fs.rm(s.rootDir, { recursive: true, force: true });
+    await fs.rm(s.rootDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   }
   async checkpointAndDestroySandbox(s: TurnSandbox, id: string) {
     try {

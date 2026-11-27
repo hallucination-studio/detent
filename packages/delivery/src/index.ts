@@ -1,22 +1,23 @@
 import { resolveJumpServerSettings } from './hub-config.js';
 import {
-  createDecisionClient, createDetentApp, createGitLabOnboardingCapability, createGitLabReleaseCapability, GitLabClient, loadConfig,
+  createDecisionClient, createDetentApp, createGitLabOnboardingCapability, createGitLabReleaseCapability, GitLabClient, loadConfig, loadHubCapabilities,
   type AppConfig, type DetentCapabilityPack, type DetentExtensions, type ReleaseGitLab, type OnboardingGitLab,
 } from '@detent/core';
 import { createDeliveryTurnProfileResolver } from './agents/profiles.js';
 import { MySqlDeliveryAuditRepository, formatDeliveryExecutionsStatus, type DeliveryAuditRepository } from './db/audit.js';
-import { authSecrets, loadDeliveryConfig, type DeliveryConfig } from './config.js';
-import { HttpJumpServerClient, type JumpServerClient } from './jumpserver/client.js';
+import { authSecrets, loadDeliveryConfig, redactDeliveryOutput, type DeliveryConfig } from './config.js';
+import { HttpJumpServerClient, type JobResultResponse, type JumpServerClient } from './jumpserver/client.js';
 import { createJumpServerTools, type DeliveryExecutionTracker } from './jumpserver/tools.js';
+import { DeliveryJobPoller } from './jumpserver/job-poller.js';
 import { matchMergeRequestWebhook } from './webhooks/merge-request.js';
 
-export { createDeliveryTurnProfileResolver, MySqlDeliveryAuditRepository, formatDeliveryExecutionsStatus };
+export { DeliveryJobPoller, createDeliveryTurnProfileResolver, MySqlDeliveryAuditRepository, formatDeliveryExecutionsStatus };
 export type { DeliveryAuditRepository, DeliveryExecutionRow } from './db/audit.js';
 export { matchMergeRequestWebhook, loadDeliveryConfig, HttpJumpServerClient, createJumpServerTools };
-export { validateReadonlyInspectCommand, validatePlaybookPath } from './jumpserver/guards.js';
+export { buildBatchShellScript, evaluateRemoteInspectCommand, validateShellCommands, validateReadonlyInspectCommand, validatePlaybookPath } from './jumpserver/guards.js';
 export type { DeliveryConfig, JumpServerClient, DeliveryExecutionTracker };
 export type {
-  JumpServerAuth, JumpServerAsset, ReadonlyInspectRequest, ReadonlyInspectResult, AnsibleJobRequest,
+  JumpServerAuth, JumpServerAsset, AssetQuery, ShellRequest, ReadonlyInspectResult, AnsibleJobRequest,
   AnsibleJobSubmission, JobResultResponse,
 } from './jumpserver/client.js';
 export type { DeliveryExecutionRecord } from './jumpserver/tools.js';
@@ -25,7 +26,7 @@ export interface DeliveryOptions extends DetentExtensions {
   deliveryConfig?: DeliveryConfig;
   gitlabClient?: ReleaseGitLab & (OnboardingGitLab | { getBotUser?: never });
   jumpserverClient?: JumpServerClient;
-  executionTracker?: DeliveryExecutionTracker & Partial<Pick<DeliveryAuditRepository, 'listSessionExecutions'>>;
+  executionTracker?: DeliveryExecutionTracker & Partial<DeliveryAuditRepository>;
 }
 
 export function createDeliveryApp(config: AppConfig = loadConfig(), options: DeliveryOptions = {}): ReturnType<typeof createDetentApp> {
@@ -34,8 +35,18 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
     ...authSecrets(deliveryConfig.jumpserverReadonlyAuth), ...authSecrets(deliveryConfig.jumpserverJobAuth)] };
   const decision = extensions.decisionClient ?? createDecisionClient(config);
   const client = jumpserverClient ?? (deliveryConfig.jumpserverBaseUrl ? new HttpJumpServerClient(deliveryConfig, config) : undefined);
-  const auditRepo = executionTracker ? undefined : new MySqlDeliveryAuditRepository();
+  const auditRepo = new MySqlDeliveryAuditRepository();
   const tracker = executionTracker ?? auditRepo;
+  let poller: DeliveryJobPoller | undefined;
+  async function onTerminalResult(sessionId: string, jobId: string, result: JobResultResponse) {
+    if (poller && tracker.listSessionExecutions) {
+      const row = (await tracker.listSessionExecutions(sessionId)).find(row => row.jumpserverJobId === jobId);
+      if (!row) throw Error('未找到当前会话的任务记录');
+      await poller.complete(row, result);
+    } else {
+      await tracker.updateExecutionResult?.(sessionId, jobId, result.status, result.outputSummary);
+    }
+  }
   const api = gitlabClient ?? new GitLabClient(config);
   const onboarding = createGitLabOnboardingCapability({
     gitlab: api.getBotUser ? api : new GitLabClient(config),
@@ -50,7 +61,7 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
   const jumpserver: DetentCapabilityPack = {
     name: 'jumpserver', enabled: !!client,
     setupHint: '请在 Hub capabilities.json 配置 jumpserver.base_url 和 auth，并在服务端提供 DETENT_SECRET_JMS_AK_ID 与 DETENT_SECRET_JMS_AK_SECRET',
-    tools: client ? createJumpServerTools({ client, config: deliveryConfig, tracker, decision }) : [],
+    tools: client ? createJumpServerTools({ client, config: deliveryConfig, tracker, decision, onTerminalResult }) : [],
   };
   const packs = new Map<string, DetentCapabilityPack>();
   for (const pack of [release, jumpserver, onboarding, ...(extensions.capabilities ?? [])]) packs.set(pack.name.trim().toLowerCase(), pack);
@@ -63,7 +74,7 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
         if (entry.type === 'jumpserver') {
           const resolved = resolveJumpServerSettings(entry, ctx.config.secrets, deliveryConfig);
           dynamic.push('setupHint' in resolved ? { name, enabled: false, tools: [], setupHint: resolved.setupHint } : {
-            name, enabled: true, tools: createJumpServerTools({ config: resolved.config, tracker, decision, defaultAccount: resolved.defaultAccount,
+            name, enabled: true, tools: createJumpServerTools({ config: resolved.config, tracker, decision, onTerminalResult, defaultAccount: resolved.defaultAccount,
               client: new HttpJumpServerClient(resolved.config, ctx.config) }),
           });
         } else if (entry.type === 'gitlab-release') {
@@ -77,7 +88,7 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
     },
     resolveTurnProfile: createDeliveryTurnProfileResolver(deliveryConfig, {
       async canCloseIssue({ session }) {
-        const rows = await tracker?.listSessionExecutions?.(session.id);
+        const rows = await tracker.listSessionExecutions?.(session.id);
         const latest = rows?.at(-1);
         if (latest && latest.status !== 'SUCCESS')
           return { ok: false, reason: '最新交付执行记录状态为 ' + latest.status + '，未成功前禁止关闭工单' };
@@ -85,12 +96,56 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
       },
       hubDefaultBranch: config.gitlabHubDefaultBranch, resolveTurnProfile: extensions.resolveTurnProfile,
     }),
+    async onReady(ctx) {
+      const cleanup = await extensions.onReady?.(ctx);
+      if (!tracker.listPendingExecutions || !tracker.completeExecution || !tracker.acknowledgeCallback) return cleanup;
+      // All concurrent lookups in one scan share the live Hub revision.
+      let document: ReturnType<typeof loadHubCapabilities> | undefined;
+      poller = new DeliveryJobPoller({
+        auditRepo: {
+          listPendingExecutions: tracker.listPendingExecutions.bind(tracker),
+          acknowledgeCallback: tracker.acknowledgeCallback.bind(tracker),
+          completeExecution: tracker.completeExecution.bind(tracker),
+        },
+        report: ctx.report, intervalMs: deliveryConfig.deliveryJobPollIntervalMs,
+        async resolveClient(row) {
+          document ??= loadHubCapabilities(ctx.gitlab, config.gitlabHubProjectId, config.gitlabHubDefaultBranch)
+            .finally(() => { document = undefined; });
+          const hub = await document;
+          if (hub.invalid) throw Error(hub.error);
+          for (const entry of Object.values(hub.entries)) {
+            if (entry.type !== 'jumpserver' || typeof entry.base_url !== 'string' ||
+                !row.jumpserverJobUrl.startsWith(entry.base_url.trim().replace(/\/$/, '') + '/')) continue;
+            const resolved = resolveJumpServerSettings(entry, config.secrets, deliveryConfig);
+            if ('setupHint' in resolved) throw Error(resolved.setupHint);
+            return new HttpJumpServerClient(resolved.config, config);
+          }
+          if (client && !Object.keys(hub.entries).some(name => name.toLowerCase() === 'jumpserver') &&
+              (jumpserverClient || row.jumpserverJobUrl.startsWith(deliveryConfig.jumpserverBaseUrl!.replace(/\/$/, '') + '/'))) return client;
+          throw Error('未找到与执行记录匹配的 JumpServer 配置');
+        },
+        async onCompleted(row, result) {
+          const scrub = (value: string) => redactDeliveryOutput(value, deliveryConfig, config);
+          const message = scrub([
+            `JumpServer 任务 ${row.jumpserverJobId} 已结束（${result.status}）`, row.jumpserverJobUrl,
+            `Playbook ${row.playbookPath} @ ${row.commitSha}`,
+            '请依据任务状态继续核验。以下为远端输出摘要：',
+          ].join('\n')) + '\n' + scrub(result.outputSummary).slice(0, 2000);
+          await ctx.orchestrator.deliverSystemEvent(row.sessionId, 'jms-job:' + row.jumpserverJobId, message, { sender: 'jumpserver' });
+        },
+      });
+      poller.start();
+      return async () => {
+        try { await poller?.stop(); }
+        finally { await cleanup?.(); }
+      };
+    },
     async onInitSchema(pool) {
-      await auditRepo?.init(pool);
+      if (!executionTracker) await auditRepo.init(pool);
       await extensions.onInitSchema?.(pool);
     },
     async renderStatusExtra(session) {
-      const rows = await tracker?.listSessionExecutions?.(session.id);
+      const rows = await tracker.listSessionExecutions?.(session.id);
       const extra = await extensions.renderStatusExtra?.(session);
       return [rows && formatDeliveryExecutionsStatus(rows), extra?.trim()].filter(Boolean).join('\n\n') || null;
     },

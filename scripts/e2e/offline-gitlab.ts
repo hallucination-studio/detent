@@ -60,6 +60,8 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
   let nextNoteId = 1;
   const issues = new Map<number, Issue>();
   const notes = new Map<number, { issueIid: number; body: string; author: User }>();
+  // File/tree objects at a commit are immutable even when the Hub branch moves.
+  const repositoryReads = new Map<string, object>();
   const releases = new Map<number, Release[]>();
   const find = (ref: string | number) => projects.find(p => String(p.id) === String(ref) || p.path_with_namespace === ref);
   const repo = (p: Project) => join(root, p.path_with_namespace + '.git');
@@ -299,21 +301,31 @@ export async function offlineGitLab(root: string, serve: (handle: (req: Request)
         const sha = commitSha(p, url.searchParams.get('ref') ?? p.default_branch);
         if (!sha) return absent();
         const object = sha + ':' + path;
-        let type: string;
-        try { type = git(repo(p), 'cat-file', '-t', object).toString().trim(); } catch { return absent(); }
-        if (item === 'files') {
-          if (type !== 'blob') return absent();
-          return reply({ file_path: path, encoding: 'base64', content: git(repo(p), 'cat-file', 'blob', object).toString('base64') });
+        const recursive = url.searchParams.get('recursive') === 'true';
+        const key = JSON.stringify([p.id, object, item, recursive]);
+        const cached = repositoryReads.get(key);
+        if (cached) return reply(cached);
+        let data: object;
+        try {
+          if (item === 'files') {
+            const blob = git(repo(p), 'cat-file', 'blob', object);
+            data = { file_path: path, encoding: 'base64', content: blob.toString('base64') };
+          } else {
+            const flags = recursive ? ['-r', '-t', '-z'] : ['-z'];
+            const entries = git(repo(p), 'ls-tree', ...flags, object).toString().split('\0').filter(Boolean);
+            data = entries.map(entry => {
+              const tab = entry.indexOf('\t');
+              const [, type, id] = entry.slice(0, tab).split(' ');
+              const rel = entry.slice(tab + 1);
+              return { id, name: posix.basename(rel), type, path: path ? path + '/' + rel : rel };
+            });
+          }
+        } catch (error) {
+          if ((error as { status?: number }).status === 128) return absent();
+          throw error;
         }
-        if (type !== 'tree') return absent();
-        const flags = url.searchParams.get('recursive') === 'true' ? ['-r', '-t', '-z'] : ['-z'];
-        const entries = git(repo(p), 'ls-tree', ...flags, object).toString().split('\0').filter(Boolean);
-        return reply(entries.map(entry => {
-          const tab = entry.indexOf('\t');
-          const [, type, id] = entry.slice(0, tab).split(' ');
-          const rel = entry.slice(tab + 1);
-          return { id, name: posix.basename(rel), type, path: path ? path + '/' + rel : rel };
-        }));
+        repositoryReads.set(key, data);
+        return reply(data);
       }
       if ((post || put || deleteFile) && item === 'files') {
         if (body.branch === 'main' && accessLevel(p, actor.id) < 40) return forbidden();

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { join } from 'node:path';
 import { matrixTurns } from './suites/jumpserver-matrix.js';
 import { kafkaCommands, kafkaTitle } from './suites/kafka.js';
@@ -19,13 +20,13 @@ const contents = (value: string | Text[]) => typeof value === 'string' ? value :
 const plan = 'Inspect web01, review the nginx reload playbook, then verify service health after execution.';
 const review = 'Please review and merge the nginx reload MR.';
 const playbook = 'deploy/nginx-reload.yml';
-const inspect = { asset_ids: ['web01'], command: 'systemctl status nginx' };
+const inspect = { asset_ids: ['web01'], commands: ['systemctl status nginx'] };
 
 interface Repos { webRepo: string; apiRepo: string; ansibleRepo: string; securityReport: string }
 
 function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }: Repos): Text | Use {
   // The CLI also sends small auxiliary requests without the workspace tools.
-  if (!body.tools?.length) return text('Delivery request');
+  if (!body.tools?.some(tool => tool.name.startsWith('mcp__detent__'))) return text('Delivery request');
   const blocks = body.messages.flatMap(m => typeof m.content === 'string' ? [text(m.content)] : m.content);
   const prefix = 'mcp__detent__';
   const toolName = (name: string) => ['Read', 'Write', 'Bash'].includes(name) ? name : prefix + name;
@@ -33,8 +34,17 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
     assert.ok(body.tools?.some(t => t.name === toolName(name)), 'SDK did not advertise ' + toolName(name));
     return { type: 'tool_use', id: 'toolu_' + randomUUID(), name: toolName(name), input };
   };
+  const interrupted = new Set<string>();
+  for (const [index, block] of blocks.entries()) {
+    if (block.type !== 'text') continue;
+    const approvedTool = /GitLab 审批结果 APPROVED，工具 (.+?)，参数 (.+?)。审批说明：/.exec(block.text);
+    if (!approvedTool) continue;
+    const prior = blocks.slice(0, index).reverse().find((b): b is Use => b.type === 'tool_use' &&
+      b.name === toolName(approvedTool[1]) && isDeepStrictEqual(b.input, JSON.parse(approvedTool[2])));
+    if (prior) interrupted.add(prior.id);
+  }
   function result(name: string, history = blocks) {
-    const call = history.find((b): b is Use => b.type === 'tool_use' && b.name === toolName(name));
+    const call = history.find((b): b is Use => b.type === 'tool_use' && b.name === toolName(name) && !interrupted.has(b.id));
     if (!call) return;
     const r = history.find((b): b is Result => b.type === 'tool_result' && b.tool_use_id === call.id);
     assert.ok(r, 'Missing SDK result for ' + name);
@@ -195,15 +205,9 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
       const assets = result('jms_list_assets');
       if (!assets) return use('jms_list_assets', {});
       assert.match(success(assets), /web01/);
-      let history = blocks;
-      const evidence: string[] = [];
-      for (const command of kafkaCommands) {
-        const run = result('jms_readonly_inspect', history);
-        if (!run) return use('jms_readonly_inspect', { asset_ids: ['web01'], command });
-        evidence.push(JSON.parse(success(run)).outputSummary);
-        history = history.slice(history.indexOf(run) + 1);
-      }
-      return text('web01 Kafka 诊断：' + evidence.join('，'));
+      const batch = result('jms_shell');
+      if (!batch) return use('jms_shell', { asset_ids: ['web01'], commands: kafkaCommands });
+      return text('web01 Kafka 诊断：' + JSON.parse(success(batch)).outputSummary);
     }
     if (approved < 0) {
       const receipt = result('detent_submit_plan', history);
@@ -226,16 +230,16 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
     let history = blocks.slice(blocks.indexOf(prompt) + 1);
     const reports = [];
     for (const input of matrixTurns[key]) {
-      const step = result('jms_readonly_inspect', history);
-      if (!step) return use('jms_readonly_inspect', input);
+      const step = result('jms_shell', history);
+      if (!step) return use('jms_shell', input);
       reports.push(contents(step.content));
       history = history.slice(history.indexOf(step) + 1);
     }
     return text(reports.join('\n'));
   }
   if (/Stage 15 (?:Hub|workflow|denied) account/.test(system)) {
-    const status = result('jms_readonly_inspect');
-    if (!status) return use('jms_readonly_inspect', { asset_ids: ['web01'], command: system.includes('workflow account') ? 'kafka-topics.sh --list' : 'uptime' });
+    const status = result('jms_shell');
+    if (!status) return use('jms_shell', { asset_ids: ['web01'], commands: [system.includes('workflow account') ? 'kafka-topics.sh --list' : 'uptime'] });
     if (system.includes('denied account')) {
       assert.ok(status.is_error);
       assert.match(contents(status.content), /资产 web01 未授权账号 ghost.*可用授权账号：ops-first、root、ops-hub、audit-ro/);
@@ -436,8 +440,8 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
     let history = turn;
     for (const [asset, commit, reason] of [['blocked-db-01', sha, '黑名单'], ['web01', '0'.repeat(40), '提交不一致'],
       ['web01', sha, '最新流水线失败']]) {
-      const denied = result('jms_run_ansible_job', history);
-      if (!denied) return use('jms_run_ansible_job', { target_project_id: targetProjectId, mr_iid: mrIid,
+      const denied = result('jms_job', history);
+      if (!denied) return use('jms_job', { target_project_id: targetProjectId, mr_iid: mrIid,
         commit_sha: commit, playbook_path: 'deploy/guard.yml', asset_ids: [asset] });
       assert.ok(denied.is_error && contents(denied.content).includes(reason), 'Expected guard denial: ' + reason);
       history = history.slice(history.indexOf(denied) + 1);
@@ -477,8 +481,8 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
     const assets = result('jms_list_assets');
     if (!assets) return use('jms_list_assets', {});
     assert.match(success(assets), /web01/);
-    const status = result('jms_readonly_inspect');
-    if (!status) return use('jms_readonly_inspect', audit ? { asset_ids: ['web01', 'web02'], command: 'ss -lntp' } : inspect);
+    const status = result('jms_shell');
+    if (!status) return use('jms_shell', audit ? { asset_ids: ['web01', 'web02'], commands: ['ss -lntp'] } : inspect);
     assert.match(success(status), /nginx active/);
     if (audit) {
       const grouped = JSON.parse(success(status));
@@ -498,8 +502,8 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
   const { targetProjectId, mrIid, sha } = step;
   const job = { target_project_id: targetProjectId, mr_iid: mrIid, commit_sha: sha, playbook_path: playbook,
     asset_ids: ['web01'], extra_vars: { service: 'nginx' } };
-  const denied = result('jms_run_ansible_job');
-  if (!denied) return use('jms_run_ansible_job', job);
+  const denied = result('jms_job');
+  if (!denied) return use('jms_job', job);
   assert.equal(denied.is_error, true);
   assert.match(contents(denied.content), /尚未合并/);
   if (!lastMerge) return closeIssue('Check nginx change.', review, true);
@@ -509,18 +513,22 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
   let executionHistory = turn;
   const expectFailure = system.includes('Verify failed playbook');
   if (expectFailure) {
-    const mixed = result('jms_run_ansible_job', turn);
-    if (!mixed) return use('jms_run_ansible_job', { ...job, asset_ids: ['web01', 'web02'], commit_sha: mergeSha });
+    const mixed = result('jms_job', turn);
+    if (!mixed) return use('jms_job', { ...job, asset_ids: ['web01', 'web02'], commit_sha: mergeSha });
     assert.ok(mixed.is_error);
     assert.match(contents(mixed.content), /共同的 account.*分组执行/);
     executionHistory = turn.slice(turn.indexOf(mixed) + 1);
   }
-  const submitted = result('jms_run_ansible_job', executionHistory);
-  if (!submitted) return use('jms_run_ansible_job', { ...job, asset_ids: expectFailure ? ['web02'] : job.asset_ids, commit_sha: mergeSha });
+  const submitted = result('jms_job', executionHistory);
+  if (!submitted) return use('jms_job', { ...job, asset_ids: expectFailure ? ['web02'] : job.asset_ids, commit_sha: mergeSha });
   const submission = JSON.parse(success(submitted));
   assert.equal(submission.commitSha, mergeSha);
-  const outcome = result('jms_get_job_result', turn);
-  if (!outcome) return use('jms_get_job_result', { job_id: submission.jobId });
+  assert.equal(submission.asyncCallback, true);
+  const callback = turn.find((b): b is Text => b.type === 'text' && b.text.includes('JumpServer 任务 ' + submission.jobId + ' 已结束'));
+  if (!callback) return text('Submitted asynchronous job ' + submission.jobUrl);
+  assert.ok(callback.text.includes(expectFailure ? 'FAILED' : 'SUCCESS'));
+  const outcome = result('jms_job_status', turn.slice(turn.indexOf(callback)));
+  if (!outcome) return use('jms_job_status', { job_id: submission.jobId });
   if (expectFailure) {
     const failure = JSON.parse(success(outcome));
     assert.equal(failure.status, 'FAILED');
@@ -533,8 +541,8 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
     return text('Playbook failed on web02, leaving this Issue open.');
   }
   assert.match(success(outcome), /nginx reloaded/);
-  const verified = result('jms_readonly_inspect', turn);
-  if (!verified) return use('jms_readonly_inspect', inspect);
+  const verified = result('jms_shell', turn);
+  if (!verified) return use('jms_shell', inspect);
   assert.match(success(verified), /nginx active/);
   return closeIssue('Nginx reload verified on web01.', 'Reload verified on web01. The approved job succeeded and nginx is active.');
 }
@@ -570,7 +578,8 @@ export function createOfflineAnthropic(repos: Repos, expectedModel: string) {
   return {
     async handle(req: Request) {
       requests++;
-      if (req.method !== 'POST' || new URL(req.url).pathname !== '/v1/messages') return new Response(null, { status: 404 });
+      const path = new URL(req.url).pathname;
+      if (req.method !== 'POST' || !['/v1/messages', '/v1/messages/count_tokens'].includes(path)) return new Response(null, { status: 404 });
       assert.ok(req.headers.get('x-api-key') === 'offline-api-key', 'Model transport did not authenticate the upstream request');
       const body: Messages = await req.json();
       if (body.model !== expectedModel) {
@@ -578,7 +587,8 @@ export function createOfflineAnthropic(repos: Repos, expectedModel: string) {
         return Response.json({ code: 'InvalidParameter', message: 'Model not exist.' }, { status: 400 });
       }
       checkPayload(body);
-      if (body.tools?.length && observeRequest) await observeRequest(contents(body.system ?? ''));
+      if (path.endsWith('/count_tokens')) return Response.json({ input_tokens: 100 });
+      if (body.tools?.some(tool => tool.name.startsWith('mcp__detent__')) && observeRequest) await observeRequest(contents(body.system ?? ''));
       const block = next(body, repos);
       if (nextTool && block.type === 'tool_use' && block.name === 'mcp__detent__' + nextTool.name) {
         const { observe } = nextTool;

@@ -9,7 +9,7 @@
 - ✅ 无状态 Pod 架构（`/tmp` 沙箱用完即焚 + `uncommitted_diff` 跨 Pod 二进制补丁还原）
 - ✅ MySQL 8.0 纯增量 `session_messages` 与分布式租约锁（15s 心跳）
 - ✅ 1:N 跨项目 Worktree / MR / Pipeline 基础工具与单评论流式渲染
-- ✅ 双层审批门禁（Plan 方案审批 + 高危工具热/冷恢复审批）
+- ✅ 双层审批门禁（Plan 方案审批 + 高危工具冷恢复审批）
 - ✅ 质量门禁落地（`npm run check` = `tsc` + `knip` + `vitest`、`.githooks/pre-commit`、`.opencodereview/rule.json`、`.gitlab-ci.yml`）
 
 ---
@@ -20,7 +20,7 @@
 | :--- | :--- | :--- | :--- |
 | **Stage 1** | **双包 Monorepo 拆分与 `@detent/core` 4 大扩展点抽象** | `packages/core` (`@detent/core`)<br/>`packages/delivery` (`@detent/delivery` 骨架)<br/>4 个标准扩展接口（`DetentExtensionTool` / `resumeSession` / `TurnProfileResolver` / `SessionLifecycleHooks`） | 1. `packages/core` 零业务词/零业务依赖<br/>2. 原有 25 项测试 100% 通过 + 新增扩展点单测<br/>3. `npm run check` (`tsc` + `knip` + `vitest`) 全绿 |
 | **Stage 2** | **GitLab `merge_request` 合并事件监听与会话自动续跑** | `session_merge_requests` 增加 `merge_commit_sha` / `merged_by` / `merged_at`<br/>`@detent/core` 暴露 `resumeSession`<br/>`@detent/delivery` 接入目标库 MR `merge` Webhook 自动唤醒原 Issue Session | 1. 端到端测试覆盖：`提 Ansible MR -> 人工 Merge -> MR Webhook 触发 -> 自动 --resume 原 Issue Session`<br/>2. 幂等校验（重复 Merge Webhook 不重复唤醒） |
-| **Stage 3** | **JumpServer 适配器（只读巡检 + 任务中心）与合规硬守卫** | `packages/delivery/src/jumpserver/client.ts`（父进程按工具执行门禁）<br/>4 个 JumpServer MCP 工具（`jms_list_assets` / `jms_readonly_inspect` / `jms_run_ansible_job` / `jms_get_job_result`）<br/>合规硬守卫（MR 未合入强拦截 + 强制人工审批卡片） | 1. 单测覆盖：MR 未合并或 SHA 不一致时 `jms_run_ansible_job` 被硬守卫直接拦截<br/>2. Plan 模式拒绝执行，Coding 模式仅在硬守卫通过后弹审批卡<br/>3. 只读巡检工具在 `plan` 阶段可用且禁止写命令 |
+| **Stage 3** | **JumpServer 适配器（只读巡检 + 任务中心）与合规硬守卫** | `packages/delivery/src/jumpserver/client.ts`（父进程按工具执行门禁）<br/>4 个 JumpServer MCP 工具（`jms_list_assets` / `jms_shell` / `jms_job` / `jms_job_status`）<br/>合规硬守卫（MR 未合入强拦截 + 强制人工审批卡片） | 1. 单测覆盖：MR 未合并或 SHA 不一致时 `jms_job` 被硬守卫直接拦截<br/>2. Plan 模式拒绝执行，Coding 模式仅在硬守卫通过后弹审批卡<br/>3. 只读巡检工具在 `plan` 阶段可用且禁止写命令 |
 | **Stage 4** | **执行审计表与 6 阶段全链路 E2E 验收** | `delivery_executions` MySQL 审计表与仓储<br/>Hub SOP 与生产审批人 RBAC 策略<br/>工作区仓库示例模板 (`examples/hub-workspace/`)<br/>6 阶段全链路端到端集成测试 | 1. 完整跑通：`开变更 Issue -> JumpServer 只读巡检 -> 方案审批 -> 写 Ansible 提 MR -> 人工合并 MR 自动唤醒 -> 执行前二次审批 -> JumpServer 任务中心执行 -> 变更后只读验收 -> 写审计表`<br/>2. 推送前通过 `ocr delegate` 100% 覆盖率审查 |
 
 ---
@@ -40,7 +40,7 @@
      - `'readonly'` -> `plan` / `coding` 均在 guard 通过后放行；
      - `'coding_auto'` -> `plan` 拒绝，`coding` 在 guard 通过后放行；
      - `'always_approve'` -> `plan` 拒绝，`coding` 下**必须**先执行 `tool.guard(input, ctx)`（未通过直接返回 `deny(reason)`），通过后返回 `'ask'` 强制弹出 GitLab 审批卡片（支持调用工具自定义的 `renderApprovalCard`）。
-   - 热审批或冷恢复放行后，执行前的 `tool.guard` 与 `tool.execute` 均接收该审批单的 `ctx.approvalId`。复检失败时终止执行。
+   - 冷恢复放行后，执行前的 `tool.guard` 与 `tool.execute` 均接收该审批单的 `ctx.approvalId`。复检失败时终止执行。
 2. **`SessionOrchestrator.resumeSession(sessionId, prompt, opts?)`**：
    - 在分布式租约锁保护下，拉起指定 Session 的新 Turn（自动水合 `.jsonl` 和 Worktree），供业务事件驱动续跑。
 3. **`TurnProfileResolver`**：
@@ -98,24 +98,24 @@ ALTER TABLE session_merge_requests
      - `JUMPSERVER_READONLY_ACCESS_KEY_ID` / `JUMPSERVER_READONLY_ACCESS_KEY_SECRET`（或 `JUMPSERVER_READONLY_TOKEN`），可用 `JUMPSERVER_READONLY_ACCOUNT` 显式指定旧模式巡检账号
      - `JUMPSERVER_JOB_ACCESS_KEY_ID` / `JUMPSERVER_JOB_ACCESS_KEY_SECRET`（或 `JUMPSERVER_JOB_TOKEN`），仅供任务中心使用
      - `JUMPSERVER_INSPECT_ALLOW_PREFIXES`（只读巡检允许的命令白名单，默认如 `systemctl status,nginx -t,df -h,free -m,uptime,ss -tlnp,kubectl get,cat /etc/nginx` 等）
-     - `JUMPSERVER_ORG_ID` 可选，`JUMPSERVER_TIMEOUT_MS` 默认 30000。
+     - `JUMPSERVER_ORG_ID` 可选，`JUMPSERVER_TIMEOUT_MS` 默认 60000。
      - `JUMPSERVER_BLOCKED_ASSETS` 使用逗号分隔资产 ID，忽略大小写。`JUMPSERVER_BLOCK_FAILED_PIPELINE` 默认开启，可用 false 或 0 关闭。
    - 定义干净的 `JumpServerClient` 接口（支持真实 JumpServer v3/v4 REST API 签名认证 + 离线 Mock 实现供自动化测试）。
 2. **4 个受治理 JumpServer MCP 工具（`packages/delivery/src/jumpserver/tools.ts`）**：
    - `jms_list_assets`（`policy: 'readonly'`）
-   - `jms_readonly_inspect`（`policy: 'readonly'`，内置只读命令白名单 + 禁止 `; | & > < $()` 注入检查）
-   - `jms_run_ansible_job`（`policy: 'always_approve'`）：
+   - `jms_shell`（`policy: 'readonly'`，内置只读命令白名单 + 禁止 `; | & > < $()` 注入检查）
+   - `jms_job`（`policy: 'always_approve'`）：
      - **`guard()` 硬校验**：
        1. 校验入参指定的 `(project, mr_iid)` 属于当前 Session；
        2. 从 MySQL 查询该 MR 状态必须为 `merged`，且 `merge_commit_sha` 非空并与请求执行的 `commit_sha` 完全一致；
        3. 校验该 MR 对应最新 Pipeline 未处于 `failed` 状态（可配置开关）。
      - **自定义审批卡片**：清晰展示 `目标资产组`、`Ansible 仓库与 Playbook 路径`、`已合并 MR 链接与 Commit SHA`、`变更参数变量`，提示运维负责人点 👍 或 `/approve` 放行。
      - **执行与审计**：放行后复核当前 MR，从 GitLab 读取该 SHA 的归档，将批准的 Playbook 提交到任务中心。通过注入的 `DeliveryExecutionTracker` 记录执行 ID、审批单和 MR；Stage 4 已提供共享池 MySQL 实现。
-   - `jms_get_job_result`（`policy: 'readonly'`）要求 tracker 确认任务属于当前会话。缺少仓储时拒绝查询。
+   - `jms_job_status`（`policy: 'readonly'`）要求 tracker 确认任务属于当前会话。缺少仓储时拒绝查询。
 
 ### 3.2 Stage 3 验收标准（DoD）
 - 单元测试完整覆盖合规硬守卫：
-  - MR 仍为 `opened`（未合并）时调用 `jms_run_ansible_job` -> 直接 `deny`，绝不发审批卡也绝不调 JumpServer；
+  - MR 仍为 `opened`（未合并）时调用 `jms_job` -> 直接 `deny`，绝不发审批卡也绝不调 JumpServer；
   - `commit_sha` 与 `merge_commit_sha` 不匹配时 -> 直接 `deny`；
   - 只读巡检命令含写操作或 shell 拼接（如 `nginx -t && rm -rf /`） -> 直接 `deny`；
   - MR 已合并且参数合规 -> 弹出定制化生产变更审批卡片，未获当前审批策略授权的人批准不执行（角色级 RBAC 见 Stage 4），批准后成功调用任务中心并返回 Job ID 与审计链接。
@@ -220,3 +220,7 @@ Core 加载 Hub SOP、检查所需能力并提供受审批的 GitLab 发版工�
 - `always_approve` 要求单次工具审批，生产工具额外校验生产审批人。
 
 模型代理在父进程脱敏并认证请求，向上游发送 Messages 和 token 计数请求前，将模型名统一为配置的 `CLAUDE_MODEL`。离线网关逐个检查 Messages 的模型名。Kafka 场景通过同一会话的工具轨迹、审批记录、MR 和源分支文件验收。
+
+## Stage 18 · 批量巡检与异步任务
+
+每轮 Claude 通过带令牌认证的回环 HTTP MCP 调用工具。工具审批和提问先保存会话并释放 Pod 租约，获授权的用户回复后由新进程恢复。通过 `jms_list_assets` 查询资产，向 `jms_shell` 传入 `commands` 数组完成批量巡检。生产审批通过后，`jms_job` 异步提交任务并返回链接，本轮结束。Delivery 记录终态并唤醒原 Issue 进行核验。`jms_job_status` 可查询当前会话所属的任务。 `npm run e2e:smoke` 验收统一工单与生产变更。全量离线套件另验证跨 Pod 恢复、超过 30 秒的工具调用和失败任务拒绝关单。

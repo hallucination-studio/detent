@@ -64,7 +64,7 @@ flowchart TD
             Session_Orch["Session 编排器<br/>(MySQL 租约锁 / 状态机 / resumeSession 扩展口)"]
             Note_Streamer["单评论节流流式渲染器"]
             Perm_Gate["双层权限门禁<br/>(Plan Gate + 工具 policy: readonly/coding_auto/always_approve)"]
-            Core_Tools["基础 GitLab 工具 (SDK MCP)<br/>(Worktree / Commit&Push / 多 MR / Pipeline)"]
+            Core_Tools["基础 GitLab 工具 (回环 HTTP MCP)<br/>(Worktree / Commit&Push / 多 MR / Pipeline)"]
             Sandbox["单轮临时 /tmp 沙箱 (用完即焚)"]
         end
     end
@@ -107,9 +107,9 @@ flowchart TD
 2. **100% 无状态 Pod + MySQL 纯增量存储**：
    - `session_messages` 表按 `(session_id, seq)` 做纯增量 `INSERT IGNORE` 批量追加（绝不在主表存整份 JSONL 大字段）。
    - 单轮运行使用 `${EPHEMERAL_ROOT}/turn-<uuid>` 临时沙箱，`finally` 强制 `rm -rf`；未提交改动以 `git diff --binary` 补丁存入 `session_worktrees.uncommitted_diff`，实现跨 Pod 无缝水合还原。
-3. **单评论流式渲染与热/冷双模审批挂起**：
+3. **单评论流式渲染与审批冷挂起**：
    - `NoteStreamer` 节流刷新单条评论并折叠工具轨迹；
-   - `PermissionGate` 在暂停前先刷盘 `checkpoint()`，支持同 Pod 内存 Promise 0 延迟热唤醒以及跨 Pod / 重启后的 `--resume` 冷恢复（跨 Pod 等锁具备状态早退机制）。
+   - `PermissionGate` 在暂停前先刷盘 `checkpoint()`，立即终止本轮、清理沙箱并释放租约，审批或回答后在持租约的新进程中恢复。
 
 ---
 
@@ -123,7 +123,7 @@ Delivery 共享同一实例。只读巡检可在静态白名单外评估诊断�
 
 为了保持 `@detent/core` 极度紧凑、不引入重型插件框架，仅定义以下 **4 个强类型接口**：
 
-应用通过 `createDetentApp(config, { tools, resolveTurnProfile, hooks, matchWebhookEvent, onInitSchema, renderStatusExtra })` 装配扩展。各项均可省略，单独启动 Core 使用 `packages/core/src/server.ts`。Core 在 `onReady` 中完成基础表初始化后等待 `onInitSchema(pool)` 建立业务表，关闭时在队列 drain 后释放该连接池。
+应用通过 `createDetentApp(config, { tools, resolveTurnProfile, hooks, matchWebhookEvent, onInitSchema, onReady, renderStatusExtra })` 装配扩展。各项均可省略，单独启动 Core 使用 `packages/core/src/server.ts`。Core 建立基础表后调用 `onInitSchema(pool)` 初始化业务表，Bot 身份就绪后调用扩展的 `onReady`。Delivery 在该钩子中启动任务扫描，并返回停服时等待扫描结束的清理函数。
 
 #### 扩展点 1：自定义工具与治理级别注册（`DetentExtensionTool`）
 ```ts
@@ -161,13 +161,14 @@ export interface DetentExtensionTool<TSchema extends z.ZodRawShape = z.ZodRawSha
 }
 ```
 
-使用 `defineExtensionTool({ schema, ... })` 定义每个工具，回调的入参类型从该工具的 Zod Schema 推导。返回的工具可放入同一个 `readonly AnyDetentExtensionTool[]`。对于获批的 `always_approve` 调用，执行前复检和执行函数均收到对应审批记录的 `ctx.approvalId`，热唤醒与冷恢复遵循相同约定。
+使用 `defineExtensionTool({ schema, ... })` 定义每个工具，回调的入参类型从该工具的 Zod Schema 推导。返回的工具可放入同一个 `readonly AnyDetentExtensionTool[]`。对于获批的 `always_approve` 调用，执行前复检和执行函数均收到对应审批记录的 `ctx.approvalId`。
 
 #### 扩展点 2：外部 Webhook 事件扩展与受控会话唤醒（`resumeSession`）
 - `SessionOrchestrator.resumeSession(sessionId: string, prompt: string, options?: { permissionMode?: PermissionMode; beforeRun?: (session: IssueSessionRow) => Promise<boolean> })`：
   - 取得租约并重读会话后先执行 `beforeRun`。返回 `false` 时直接释放租约。返回 `true` 或省略回调时继续检查待审状态，再设置权限模式并启动轮次。
   - 租约占用时抛出 `SessionBusy`，等待方案或工具审批时保留待审状态并拒绝续跑。
-  - 受分布式租约锁保护的公开入口，供业务模块在收到外部事件（如目标仓库 **MR 被人工合并**、JumpServer 异步任务回调、告警触发）后唤醒对应的 Hub Issue Session。
+  - 受分布式租约锁保护的公开入口，供业务模块在收到外部事件（如目标仓库 **MR 被人工合并**、告警触发）后唤醒对应的 Hub Issue Session。
+- 异步任务完成后，扩展通过 `deliverSystemEvent(sessionId, eventId, content)` 将结果写入收件箱。事件按会话与 ID 去重，忙碌或待审会话保留消息。
 - 通过验签和 Bot 过滤的非内置事件交给同步匹配器 `matchWebhookEvent(event)` 校验。返回 `null` 时，网关将事件提交到队列评估 Hub 策略并响应 202；未配置策略匹配器时响应 200 和 `{ ignored: true }`。返回 `{ key, handle(orchestrator) }` 时，网关提交到与内置事件共用的 WebhookQueue 后即响应 202。队列按 eventId 去重，同一 key 串行，遇到 `SessionBusy` 退避重试。停服时中断退避并等待在途处理结束。
 
 #### 扩展点 3：SOP 与审批人策略解析（`TurnProfileResolver`）
@@ -212,7 +213,7 @@ sequenceDiagram
         Note over Ops,JMS_RO: 阶段 1 & 2：发起变更工单 -> JumpServer 只读巡检 -> 产出变更方案
         Ops->>GL_Hub: 创建环境变更 Issue #88 (如标签 delivery::env-change)
         GL_Hub->>Detent: Issue Hook (open) -> 匹配 env-change SOP
-        Detent->>JMS_RO: jms_list_assets & jms_readonly_inspect (只读巡检目标主机现状)
+        Detent->>JMS_RO: jms_list_assets & jms_shell (只读巡检目标主机现状)
         JMS_RO-->>Detent: 返回当前 Nginx/配置/服务状态
         Detent->>GL_Hub: 输出《环境变更实施方案审批卡》(现状 + 变更脚本计划 + 回滚方案)
     end
@@ -240,12 +241,14 @@ sequenceDiagram
 
     rect rgb(255, 235, 238)
         Note over Ops,JMS_Job: 阶段 6：第三道门禁(执行前硬校验 + 人工审批) -> JumpServer 任务中心执行 & 只读验收
-        Detent->>Detent: Claude 调用 jms_run_ansible_job -> Policy Guard 硬校验 MR !205 必须已 merged 且 SHA 一致
+        Detent->>Detent: Claude 调用 jms_job -> Policy Guard 硬校验 MR !205 必须已 merged 且 SHA 一致
         Detent->>GL_Hub: 弹出【生产变更执行审批卡片】(展示资产组 / 已合并 MR SHA / Playbook 路径)
         Ops->>GL_Hub: 运维负责人点 👍 或回复 /approve 放行执行
         Detent->>JMS_Job: 调用 JumpServer 任务中心 API 执行已合入的 Ansible Playbook
-        JMS_Job-->>Detent: 返回任务 ID、执行结果与审计录像链接
-        Detent->>JMS_RO: jms_readonly_inspect (执行变更后只读健康验收)
+        JMS_Job-->>Detent: 立即返回任务 ID 与审计链接，本轮结束
+        Detent->>JMS_Job: DeliveryJobPoller 查询终态并持久化待投递标记
+        Detent->>Detent: deliverSystemEvent 按 jms-job:任务ID 去重唤醒，再确认投递
+        Detent->>JMS_RO: jms_shell (执行变更后只读健康验收)
         Detent->>GL_Hub: 输出《变更交付完成报告》(MR + 审批人 + JumpServer 任务链接 + 验收结果)
     end
 ```
@@ -257,9 +260,11 @@ sequenceDiagram
 | 工具名 | 绑定凭证 | 治理级别 (`policy`) | 强制守卫 (`guard`) | 功能说明 |
 | :--- | :--- | :--- | :--- | :--- |
 | `jms_list_assets` | Hub AccessKey | `readonly` | 仅限查询已授权节点/主机组 | 按搜索词或节点查询已授权资产的 ID、名称与地址 |
-| `jms_readonly_inspect` | Hub AccessKey | `readonly` | 硬拒绝危险命令，校验允许前缀或通过 Jev 只读判定（禁止写/改/删命令） | 通过 JumpServer 授权账号在目标环境执行只读巡检（如查配置、端口、进程、磁盘、健康检查） |
-| `jms_run_ansible_job` | Hub AccessKey | **`always_approve`** | **1. 硬校验对应 Ansible MR 在 MySQL 中已 `merged` 且 `merge_commit_sha` 匹配**<br/>**2. 校验目标资产组不在黑名单**<br/>**3. 审批前与放行后双重校验** | 通过 JumpServer 任务中心（Ops Job Center）下发指定仓库、指定已合并 Commit 的 Ansible Playbook 任务，并通过注入的 tracker 记录实际执行 ID |
-| `jms_get_job_result` | Hub AccessKey | `readonly` | 必须由 tracker 确认本 Session 拥有任务 ID；未配置则拒绝 | 轮询并拉取 JumpServer 任务中心执行状态、标准输出摘要及 JumpServer Web 审计链接 |
+| `jms_shell` | Hub AccessKey | `readonly` | 硬拒绝危险命令，校验允许前缀或通过 Jev 只读判定（禁止写/改/删命令） | 通过 commands 数组按授权账号批量执行只读巡检（如查配置、端口、进程、磁盘、健康检查） |
+| `jms_job` | Hub AccessKey | **`always_approve`** | **1. 硬校验对应 Ansible MR 在 MySQL 中已 `merged` 且 `merge_commit_sha` 匹配**<br/>**2. 校验目标资产组不在黑名单**<br/>**3. 审批前与放行后双重校验** | 通过 JumpServer 任务中心（Ops Job Center）下发指定仓库、指定已合并 Commit 的 Ansible Playbook 任务，并通过注入的 tracker 记录实际执行 ID |
+| `jms_job_status` | Hub AccessKey | `readonly` | 必须由 tracker 确认本 Session 拥有任务 ID；未配置则拒绝 | 按需查询 JumpServer 任务中心执行状态、标准输出摘要及 JumpServer Web 审计链接 |
+
+通过 `npm run e2e:smoke` 验证异步提交、回调核验和关单。终态与 `callback_pending` 在同一次更新中提交。投递失败后重新扫描终态行并使用已保存的摘要，收件箱按会话和事件 ID 去重。
 
 Stage 3 通过 `createDeliveryApp(config, options)` 装配。Hub 配置服务地址和 `auth` 后启用四个工具。默认使用同一 AccessKey 做 HMAC-SHA256 签名。未配置 Hub 条目的旧部署仍可使用环境变量为两个角色分别指定凭证。巡检与 Playbook 均校验资产账号，并发送 `runas` 和 `runas_policy=skip`。
 
@@ -269,7 +274,7 @@ Stage 3 通过 `createDeliveryApp(config, options)` 装配。Hub 配置服务地
 > **四重防绕过安全机制（Defence in Depth）**：
 > 1. **父进程工具门禁**：JumpServer AccessKey 仅由服务端使用。只读流程隐藏执行工具，巡检命令通过硬拦截和只读判断后才能提交。生产执行须通过 prod 审批。
 > 2. **禁止裸连 SSH / 本地直跑 Ansible**：交付类 Agent（如 `env-change SOP`）默认禁用或严格限制 `Bash`（禁止 `ssh`、`scp`、`ansible`、`ansible-playbook` 直连命令），所有环境触达必须走 JumpServer 工具。
-> 3. **代码硬校验 MR 已合并**：即使 Prompt 提示词被绕过，只要目标 Ansible MR 还没在 GitLab 上真实 `merged`，`jms_run_ansible_job.guard()` 会直接以硬代码拒绝执行。
+> 3. **代码硬校验 MR 已合并**：即使 Prompt 提示词被绕过，只要目标 Ansible MR 还没在 GitLab 上真实 `merged`，`jms_job.guard()` 会直接以硬代码拒绝执行。
 > 4. **三方审计闭环**：每一次生产变更在 MySQL `delivery_executions` 表中将 **GitLab Issue（工单与审批人） + GitLab MR（已合并的 Ansible Commit SHA） + JumpServer Job ID（执行日志与堡垒机审计记录）** 强关联存证。
 
 ---
@@ -404,7 +409,7 @@ V4 通过 **3 层组合机制** 实现安全可控的 Issue 闭环：
 }
 ```
 
-Agent 通过 `requires: [harbor-sync]` 启用本包，工具以 `<包前缀>__<工具名>` 注册到 Detent SDK MCP。上例中 `harbor-sync__check_image_exists` 可在 Plan 调用，未指定策略的 `harbor-sync__sync_image` 默认 `always_approve`，在 Coding 阶段通过工具审批后才调用远端。`toolPolicies` 可覆盖 `defaultPolicy`，工具仍通过既有门禁。缺失凭证、初始化失败或工具名冲突会禁用对应能力包，经 `setupHint` 提供引导。
+Agent 通过 `requires: [harbor-sync]` 启用本包，工具以 `<包前缀>__<工具名>` 注册到 Detent 回环 HTTP MCP。上例中 `harbor-sync__check_image_exists` 可在 Plan 调用，未指定策略的 `harbor-sync__sync_image` 默认 `always_approve`，在 Coding 阶段通过工具审批后才调用远端。`toolPolicies` 可覆盖 `defaultPolicy`，工具仍通过既有门禁。缺失凭证、初始化失败或工具名冲突会禁用对应能力包，经 `setupHint` 提供引导。
 
 请求头在服务端展开。代理在工具元数据、审批卡片、工具结果和错误返回前脱敏，外部凭证不传给 Claude Code。Delivery 重读当前 Agent 验证工具仍启用，并对 `approverTier: prod` 包的工具执行生产审批权限校验，即使 SOP 指定 `approver_tier: standard`。Plan 保持普通项目审批权限。示例 `image-sync` 默认 `requires: []`，可通过 GitOps 清单 MR 与 CI 完成同步，也可配置此能力包。[镜像同步 Agent](../examples/hub-workspace/agents/image-sync/AGENT.md)
 
@@ -495,7 +500,7 @@ Hub Issue 的 `/help` 在成员检查后从默认分支加载 Agent，按当前�
 `agents/onboarding/AGENT.md` 请求 `gitlab-onboarding`。只读工具按项目或群组查询 Bot 有效权限，在有管理权限时核验目标事件。写工具先验证全部目标均达到 Maintainer，再由生产审批人审核范围、回调地址及事件。执行时重读目标和权限，以同一 URL 更新或创建 Webhook。服务端从 `DETENT_PUBLIC_URL` 生成回调地址，只在 GitLab API 请求中使用 Webhook 密钥。Claude 通过单轮回环连接调用 Messages API，由父进程添加上游认证头。
 
 
-Issue 的 `/help` 按当前 Hub 定义列出场景、标签和就绪状态。Issue 与 MR 的 `/status` 显示中文状态和下一步操作。`WAITING_TOOL` 下的普通回复绑定当前 `ASK_USER` 审批记录，校验身份后按原热等待或冷恢复路径继续。其他工具仍需审批卡决定。审批解析器接收待审类型与工具名；已移出流程的操作无法通过更高权限放行。生产审批拒绝提示先核验普通成员权限，进程内按审批单和用户去重，最多保留 1024 条记录。
+Issue 的 `/help` 按当前 Hub 定义列出场景、标签和就绪状态。Issue 与 MR 的 `/status` 显示中文状态和下一步操作。`WAITING_TOOL` 下的普通回复绑定当前 `ASK_USER` 审批记录，校验身份后在新进程中恢复。其他工具仍需审批卡决定。审批解析器接收待审类型与工具名；已移出流程的操作无法通过更高权限放行。生产审批拒绝提示先核验普通成员权限，进程内按审批单和用户去重，最多保留 1024 条记录。
 
 ### Stage 15 · Hub 配置与认证边界
 

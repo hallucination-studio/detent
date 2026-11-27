@@ -11,6 +11,7 @@ import type {
   ParsedUserIntent,
   PermissionMode,
   SessionStatus,
+  SessionInboxRow,
 } from '../types.js';
 import { redactGitUrl, type GitLabClient } from '../gitlab/client.js';
 import type { WebhookEvent } from '../gitlab/webhook.js';
@@ -32,6 +33,10 @@ import { notifyHook } from './lifecycle.js';
 export { SessionBusy } from './turn-runtime.js';
 const helpHint = '> 💡 发送 `/help` 可随时查看当前工作区的能力与指令。';
 type TurnTrigger = 'request' | 'continuation' | 'plan';
+function inboxTrigger(items: SessionInboxRow[]): TurnTrigger {
+  return items.every(item => item.sourceKind === 'system') ? 'continuation' : 'request';
+}
+
 type Client = WorkspaceGitLab &
   Pick<
     GitLabClient,
@@ -91,6 +96,21 @@ export class SessionOrchestrator extends TurnRuntime {
       await this.run(s, active, prompt, undefined, options?.permissionMode ? 'continuation' : 'request');
     });
   }
+  async deliverSystemEvent(sessionId: string, eventId: string, content: string, options?: { sender?: string }): Promise<boolean> {
+    const session = await this.repo.getSession(sessionId);
+    if (!session || session.sessionKind !== 'issue' || session.status === 'DONE') return false;
+    const queued = await this.repo.enqueueSessionInbox({
+      sessionId, eventId, sourceKind: 'system', senderUsername: options?.sender ?? 'detent',
+      content: redactGitUrl(content, this.secrets),
+    });
+    if (!queued) return false;
+    try {
+      await this.wakeSession(session, 'inbox');
+    } catch (error) {
+      if (!(error instanceof SessionBusy)) throw error;
+    }
+    return true;
+  }
   async wakeSession(candidate: IssueSessionRow, reason: 'expired' | 'inbox') {
     // The Issue runner publishes Issue approvals and may close the Issue.
     if (candidate.sessionKind !== 'issue') return;
@@ -100,7 +120,7 @@ export class SessionOrchestrator extends TurnRuntime {
       const items = await this.drainInbox(s.id, active);
       if (!items.length && reason === 'inbox') return;
       await this.run(s, active, formatInboxMessages(items, this.secrets) || '上轮执行中断，请检查已保存的进度并继续。',
-        undefined, reason === 'expired' && !items.length ? 'continuation' : 'request');
+        undefined, inboxTrigger(items));
     }, undefined, reason === 'expired' ? candidate.lockExpiresAt! : undefined);
   }
   async handleIssueOpened(event: Extract<WebhookEvent, { object_kind: 'issue' }>) {
@@ -137,8 +157,9 @@ export class SessionOrchestrator extends TurnRuntime {
   ) {
     let next: string | undefined = prompt;
     while (next !== undefined) {
-      next = await this.runTurn(s, active, next, previousDecision, trigger);
-      trigger = 'request';
+      const pending = await this.runTurn(s, active, next, previousDecision, trigger);
+      next = pending && formatInboxMessages(pending, this.secrets);
+      if (pending) trigger = inboxTrigger(pending);
       previousDecision = undefined;
       if (next === undefined && !active.controller.signal.aborted && ['IDLE', 'WAITING_PLAN'].includes(s.status)) {
         // A comment can arrive during the final GitLab write or sandbox cleanup.
@@ -146,15 +167,18 @@ export class SessionOrchestrator extends TurnRuntime {
           active.ownsLease = false;
           return;
         }
-        const late = await this.drainInbox(s.id, active);
+        // Only human feedback supersedes a published plan. System callbacks stay
+        // in the inbox until the approval resumes the session.
+        const late = await this.drainInbox(s.id, active, s.status === 'WAITING_PLAN' ? 'note' : undefined);
         if (late.length) {
           if (s.status === 'WAITING_PLAN') await this.expire(s);
           next = formatInboxMessages(late, this.secrets);
+          trigger = inboxTrigger(late);
         }
       }
     }
   }
-  private async runTurn(s: IssueSessionRow, active: Active, prompt: string, previousDecision?: ApprovalRequestRow, trigger: TurnTrigger = 'request'): Promise<string | undefined> {
+  private async runTurn(s: IssueSessionRow, active: Active, prompt: string, previousDecision?: ApprovalRequestRow, trigger: TurnTrigger = 'request'): Promise<SessionInboxRow[] | undefined> {
     const channel = this.channel(s);
     const drainInbox = () => this.drainInbox(s.id, active);
     const host = new EphemeralSandbox(this.config, this.repo, this.gitlab);
@@ -223,7 +247,6 @@ export class SessionOrchestrator extends TurnRuntime {
         checkpoint,
         previousDecision,
       });
-      active.gate = gate;
       streamer = new NoteStreamer(
         this.config.noteStreamThrottleMs,
         (body) => channel.updateNote(note.id, body),
@@ -292,7 +315,7 @@ export class SessionOrchestrator extends TurnRuntime {
       }
       const completed = this.extensions.hooks?.onTurnCompleted;
       if (completed) await notifyHook(async () => completed((await this.repo.getSession(s.id))!, result), this.secrets);
-      if (pending.length) return formatInboxMessages(pending, this.secrets);
+      if (pending.length) return pending;
     } catch (error) {
       const cause = controller.signal.reason ?? error;
       // A status-sync failure after GitLab accepted the close cannot undo it.

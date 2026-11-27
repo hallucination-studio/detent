@@ -49,9 +49,12 @@ export async function runIssueScenarios(h: Issues) {
   await pendingCard(clarify, 'Plan', ['Confirm the deployment port']);
   await post(clarify, '/approve');
   const ask = await pendingCard(clarify, 'AskUserQuestion', ['### 💬 需要你的确认', '1. Which service port?', '直接回复你的确认内容即可继续']);
+  const suspended = await state(clarify, 'WAITING_TOOL');
+  assert.equal(suspended.locked_by_pod, null);
   assert.equal(ask.approval_type, 'ASK_USER');
   await post(clarify, 'Use port 6380');
   const clarified = await state(clarify, 'IDLE');
+  assert.equal(clarified.claude_session_id, suspended.claude_session_id);
   await report(clarify, 'Confirmed port 6380');
   assert.equal((await approval(ask.id)).decision_comment, 'Use port 6380');
   await checkSession(h, clarified);

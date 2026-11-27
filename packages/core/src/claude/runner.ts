@@ -1,16 +1,17 @@
-import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-code';
+import { query } from '@anthropic-ai/claude-code';
 import { z } from 'zod';
 import type { ToolStep } from '../gitlab/note-streamer.js';
 import { ToolTrace } from './tool-trace.js';
 import buffer from 'node:buffer';
 import { configuredSecrets, redactGitUrl, scrubJson } from '../gitlab/redact.js';
+import { openMcpTransport, type McpCallContext, type McpTool } from './mcp-transport.js';
 import { openModelTransport } from './model-transport.js';
 import type { AppConfig } from '../config.js';
 import { formatInboxMessages } from '../orchestrator/turn-runtime.js';
 import type { IssueSessionRow, SessionInboxRow } from '../types.js';
 import type { TurnSandbox } from '../workspace/ephemeral-sandbox.js';
 import { schemas, type ToolName, type WorkspaceTools } from '../workspace/mcp-tools.js';
-import { ToolDenied, type PermissionGate } from './permission-gate.js';
+import { ColdHold, ToolDenied, type PermissionGate } from './permission-gate.js';
 
 const textDelta = z.object({
   type: z.literal('content_block_delta'),
@@ -33,11 +34,6 @@ export interface TurnInput {
 export interface ClaudeRunner {
   run(turn: TurnInput): Promise<string>;
 }
-const mcpMetadata = z.object({ _meta: z.object({ 'claudecode/toolUseId': z.string() }) });
-function mcpToolId(extra: unknown) {
-  return mcpMetadata.safeParse(extra).data?._meta['claudecode/toolUseId'];
-}
-
 export class SdkClaudeRunner implements ClaudeRunner {
   constructor(private config: AppConfig) {}
   async run(t: TurnInput) {
@@ -58,9 +54,9 @@ export class SdkClaudeRunner implements ClaudeRunner {
       }
       return decision;
     };
-    const invoke = async (name: string, input: Record<string, unknown>, extra: unknown,
-      operation: (step: ToolStep) => Promise<unknown>) => {
-      const step = trace.handler('mcp__detent__' + name, input, mcpToolId(extra));
+    const invoke = async (name: string, extra: McpCallContext, operation: (step: ToolStep) => Promise<unknown>) => {
+      const id = extra._meta?.['claudecode/toolUseId'];
+      const step = trace.handler('mcp__detent__' + name, extra.rawInput, typeof id === 'string' ? id : undefined);
       trace.pending(step);
       try {
         const output = await operation(step);
@@ -69,39 +65,40 @@ export class SdkClaudeRunner implements ClaudeRunner {
         return { content: [{ type: 'text' as const, text: redact(text ?? '') }] };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (!failed.has(step.id)) trace.update(step, message, error instanceof ToolDenied ? '⛔ 已拦截：' : '❌ ');
+        if (!failed.has(step.id)) {
+          const prefix = error instanceof ColdHold ? '' : error instanceof ToolDenied ? '⛔ 已拦截：' : '❌ ';
+          trace.update(step, message, prefix);
+        }
         failed.add(step.id);
-        throw Error(redact(message));
+        if (error instanceof ColdHold || error instanceof ToolDenied)
+          return { isError: true, content: [{ type: 'text' as const, text: redact(message) }] };
+        throw error;
       }
     };
-    const server = createSdkMcpServer({
-      name: 'detent',
-      tools: [
-        ...(t.allowedWorkspaceTools ?? Object.keys(schemas) as ToolName[]).map(name =>
-          tool(name, 'GitLab workspace: ' + name, schemas[name], (input, extra) =>
-            invoke(name, input, extra, async step => {
-              const decision = await canUseTool(name, input, step);
-              if (decision.behavior === 'deny') throw Error(decision.message);
-              t.controller.signal.throwIfAborted();
-              return t.tools.invoke(name, decision.updatedInput);
-            })),
-        ),
-        ...Array.from(gate.extensionTools, ([id, extension]) =>
-          tool(extension.name, redact(extension.description), extension.schema, (input, extra) =>
-            invoke(extension.name, input, extra, () => gate.invokeExtension(id, input))),
-        ),
-        tool(
-          'AskUserQuestion',
-          'Ask a question on GitLab',
-          { questions: z.array(z.object({ question: z.string() })).min(1) },
-          (input, extra) => invoke('AskUserQuestion', input, extra, async step => {
-            const decision = await canUseTool('AskUserQuestion', input, step);
-            if (decision.behavior === 'deny') throw Error(decision.message);
-            return decision.updatedInput.answers;
-          }),
-        ),
-      ],
-    });
+    const tools: McpTool[] = [
+      ...(t.allowedWorkspaceTools ?? Object.keys(schemas) as ToolName[]).map((name): McpTool => ({
+        name, description: 'GitLab workspace: ' + name, inputSchema: schemas[name],
+        handler: (input, extra) => invoke(name, extra, async step => {
+          const decision = await canUseTool(name, input, step);
+          if (decision.behavior === 'deny') throw new ToolDenied(decision.message);
+          t.controller.signal.throwIfAborted();
+          return t.tools.invoke(name, decision.updatedInput);
+        }),
+      })),
+      ...Array.from(gate.extensionTools, ([id, extension]): McpTool => ({
+        name: extension.name, description: extension.description, inputSchema: extension.schema,
+        handler: (input, extra) => invoke(extension.name, extra, () => gate.invokeExtension(id, input)),
+      })),
+      {
+        name: 'AskUserQuestion', description: 'Ask a question on GitLab',
+        inputSchema: { questions: z.array(z.object({ question: z.string() })).min(1) },
+        handler: (input, extra) => invoke('AskUserQuestion', extra, async step => {
+          const decision = await canUseTool('AskUserQuestion', input, step);
+          if (decision.behavior === 'deny') throw new ToolDenied(decision.message);
+          return decision.updatedInput.answers;
+        }),
+      },
+    ];
     const env: Record<string, string> = {
       PATH: process.env.PATH ?? '/usr/bin:/bin',
       HOME: sandbox.claudeHome,
@@ -109,6 +106,8 @@ export class SdkClaudeRunner implements ClaudeRunner {
       TMPDIR: sandbox.rootDir,
       ...(this.config.claudeModel && { ANTHROPIC_SMALL_FAST_MODEL: this.config.claudeModel, CLAUDE_CODE_SUBAGENT_MODEL: this.config.claudeModel }),
       LANG: 'en_US.UTF-8',
+      MCP_TOOL_TIMEOUT: '300000',
+      MCP_TIMEOUT: '30000',
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
       GIT_CONFIG_NOSYSTEM: '1',
       GIT_CONFIG_GLOBAL: '/dev/null',
@@ -119,6 +118,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
       GIT_CONFIG_VALUE_1: 'false',
     };
     let model: Awaited<ReturnType<typeof openModelTransport>> | undefined;
+    let mcp: Awaited<ReturnType<typeof openMcpTransport>> | undefined;
     let diagnostic = '';
     const transport = new AbortController();
     let interrupt: (() => void) | undefined;
@@ -126,11 +126,11 @@ export class SdkClaudeRunner implements ClaudeRunner {
     try {
       let resultText: string | undefined;
       t.controller.signal.throwIfAborted();
-      if (this.config.anthropicApiKey || this.config.anthropicBaseUrl || this.config.claudeModel || secrets.length) {
-        model = await openModelTransport(this.config.anthropicBaseUrl ?? 'https://api.anthropic.com', this.config.anthropicApiKey, secrets, this.config.claudeModel);
-        env.ANTHROPIC_BASE_URL = model.url;
-        env.ANTHROPIC_AUTH_TOKEN = 'detent-local';
-      }
+      mcp = await openMcpTransport(tools, secrets);
+      secrets.push(mcp.token);
+      model = await openModelTransport(this.config.anthropicBaseUrl ?? 'https://api.anthropic.com', this.config.anthropicApiKey, secrets, this.config.claudeModel);
+      env.ANTHROPIC_BASE_URL = model.url;
+      env.ANTHROPIC_AUTH_TOKEN = 'detent-local';
       const messages = query({
         prompt: redact(t.prompt),
         options: {
@@ -186,7 +186,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
           model: this.config.claudeModel,
           maxTurns: this.config.claudeMaxTurns,
           appendSystemPrompt: redact(t.systemPrompt),
-          mcpServers: { detent: server },
+          mcpServers: { detent: { type: 'http', url: mcp.url, headers: { Authorization: 'Bearer ' + mcp.token } } },
           strictMcpConfig: true,
           includePartialMessages: true,
           // Extension authorization runs with parsed inputs in the MCP handler, once per invocation.
@@ -195,15 +195,17 @@ export class SdkClaudeRunner implements ClaudeRunner {
             : canUseTool(name, input),
         },
       });
-      // Stop the turn through the CLI control channel. Killing its transport while
-      // an MCP handler is replying makes SDK 1.x reject outside the message iterator.
+      // Give the CLI an opportunity to persist the transcript before closing its transport.
       interrupt = () => {
-        shutdown = setTimeout(() => transport.abort(), 10000);
+        shutdown = setTimeout(() => transport.abort(), t.controller.signal.reason instanceof ColdHold ? 500 : 10000);
         void messages.interrupt().catch(() => transport.abort());
       };
       t.controller.signal.addEventListener('abort', interrupt, { once: true });
       if (t.controller.signal.aborted) interrupt();
       for await (const message of messages) {
+        // An interrupted result can precede process exit. Keep the abort fallback
+        // armed and drain stdout before the orchestrator removes the sandbox.
+        if (t.controller.signal.aborted) continue;
         if (message.session_id !== id) throw Error('Claude session identity changed');
         if (message.type === 'assistant') {
           for (const block of message.message.content)
@@ -233,6 +235,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
       if (resultText === undefined) throw Error('Claude ended without a result');
       return redact(resultText);
     } catch (error) {
+      if (t.controller.signal.reason instanceof ColdHold) throw t.controller.signal.reason;
       const original = error instanceof Error ? error.message : String(error);
       const detail = t.controller.signal.aborted ? original : diagnostic.trim() || original;
       throw Error(redact(detail));
@@ -240,6 +243,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
       model?.close();
       clearTimeout(shutdown);
       if (interrupt) t.controller.signal.removeEventListener('abort', interrupt);
+      await mcp?.close();
     }
   }
 }

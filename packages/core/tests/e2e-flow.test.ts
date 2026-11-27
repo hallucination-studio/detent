@@ -64,7 +64,7 @@ async function mockGitLab(root: string) {
   };
 }
 
-it('resumes a cold Bash approval, answers a hot question and reports two MRs and a pipeline', async () => {
+it('resumes both a Bash approval and a user question and reports two MRs and a pipeline', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'detent-flow-'));
   try {
     const gitlab = await mockGitLab(root);
@@ -110,8 +110,11 @@ it('resumes a cold Bash approval, answers a hot question and reports two MRs and
           await writeFile(edited, 'in progress');
           await log('coding');
         } else expect(await readFile(edited, 'utf8')).toBe('in progress');
-        const permission = await t.gate.canUseTool('Bash', { command: 'npm install ioredis' });
-        expect(permission.behavior).toBe('allow');
+        if (dirs.length < 4) {
+          const permission = await t.gate.canUseTool('Bash', { command: 'npm install ioredis' });
+          expect(permission.behavior).toBe('allow');
+          await log('question');
+        }
         const question = await t.gate.canUseTool('AskUserQuestion', { questions: [{ question: '目标分支？' }] });
         expect(question).toMatchObject({ behavior: 'allow', updatedInput: { answers: { '目标分支？': 'main' } } });
         for (const [i, dir] of paths.entries()) {
@@ -134,8 +137,8 @@ it('resumes a cold Bash approval, answers a hot question and reports two MRs and
       }),
     };
     const errors: unknown[] = [];
-    function pod(podId: string, hotHoldTimeoutMs: number) {
-      const orch = new SessionOrchestrator({ ...config, podId, hotHoldTimeoutMs }, repo, gitlab, runner);
+    function pod(podId: string) {
+      const orch = new SessionOrchestrator({ ...config, podId }, repo, gitlab, runner);
       const client = Object.assign(new GitLabClient(config, async () => { throw Error('Unexpected GitLab API call'); }), gitlab, {
         listOpenMergeRequestsByBranch: vi.fn().mockResolvedValue([{ iid: 1 }]),
         getMergeRequest: vi.fn().mockResolvedValue({ iid: 1, state: 'opened', assignees: [] }),
@@ -144,7 +147,7 @@ it('resumes a cold Bash approval, answers a hot question and reports two MRs and
       const mrs = new MergeRequestOrchestrator(config, repo, client, runner, { runHubEvent: vi.fn() });
       return new WebhookQueue((event, id) => dispatchWebhook(orch, event, id, mrs), error => errors.push(error));
     }
-    let route = pod('A', 0);
+    let route = pod('A');
     const app = createWebhookApp(config, gitlab, (id, event) => route.submit(id, event));
     const send = async (e: GitLabWebhookPayload) =>
       app.inject({
@@ -186,22 +189,24 @@ it('resumes a cold Bash approval, answers a hot question and reports two MRs and
     await route.drain();
     expect(gitlab.notes.at(-1)).toContain('当前正在等待上方审批卡确认');
     expect(await repo.getLatestPendingApproval(s.id)).toMatchObject({ approvalType: 'TOOL_USE', status: 'PENDING' });
-    route = pod('B', 15000);
+    route = pod('B');
     await send(note('/approve'));
-    await vi.waitFor(async () => {
-      expect(await repo.getLatestPendingApproval(s.id)).toMatchObject({ approvalType: 'ASK_USER' });
-    }, { timeout: 10000 });
+    await route.drain();
+    expect(await repo.getLatestPendingApproval(s.id)).toMatchObject({ approvalType: 'ASK_USER' });
+    expect(await readdir(config.ephemeralRoot)).toEqual([]);
+    route = pod('C');
     await send(note('main'));
     await route.drain();
     expect(await repo.getSession(s.id)).toMatchObject({
       status: 'IDLE',
       lockedByPod: null,
-      lastMessageSeq: 3,
+      lastMessageSeq: 4,
     });
     expect(gitlab.notes.some(body => body.includes('🔍 工具调用轨迹（2 步）') && body.includes('2. **`detent_create_mr`**'))).toBe(true);
     expect(ids.size).toBe(1);
     expect(runner.run.mock.calls[2][0].prompt).toContain('工具 Bash，参数 {"command":"npm install ioredis"}');
-    expect(new Set(dirs).size).toBe(3);
+    expect(runner.run.mock.calls[3][0].prompt).toContain('AskUserQuestion');
+    expect(new Set(dirs).size).toBe(4);
     expect(await repo.listSessionMergeRequests(s.id)).toHaveLength(2);
     for (const [, input] of gitlab.createMergeRequest.mock.calls) expect(input.assignee_ids).toEqual([99]);
     await send({
@@ -476,10 +481,10 @@ it('applies turn profiles and approval hooks across pods and resumes under the e
     await repo.acquireSessionLease(session.id, 'busy', 30);
     await expect(podA.resumeSession(session.id, 'external', { beforeRun: skip })).rejects.toBeInstanceOf(SessionBusy);
     expect(skip).toHaveBeenCalledOnce();
-    expect(runner.run).toHaveBeenCalledTimes(2);
+    expect(runner.run).toHaveBeenCalledTimes(3);
     await repo.releaseSessionLease(session.id, 'busy');
     await podA.resumeSession(session.id, 'external', { permissionMode: 'plan', beforeRun: async () => true });
-    const turn = runner.run.mock.calls[2][0];
+    const turn = runner.run.mock.calls[3][0];
     expect(turn).toMatchObject({
       prompt: 'external', resume: true, systemPrompt: expect.stringContaining('Follow the issue checklist.'),
       session: { claudeSessionId: session.claudeSessionId, permissionMode: 'plan' },
@@ -487,7 +492,7 @@ it('applies turn profiles and approval hooks across pods and resumes under the e
     expect(history[1]).toContain('实施方案已获批准');
     expect(hooks.onTurnCompleted).toHaveBeenCalledTimes(3);
     expect(hooks.onTurnCompleted).toHaveBeenLastCalledWith(
-      expect.objectContaining({ id: session.id, lastMessageSeq: 3, status: 'WAITING_PLAN' }), 'external',
+      expect.objectContaining({ id: session.id, lastMessageSeq: 4, status: 'WAITING_PLAN' }), 'external',
     );
     expect((await repo.getSession(session.id))?.lockedByPod).toBeNull();
     expect(await readdir(config.ephemeralRoot)).toEqual([]);
@@ -546,4 +551,33 @@ it('renders live Hub help before session creation and preserves pending approval
   expect(await repo.getSession(s.id)).toEqual(s);
   expect(await repo.getLatestPendingApproval(s.id)).toEqual(pending);
   expect(run).not.toHaveBeenCalled();
+});
+
+it('resumes a vote received while the publishing worker still holds a coding lease', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'detent-early-vote-'));
+  try {
+    const repo = new InMemoryDetentRepository();
+    const s = await repo.getOrCreateSession(1, 42, 'test');
+    await repo.acquireSessionLease(s.id, 'publisher', 30);
+    await repo.updateSessionState(s.id, { status: 'CODING', permissionMode: 'default' });
+    const input = { command: 'npm install' };
+    const card = await repo.createApprovalRequest(s.id, 'TOOL_USE', 'Bash', input);
+    await repo.updateApprovalNoteId(card.id, 7);
+    const run = vi.fn(async (turn: TurnInput) => {
+      expect(await turn.gate.canUseTool('Bash', input)).toMatchObject({ behavior: 'allow' });
+      return 'done';
+    });
+    const pod = new SessionOrchestrator(loadConfig({ EPHEMERAL_ROOT: path.join(root, 'turns') }), repo, await mockGitLab(root), { run });
+    const acquire = vi.spyOn(repo, 'acquireSessionLease');
+    const vote = dispatchWebhook(pod, emoji(7));
+    await vi.waitFor(() => expect(acquire).toHaveBeenCalledTimes(2), { timeout: 2000 });
+    await repo.updateSessionState(s.id, { status: 'WAITING_TOOL' });
+    await repo.releaseSessionLease(s.id, 'publisher');
+    await vote;
+    expect(run).toHaveBeenCalledOnce();
+    expect(await repo.getLatestApproval(s.id)).toMatchObject({ id: card.id, status: 'APPROVED' });
+    expect(await repo.getSession(s.id)).toMatchObject({ status: 'IDLE', lockedByPod: null });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

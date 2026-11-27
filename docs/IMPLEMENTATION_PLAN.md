@@ -257,3 +257,16 @@ Stage 6 已实现。使用 `loadHubWorkflows` 和 `matchHubWorkflow` 解析当�
 - 验收通用环境密钥、完整引用与请求头模板、默认分支能力热更新、外部 MCP 生产审批，以及 Agent 级账号与巡检前缀。
 - 离线驱动通过真实子进程启动边界、模型请求、GitLab 评论与工具轨迹、MySQL transcript 检查凭证隔离。在编码轮次验证 Hub 能力文件的写保护。
 - Branch 4 使用单把 AccessKey 验证巡检和生产执行签名。先使用流程 `account`，其次使用 Hub `default_account`。两者均未设置时，逐资产按 JumpServer 返回顺序选择首个有效授权账号，跳过停用账号和以 `@` 开头的虚拟账号。巡检按账号分组并汇总结果。单个 Ansible 任务要求所有目标使用同一账号，否则须指定共同的 `account` 或分组执行。缺少有效账号时，错误指出对应资产。 离线场景验证两组巡检，且合并 SHA 与生产审批通过后，Ansible 以首账号和 `runas_policy=skip` 执行。
+
+### JumpServer 契约与单工单交接验收
+
+| 场景 | 观测点 |
+| --- | --- |
+| J-1 | 直接向回环 API 提交缺失或错误的 `is_periodic` 得到 400。Delivery Pod 提交巡检、Playbook 时须显式为 false。 |
+| J-2、J-5 | 过滤虚拟与停用账号，HTML 404 回退至资产详情。按 Agent、Hub、资产首账号选择，空授权或未授权账号在提交前拒绝。 |
+| J-3、J-4 | 检查结构化结果及去除 NUL 的日志回退。同账号批量提交一次，不同账号的巡检分组汇总。混合账号的 Playbook 在上传前拒绝，失败执行写审计并阻止关单。 |
+| J-6、J-7 | 验证 Kafka 进程、监听端口、Topic 列表、日期和主机名。硬拒绝不访问 Jev 或 JumpServer。语义放行要求 pure_readonly、noul ≥ 0.75、impact ≤ 1.35，拒绝展示评分。资产黑名单覆盖巡检及 Playbook。 |
+| J-8 | 校验合并状态、SHA、流水线和生产审批人，对照 ZIP 的 main.yml、runas 与 jms_ 参数，检查 SUCCESS 审计、/status 与自动关单。 |
+| J-9、J-10 | 含密钥的 400/403/500 在 Pod stderr 与工具轨迹中保留脱敏原文，MySQL transcript 无密钥。下一条评论加载 Hub 的前缀、账号、黑名单与启停配置。 |
+
+单工单场景使用真实 Claude Code 和原生 `--agents`。协调者通过 `Task` 委派 audit，从子工具结果汇报 Kafka 状态并回到 IDLE。在同一 Issue 内，code-delivery 收到配置修改请求后提交 Plan，用户 👍 批准后修改目标仓库并开 MR。验收从 GitLab 与 MySQL 校验过程中的工具轨迹、审批、Session 标识和 MR 文件内容。

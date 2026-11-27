@@ -1,4 +1,8 @@
-import { mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { openModelTransport } from '../src/claude/model-transport.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { query } from '@anthropic-ai/claude-code';
@@ -40,7 +44,7 @@ it('normalizes provider-specific endpoints and defaults', () => {
   expect(loadConfig(typesafe)).toMatchObject({ jevBaseUrl: 'https://api.typesafe.ai/v1/systemone', jevModel: 'jev-latest' });
   expect(loadConfig({ ...typesafe, JEV_BASE_URL: base }).jevBaseUrl).toBe(base);
   expect(loadConfig({ JEV_PROVIDER: 'custom', JEV_BASE_URL: base, JEV_API_KEY: ' ' })).toMatchObject({
-    jevApiKey: undefined, jevModel: 'jev-latest', jevTimeoutMs: 2500, jevThreshold: 0.9,
+    jevApiKey: undefined, jevModel: 'jev-latest', jevTimeoutMs: 6000, jevThreshold: 0.9,
   });
   expect(loadConfig({ ...bailian, JEV_PROVIDER: 'custom', JEV_MODEL: ' override ' }).jevModel).toBe('override');
 });
@@ -70,7 +74,7 @@ it.each([true, false])('posts one typed batch with optional authentication (%s)'
   expect(JSON.parse(String(init?.body))).toEqual({ model: 'jev-latest', state, questions });
 });
 
-it('discards transport errors, HTTP bodies and invalid or incomplete answers', async () => {
+it('reports redacted transport, parsing and validation failures', async () => {
   const config = loadConfig({ ...bailian, JEV_TIMEOUT_MS: '5' });
   const bad = [
     new Response(secret, { status: 401 }), new Response(secret), Response.json({}),
@@ -83,8 +87,69 @@ it('discards transport errors, HTTP bodies and invalid or incomplete answers', a
     async (_url, init) => new Promise((_resolve, reject) => init!.signal!.addEventListener('abort', () => reject(Error(secret)))),
     ...bad.map(r => async () => r),
   ];
-  for (const http of failures)
-    await expect(createDecisionClient(config, http)!.decide('state', questions)).rejects.toThrow(/^System One decision unavailable or invalid$/);
+  const logs = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    for (const http of failures) {
+      const failure = createDecisionClient(config, http)!.decide('state', questions);
+      await expect(failure).rejects.toThrow(/^System One decision unavailable or invalid: ./);
+      await expect(failure).rejects.not.toThrow(secret);
+    }
+    expect(logs.mock.calls.flat().join(' ')).not.toContain(secret);
+  } finally { logs.mockRestore(); }
+});
+
+it('keeps upstream HTTP details in logs and exceptions while redacting credentials before truncation', async () => {
+  const config = loadConfig({ ...bailian, GITLAB_TOKEN: 'pat/credential', DETENT_SECRET_EXTRA: 'private-value' });
+  const raw = 'validation failed\n' + secret + ' pat%2Fcredential private-value ' + 'x'.repeat(350) + ' diagnostic-id ' + 'y'.repeat(1200);
+  const http = async () => new Response(raw, { status: 403 });
+  const logs = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const gitlab = new GitLabClient(config, http);
+    const jev = createDecisionClient(config, http)!;
+    for (const [scope, request] of [
+      ['gitlab', () => gitlab.getBotUser()], ['jev', () => jev.decide('state', questions)],
+    ] as const) {
+      const failure = request();
+      await expect(failure).rejects.toThrow(/HTTP 403: validation failed \*\*\* \*\*\* \*\*\*/);
+      await expect(failure).rejects.not.toThrow('diagnostic-id');
+      if (scope === 'gitlab') await expect(failure).rejects.toMatchObject({ status: 403 });
+      const lines = logs.mock.calls.flat().filter(line => line.startsWith('[detent:' + scope + ']'));
+      expect(lines.some(line => line.includes('diagnostic-id'))).toBe(true);
+      for (const line of lines) {
+        expect(line.length).toBeLessThan(1030);
+        expect(line).not.toMatch(/decision-secret|pat%2Fcredential|private-value|[\r\n]/);
+      }
+    }
+    expect(logs.mock.calls.flat()).toContainEqual(expect.stringContaining('GET /user HTTP 403'));
+    expect(await gitlab.hasApprovalPermission(1, 2)).toBe(false);
+  } finally { logs.mockRestore(); }
+});
+
+it('returns bounded redacted model errors even if the upstream keeps the error stream open', async () => {
+  const upstream = createServer((_req, res) => {
+    res.writeHead(429).write('quota exceeded: ' + secret + '\n' + 'x'.repeat(4096));
+  });
+  upstream.listen(0, '127.0.0.1');
+  await once(upstream, 'listening');
+  const proxy = await openModelTransport('http://127.0.0.1:' + (upstream.address() as AddressInfo).port, secret, []);
+  const logs = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const res = await fetch(proxy.url + '/v1/messages', {
+      method: 'POST', headers: { Authorization: 'Bearer detent-local' }, body: '{}', signal: AbortSignal.timeout(3000),
+    });
+    expect(res.status).toBe(429);
+    const body = await res.text();
+    expect(body).toContain('Model HTTP 429: quota exceeded: ***');
+    expect(body.length).toBeLessThan(330);
+    expect(body).not.toContain(secret);
+    expect(logs).toHaveBeenCalledWith(expect.stringContaining('[detent:model-transport] Model HTTP 429 quota exceeded: ***'));
+    expect(logs.mock.calls.flat().join(' ')).not.toContain(secret);
+  } finally {
+    logs.mockRestore();
+    proxy.close();
+    upstream.closeAllConnections();
+    await new Promise<void>(resolve => upstream.close(() => resolve()));
+  }
 });
 
 async function setup(mode: 'plan' | 'default' = 'default', readonly = false, workspaceRoot = process.cwd()) {
@@ -101,9 +166,12 @@ async function setup(mode: 'plan' | 'default' = 'default', readonly = false, wor
   return { gate, decide, createIssueNote };
 }
 
-it('routes static queries and hard-gated commands without a model call', async () => {
-  const coding = await setup();
-  const plan = await setup('plan');
+it('routes static queries and hard-gated commands without a model call', async ({ onTestFinished }) => {
+  const workspace = await realpath(await mkdtemp(join(tmpdir(), 'detent-guard-')));
+  onTestFinished(() => rm(workspace, { recursive: true, force: true }));
+  await mkdir(join(workspace, '.git'));
+  const coding = await setup('default', false, workspace);
+  const plan = await setup('plan', false, workspace);
   expect(await plan.gate.preflight('Bash', { command: 'git status' })).toMatchObject({ behavior: 'allow' });
   for (const command of [null, ' ', 'x'.repeat(2001), 'ls\0', 'ls; curl host', 'git push', 'ssh host', 'sudo id',
     'cd ../other', 'cat /etc/passwd', 'cat /work2/x', 'echo hi > CLAUDE.md', 'rm workflows/a', 'cp f .git/config',
@@ -129,7 +197,7 @@ it('allows zero-external-impact development commands and evaluates each once', a
 it('requires a readonly classification and low impact in both readonly modes', async () => {
   for (const { gate, decide } of [await setup('plan'), await setup('default', true)]) {
     for (const [choice, score, behavior] of [
-      ['readonly_inspect', 0.6, 'allow'], ['workspace_dev', 0, 'deny'], ['readonly_inspect', 0.61, 'deny'],
+      ['readonly_inspect', 1.2, 'allow'], ['workspace_dev', 0, 'deny'], ['readonly_inspect', 1.21, 'deny'],
     ] as const) {
       decide.mockResolvedValue(answers(choice, 0.9, score));
       expect(await gate.canUseTool('Bash', { command: 'pwd; ls' })).toMatchObject({ behavior });
@@ -138,7 +206,9 @@ it('requires a readonly classification and low impact in both readonly modes', a
   }
 });
 
-it('opens a human approval card with a redacted risk note on errors, low safety or high impact', async () => {
+it('opens a human approval card with a redacted risk note on errors, low safety or high impact', async ({ onTestFinished }) => {
+  const logs = vi.spyOn(console, 'error').mockImplementation(() => {});
+  onTestFinished(() => logs.mockRestore());
   for (const response of [undefined, answers('workspace_dev', 0.89), answers('workspace_dev', 1, 1.41)]) {
     const { gate, decide, createIssueNote } = await setup();
     if (response) decide.mockResolvedValue(response);
@@ -148,6 +218,8 @@ it('opens a human approval card with a redacted risk note on errors, low safety 
     expect(card).toContain('**风控提示**');
     expect(card).not.toContain(secret);
   }
+  expect(logs).toHaveBeenCalledWith('[detent:bash-guard] ***');
+  expect(logs.mock.calls.flat().join(' ')).not.toContain(secret);
 });
 
 it('isolates service credentials from the SDK child, prompt, stderr and GitLab notes', async () => {

@@ -1,5 +1,5 @@
 import type { DetentCapabilityPack } from '../extensions.js';
-import { redactGitUrl } from '../gitlab/redact.js';
+import { logError, redactGitUrl } from '../gitlab/redact.js';
 import type { HubAgent } from '../workflows/hub-agents.js';
 import { missingHubCapabilities } from '../workflows/hub-workflows.js';
 import type { DecisionClient, DecisionQuestion } from './jev-client.js';
@@ -56,11 +56,11 @@ export async function routeHubAgent(
     }, questions);
     if (agent?.type !== 'choice' || typeof agent.choice !== 'string' || !Object.hasOwn(criteria, agent.choice) ||
         clear?.type !== 'noul' || !isProbability(clear.noul) ||
-        ambiguity?.type !== 'score' || !Number.isFinite(ambiguity.score) || ambiguity.score < 0) throw Error();
+        ambiguity?.type !== 'score' || !Number.isFinite(ambiguity.score) || ambiguity.score < 0) throw Error('Invalid Jev routing answers');
 
     const probabilities = agent.probabilities;
     if (probabilities !== undefined && (!probabilities || typeof probabilities !== 'object' || Array.isArray(probabilities) ||
-        !Object.values(probabilities).every(isProbability))) throw Error();
+        !Object.values(probabilities).every(isProbability))) throw Error('Invalid Jev routing probabilities');
 
     const contenders = agents.filter(candidate => candidate.id === agent.choice);
     const matched = agent.choice !== noMatch && contenders.length === 1 ? contenders[0] : undefined;
@@ -83,7 +83,8 @@ export async function routeHubAgent(
       ...(matched && !strongerReady && { suggestion: { agent: matched, confidence } }),
       ...(topCandidates && { topCandidates }),
     };
-  } catch {
+  } catch (error) {
+    logError('agent-router', error);
     return { kind: 'triage', reason: 'Jev 意图路由暂不可用' };
   }
 }

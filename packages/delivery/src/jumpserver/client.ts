@@ -64,7 +64,9 @@ const jobDefinition = resource.extend({ variable: z.array(z.unknown()).nullish()
 const task = z.object({ task_id: z.string().min(1) });
 
 class HttpError extends Error {
-  constructor(readonly status: number) { super('JumpServer HTTP ' + status); }
+  constructor(readonly status: number, snippet: string) {
+    super('JumpServer HTTP ' + status + (snippet ? ': ' + snippet : ''));
+  }
 }
 
 export class HttpJumpServerClient implements JumpServerClient {
@@ -77,8 +79,13 @@ export class HttpJumpServerClient implements JumpServerClient {
     this.base = config.jumpserverBaseUrl.replace(/\/$/, '');
   }
 
+  private redact(value: string) {
+    return redactSecrets(redactGitUrl(value), this.config, this.gitlab.gitlabToken, this.gitlab.jevApiKey ?? '', ...Object.values(this.gitlab.secrets ?? {}));
+  }
+
   private async request<S extends z.ZodTypeAny>(
-    auth: JumpServerAuth, path: string, schema: S, body?: object, signal = AbortSignal.timeout(this.config.jumpserverTimeoutMs),
+    auth: JumpServerAuth, path: string, schema: S, body?: object,
+    { signal = AbortSignal.timeout(this.config.jumpserverTimeoutMs), fallbackOn404 = false }: { signal?: AbortSignal; fallbackOn404?: boolean } = {},
   ): Promise<z.output<S>> {
     const method = body ? 'POST' : 'GET';
     try {
@@ -98,15 +105,23 @@ export class HttpJumpServerClient implements JumpServerClient {
         method, headers, signal, redirect: 'error', body: body instanceof FormData ? body : JSON.stringify(body),
       });
       if (!response.ok) {
-        await response.body?.cancel();
-        throw new HttpError(response.status);
+        const safeSnippet = this.redact(await response.text().catch(error => {
+          console.error('[detent:jumpserver]', method, this.redact(path), response.status, this.redact(String(error)));
+          return '';
+        })).slice(0, 1000);
+        if (!(fallbackOn404 && response.status === 404))
+          console.error('[detent:jumpserver]', method, this.redact(path), response.status, safeSnippet);
+        throw new HttpError(response.status, safeSnippet.slice(0, 300));
       }
-      const parsed = schema.safeParse(await response.json().catch(() => undefined));
+      const parsed = schema.safeParse(await response.json().catch(error => {
+        console.error('[detent:jumpserver]', method, this.redact(path), error instanceof SyntaxError ? 'Invalid JSON' : this.redact(String(error)));
+        throw Error('Invalid JumpServer response');
+      }));
       if (!parsed.success) throw Error('Invalid JumpServer response');
       return parsed.data;
     } catch (error) {
       if (error instanceof HttpError) throw error;
-      throw Error(redactSecrets(error instanceof Error ? error.message : 'JumpServer request failed', this.config));
+      throw Error(this.redact(error instanceof Error ? error.message : 'JumpServer request failed'));
     }
   }
 
@@ -128,7 +143,8 @@ export class HttpJumpServerClient implements JumpServerClient {
     })]));
     let accounts: z.infer<typeof items>;
     try {
-      accounts = await this.request(auth, path + 'accounts/', z.union([items, z.object({ results: items }).transform(page => page.results)]));
+      accounts = await this.request(auth, path + 'accounts/', z.union([items, z.object({ results: items }).transform(page => page.results)]),
+        undefined, { fallbackOn404: true });
     } catch (error) {
       if (!(error instanceof HttpError) || error.status !== 404) throw error;
       const detail = await this.request(auth, path, z.object({ permed_accounts: items.optional(), accounts: items.optional() }));
@@ -144,7 +160,7 @@ export class HttpJumpServerClient implements JumpServerClient {
     const groups = new Map<string, string[]>();
     for (const id of new Set(assetIds)) {
       const accounts = await this.listAssetAccounts(id, auth);
-      if (!accounts.length) throw Error(`资产 ${id} 没有可用的真实授权账号`);
+      if (!accounts.length) throw Error(`资产 ${id} 在 JumpServer 中未给当前 API Key 授权任何登录账号`);
       const selected = account ?? accounts[0];
       if (!accounts.includes(selected))
         throw Error(`资产 ${id} 未授权账号 ${selected}；可用授权账号：${accounts.join('、')}`);
@@ -161,17 +177,18 @@ export class HttpJumpServerClient implements JumpServerClient {
     auth: JumpServerAuth, body: object, signal: AbortSignal, variables?: Record<string, unknown>,
   ): Promise<AnsibleJobSubmission> {
     let execution: z.infer<typeof task>;
+    const jobBody = { ...body, is_periodic: false };
     if (variables && Object.keys(variables).length) {
       // Definitions exposing the variable relation use native parameter objects.
       // Older Job Centers consume JSON text. Keep their variables in the same jms_ namespace.
-      const job = await this.request(auth, 'ops/jobs/', jobDefinition, { ...body, name: 'detent-' + randomUUID() }, signal);
+      const job = await this.request(auth, 'ops/jobs/', jobDefinition, { ...jobBody, name: 'detent-' + randomUUID() }, { signal });
       const namespaced = Object.fromEntries(Object.entries(variables).map(([name, value]) =>
         [name.startsWith('jms_') ? name : 'jms_' + name, value]));
       execution = await this.request(auth, 'ops/job-executions/', task, {
         job: job.id, parameters: job.variable === undefined ? JSON.stringify(namespaced) : namespaced,
-      }, signal);
+      }, { signal });
     } else {
-      execution = await this.request(auth, 'ops/jobs/', task, { ...body, instant: true }, signal);
+      execution = await this.request(auth, 'ops/jobs/', task, { ...jobBody, instant: true }, { signal });
     }
     const jobId = execution.task_id;
     if (redactSecrets(jobId, this.config) !== jobId) throw Error('Unsafe JumpServer execution ID');
@@ -214,33 +231,38 @@ export class HttpJumpServerClient implements JumpServerClient {
       const groups = await this.resolveAccountGroups(request.assetIds, request.account, auth);
       if (groups.size !== 1) throw Error('目标资产的首个授权账号不同，请指定共同的 account 或按账号分组执行');
       const [account] = groups.keys();
-      const form = await playbookUpload(request, this.gitlab, signal);
-      const playbook = await this.request(auth, 'ops/playbooks/', resource, form, signal);
+      const form = await playbookUpload(request, this.gitlab, signal).catch(error => {
+        const detail = this.redact(error instanceof Error ? error.message : String(error));
+        console.error('[detent:playbook]', detail.slice(0, 1000));
+        throw Error(detail.slice(0, 300));
+      });
+      const playbook = await this.request(auth, 'ops/playbooks/', resource, form, { signal });
       return await this.submit(auth, { type: 'playbook', playbook: playbook.id,
         runas: account, runas_policy: 'skip', assets: request.assetIds, comment: request.comment }, signal, request.extraVars);
     } catch (error) {
+      if (error instanceof HttpError) throw error;
       const message = error instanceof Error ? error.message : 'JumpServer submission failed';
-      throw Error(redactSecrets(message, this.config, this.gitlab.gitlabToken));
+      throw Error(this.redact(message));
     }
   }
 
   private async result(auth: JumpServerAuth, jobId: string, signal: AbortSignal): Promise<JobResultResponse> {
     const id = segment(jobId);
-    const { status, summary } = await this.request(auth, 'ops/job-execution/task-detail/' + id + '/', detail, undefined, signal);
+    const { status, summary } = await this.request(auth, 'ops/job-execution/task-detail/' + id + '/', detail, undefined, { signal });
     let output = JSON.stringify(summary ?? {});
     if (status === 'SUCCESS' || status === 'FAILED') {
       // Newer releases expose structured results. Earlier v3/v4 installations expose a log tail.
       try {
         const reply = await this.request(auth, 'ops/job-execution/result/' + id + '/',
-          z.object({ result: z.record(z.unknown()).nullable() }), undefined, signal);
+          z.object({ result: z.record(z.unknown()).nullable() }), undefined, { signal, fallbackOn404: true });
         output += '\n' + JSON.stringify(reply.result);
       } catch (error) {
         if (!(error instanceof HttpError) || error.status !== 404) throw error;
-        const log = await this.request(auth, 'ops/ansible/job-execution/' + id + '/log/', z.object({ data: z.string() }), undefined, signal);
-        output += '\n' + log.data;
+        const log = await this.request(auth, 'ops/ansible/job-execution/' + id + '/log/', z.object({ data: z.string() }), undefined, { signal });
+        output += '\n' + log.data.replaceAll('\u0000', '');
       }
     }
-    const safe = redactSecrets(redactGitUrl(output), this.config, this.gitlab.gitlabToken, this.gitlab.jevApiKey ?? '', ...Object.values(this.gitlab.secrets ?? {}));
+    const safe = this.redact(output);
     return { jobId, jobUrl: this.jobUrl(jobId), status, outputSummary: safe.slice(0, 16000) };
   }
 

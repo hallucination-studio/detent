@@ -7,6 +7,7 @@ export {
   parseMcpCapabilitiesConfig, type McpCapabilityConfig,
 } from './extensions/mcp-bridge.js';
 export { loadConfig, type AppConfig } from './config.js';
+export { formatHttpError, logError } from './gitlab/redact.js';
 export { GitLabClient, redactGitUrl, type IssueNote, type MergeRequestDiscussion, type MergeRequestNote } from './gitlab/client.js';
 export { createGitLabOnboardingCapability, createGitLabOnboardingTools, type OnboardingGitLab } from './workspace/onboarding-tools.js';
 export { createGitLabReleaseTools, createGitLabReleaseCapability, type ReleaseGitLab } from './workspace/release-tools.js';

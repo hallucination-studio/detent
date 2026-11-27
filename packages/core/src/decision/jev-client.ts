@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { configuredSecrets, redactGitUrl, scrubJson } from '../gitlab/redact.js';
+import { configuredSecrets, formatHttpError, logError, redactGitUrl, scrubJson } from '../gitlab/redact.js';
 import type { AppConfig } from '../config.js';
 
 export type JevProvider = AppConfig['jevProvider'];
@@ -58,25 +58,30 @@ class HttpJevDecisionClient implements DecisionClient {
   }
 
   async decide(state: string | Record<string, unknown>, questions: Record<string, DecisionQuestion>) {
+    let detail: string;
     try {
       const res = await this.http(this.endpoint, {
         method: 'POST', redirect: 'error', signal: AbortSignal.timeout(this.timeoutMs),
         headers: { 'Content-Type': 'application/json', ...(this.#apiKey && { Authorization: 'Bearer ' + this.#apiKey }) },
         body: JSON.stringify(scrubJson({ model: this.model, state, questions }, value => redactGitUrl(value, this.#secrets))),
       });
-      if (!res.ok) throw Error();
-      const { answers } = response.parse(await res.json());
-      for (const [id, question] of Object.entries(questions)) {
-        const answer = answers[id];
-        if (answer?.type !== question.type) throw Error();
-        if (answer.type === 'choice' && question.type === 'choice' && !Object.hasOwn(question.criteria, answer.choice))
-          throw Error();
+      if (res.ok) {
+        const { answers } = response.parse(await res.json());
+        for (const [id, question] of Object.entries(questions)) {
+          const answer = answers[id];
+          if (answer?.type !== question.type) throw Error('Missing or invalid answer type for ' + id);
+          if (answer.type === 'choice' && question.type === 'choice' && !Object.hasOwn(question.criteria, answer.choice))
+            throw Error('Unexpected choice for ' + id);
+        }
+        return answers;
       }
-      return answers;
-    } catch {
-      // Transport and validation exceptions may contain credentials or untrusted response text.
-      throw Error('System One decision unavailable or invalid');
+      const body = await res.text().catch(error => logError('jev', error, this.#secrets));
+      logError('jev', 'Jev HTTP ' + res.status, this.#secrets, body);
+      detail = formatHttpError('Jev', res.status, body, this.#secrets);
+    } catch (error) {
+      detail = logError('jev', error, this.#secrets);
     }
+    throw Error('System One decision unavailable or invalid: ' + detail);
   }
 }
 

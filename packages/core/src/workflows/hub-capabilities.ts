@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { logError } from '../gitlab/redact.js';
 import type { DetentCapabilityPack } from '../extensions.js';
 import { connectMcpCapabilityPack } from '../extensions/mcp-bridge.js';
 import type { GitLabClient } from '../gitlab/client.js';
@@ -30,8 +31,8 @@ export async function loadHubCapabilities(
     const entries = entriesSchema.parse(JSON.parse(raw));
     const names = Object.keys(entries).map(name => name.toLowerCase());
     if (new Set(names).size === names.length) return { present: true, entries, invalid: false };
-  } catch {
-    // Parser and validation errors can contain credentials from the document.
+  } catch (error) {
+    logError('hub-capabilities', error);
   }
   return { present: true, entries: {}, invalid: true, error: 'Hub capabilities.json 格式无效' };
 }

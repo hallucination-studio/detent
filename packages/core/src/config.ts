@@ -49,7 +49,7 @@ const ConfigSchema = z.object({
   jevModel: z.string().optional(),
   jevThreshold: z.coerce.number().min(0.5).max(0.99).default(0.9),
   jevRoutingThreshold: z.coerce.number().min(0.5).max(0.99).default(0.8),
-  jevTimeoutMs: z.coerce.number().int().positive().max(30000).default(2500),
+  jevTimeoutMs: z.coerce.number().int().positive().max(30000).default(6000),
   safeBashPrefixes: z
     .string()
     .default('git status,git diff,git log,git branch')

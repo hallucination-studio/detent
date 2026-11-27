@@ -4,7 +4,7 @@
 
 ---
 
-## 一、 不可违背的 6 条核心架构红线（Architectural Invariants）
+## 一、 不可违背的 7 条核心架构红线（Architectural Invariants）
 
 1. **双包单向分层隔离（`@detent/core` 零业务污染）**
    - 项目演进为双包 Monorepo：`packages/core`（`@detent/core` 通用无状态基础架构包）与 `packages/delivery`（`@detent/delivery` 受治理 AI 变更交付中枢）。
@@ -24,6 +24,9 @@
    - **第三道（执行前生产审批）**：`jms_run_ansible_job` 治理级别必须为 `always_approve`；父进程按 `mode: readonly` 隐藏执行工具，巡检先硬拒绝危险命令，再检查允许前缀或交 Jev 评估。生产执行要求 `prod` 审批。JumpServer 推荐共用一把 AccessKey，仅由父进程持有；高敏感交付 Agent 禁用裸连 SSH / 本地直跑 Ansible。
 6. **严格防止 GitLab Bot 无限自环（Loop Prevention）与脱敏**
    - 收到任何 GitLab Webhook 时，必须校验 `X-Gitlab-Token` 并第一时间通过 `isBotUser` 过滤 Bot 自身的人为操作事件。pipeline、build、deployment 保留 Bot 触发的状态变化；所有评论与错误日志必须经过 `redactGitUrl` 脱敏。
+
+7. **错误可观测性与脱敏**
+   - 禁止静默吞错：禁止裸 `catch {}`。上游 HTTP 4xx/5xx 错误必须用 `logError` 或 `console.error` 记录状态及脱敏后的原始响应详情。先脱敏再截断，将安全摘要传递给工具轨迹。
 
 ---
 
@@ -63,7 +66,7 @@ Core 持有通用 System One 客户端（百炼 Decision Model API、TypeSafe、
 
 每轮从 Hub 默认分支发现 `agents/<id>/AGENT.md`、Agent 私有 Skills 和经 `shared_skills` 引用的共享 Skills。只将选定 Agent 及其引用的 Skills 放入工作区，提示词列出 Skill 摘要供 `Read` 按需加载。写保护覆盖根目录的 `CLAUDE.md`、`agents/`、`skills/` 和 `workflows/`。同 ID 的新版 Agent 优先，其余 `workflows/*.md` 继续可用。Bootstrap 递归补齐缺失的模板文件。
 
-有匹配标签时按当前 Hub 定义选 Agent。普通轮次无匹配标签时可由 Jev 结合工单与非 Bot 用户评论路由。高置信度且能力齐备时先持久化 Plan，再写回 Agent 标签。无法明确匹配且无默认 Agent 时进入只读 Triage，询问补充信息后回到 `IDLE`。`/use` 在租约内作废旧待审单并持久化 Plan 重置，再替换 Agent 标签。`purpose === 'approval'` 只按现有标签或默认 Agent 解析授权，严禁触发 Jev 或 Triage。
+有匹配标签时按当前 Hub 定义选 Agent。普通轮次无匹配标签时可由 Jev 结合工单与非 Bot 用户评论路由。高置信度且能力齐备时先持久化 Plan，再写回 Agent 标签。无法明确匹配且有就绪 Agent 时，由协调者通过 Claude Code 原生 `--agents` 注册流程并按序调用 `Task(subagent_type=…)`。每次委派独立校验工具权限与账号，父子调用都进入工具轨迹。只读诊断直接回到 `IDLE`，同一工单的后续变更委派进入 `WAITING_PLAN`，批准后才可编辑和开 MR。无需添加流程标签或发送 `/use`。没有可委派的 Agent 时保留澄清路径。`/use` 在租约内作废旧待审单并持久化 Plan 重置，再替换 Agent 标签。`purpose === 'approval'` 按既有审批单的委派范围或当前标签、默认 Agent 复核授权，严禁触发 Jev 或 Triage。
 
 服务端通过 `DETENT_MCP_CAPABILITIES_FILE` 加载 Streamable HTTP 能力包，由 Agent 的 `requires` 选用。代理工具默认 `always_approve`，由既有 Plan 与工具门禁治理。认证信息由服务端解析，代理对工具元数据、审批卡、调用结果和错误脱敏。Delivery 对 `approverTier: prod` 包的工具审批强制校验生产权限，SOP 的 `approver_tier: standard` 无法降级。
 
@@ -136,3 +139,5 @@ Issue 与 MR 的普通回复只可回答当前待审的 `ASK_USER`，沿用审�
 `DETENT_SECRET_*` 仅在父进程解析。新增输出路径必须使用完整配置密钥集合脱敏，包含 SDK 输入、代理元数据、工具参数与结果、审批、Jev、GitLab 和增量 transcript。沙箱保护 Hub 根目录的 `capabilities.json`，包含 Edit、Write、Bash 和符号链接路径。
 
 Issue 的 `/help`、轮次、审批分别读取 Hub 默认分支的能力配置。单轮解析所得的工具与流程授权使用同一份能力清单。MCP 请求头只在服务端展开；Hub 配置不能展开通用进程环境变量。临时连接在发现或调用结束时释放。Delivery 解释业务能力字段，Core 透传通用的流程 `account` 与 `allow_prefixes`。Hub 的 JumpServer `auth` 通过 `$secret:JMS_AK_ID` 和 `$secret:JMS_AK_SECRET` 引用父进程密钥。先使用流程 `account`，其次使用 Hub `default_account`。两者均未设置时，逐资产按 JumpServer 返回顺序选择首个有效授权账号，跳过停用账号和以 `@` 开头的虚拟账号。巡检按账号分组并汇总结果。单个 Ansible 任务要求所有目标使用同一账号，否则须指定共同的 `account` 或分组执行。缺少有效账号时，错误指出对应资产。
+
+JumpServer 即时巡检与 Playbook 定义均在 `POST /api/v1/ops/jobs/` 显式发送 `is_periodic: false`。巡检按等价标志静态放行 `ss -lntp`。白名单外诊断要求 Jev 返回 `choice=pure_readonly`、`noul ≥ 0.75`、`0 ≤ impact ≤ 1.35`，拒绝理由保留三项指标。Jev 请求默认超时 6000 ms。

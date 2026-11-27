@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import { defineExtensionTool, type DetentCapabilityPack, type ToolGovernancePolicy } from '../extensions.js';
 import { escapeTableCell } from '../gitlab/note-streamer.js';
-import { redactGitUrl, scrubJson } from '../gitlab/redact.js';
+import { formatHttpError, logError, redactGitUrl, scrubJson } from '../gitlab/redact.js';
 import { normalizeHubValue } from '../workflows/hub-frontmatter.js';
 import type { WorkflowApproverTier } from '../workflows/hub-workflows.js';
 import { isHubPathSegment } from '../workspace/hub-paths.js';
@@ -69,10 +69,11 @@ function validateConfig(value: unknown): McpCapabilityConfig[] {
   throw Error('Invalid MCP capability configuration' + (field ? ' at ' + field : '') + detail);
 }
 
-function parseJson(text: string, errorMessage: string): unknown {
+function parseJson(text: string, errorMessage: string, secrets?: Set<string>): unknown {
   try {
     return JSON.parse(text);
-  } catch {
+  } catch (error) {
+    logError('mcp-bridge', error, secrets && [...secrets], errorMessage);
     throw Error(errorMessage);
   }
 }
@@ -171,7 +172,7 @@ function matchesReply(value: unknown, id: number): value is Record<string, unkno
   return message?.id === id && !Object.hasOwn(message, 'method');
 }
 
-async function readEventStream(body: ReadableStream<Uint8Array>, id: number) {
+async function readEventStream(body: ReadableStream<Uint8Array>, id: number, secrets: Set<string>) {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let pending = '';
@@ -194,7 +195,7 @@ async function readEventStream(body: ReadableStream<Uint8Array>, id: number) {
         const payload = data.join('\n');
         data = [];
         if (!payload.trim()) continue;
-        const message = parseJson(payload, 'Invalid MCP event stream JSON');
+        const message = parseJson(payload, 'Invalid MCP event stream JSON', secrets);
         const messages: unknown[] = Array.isArray(message) ? message : [message];
         const reply = messages.find(item => matchesReply(item, id));
         if (reply) return reply;
@@ -202,23 +203,28 @@ async function readEventStream(body: ReadableStream<Uint8Array>, id: number) {
       pending = pending.slice(offset);
     }
   } finally {
-    void reader.cancel().catch(() => {});
+    void reader.cancel().catch(error => logError('mcp-bridge', error, [...secrets]));
   }
 }
 
-async function readReply(response: Response, id: number) {
-  if (!response.ok) {
-    void response.body?.cancel().catch(() => {});
-    throw Error('MCP HTTP error ' + response.status);
-  }
+async function checkHttp(response: Response, secrets: Set<string>) {
+  if (response.ok) return;
+  const context = 'MCP HTTP error ' + response.status;
+  const body = await response.text().catch(error => logError('mcp-bridge', error, [...secrets], context));
+  logError('mcp-bridge', context, [...secrets], body);
+  throw Error(body.trim() ? formatHttpError('MCP', response.status, body, [...secrets]) : context);
+}
+
+async function readReply(response: Response, id: number, secrets: Set<string>) {
+  await checkHttp(response, secrets);
   const type = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
   let message: unknown;
   if (type === 'application/json') {
-    message = parseJson(await response.text(), 'Invalid MCP response JSON');
+    message = parseJson(await response.text(), 'Invalid MCP response JSON', secrets);
   } else if (type === 'text/event-stream' && response.body) {
-    message = await readEventStream(response.body, id);
+    message = await readEventStream(response.body, id, secrets);
   } else {
-    void response.body?.cancel().catch(() => {});
+    void response.body?.cancel().catch(error => logError('mcp-bridge', error, [...secrets]));
     throw Error('Unsupported MCP response content type');
   }
   if (!matchesReply(message, id) || message.jsonrpc !== '2.0' ||
@@ -262,7 +268,7 @@ function createClient(url: string, resolvedHeaders: Record<string, string>, time
     const response = await post({
       id, method: 'initialize', params: { protocolVersion: preferredProtocolVersion, capabilities: {}, clientInfo: { name: 'detent', version: '1.0.0' } },
     });
-    const result = await readReply(response, id);
+    const result = await readReply(response, id, secrets);
     const protocolVersion = jsonObject(result)?.protocolVersion;
     if (typeof protocolVersion !== 'string' || !supportedProtocolVersions.has(protocolVersion)) {
       throw Error('Unsupported MCP protocol version');
@@ -275,8 +281,10 @@ function createClient(url: string, resolvedHeaders: Record<string, string>, time
     const session = { protocolVersion, sessionId };
     try {
       const notification = await post({ method: 'notifications/initialized' }, session);
-      void notification.body?.cancel().catch(() => {});
-    } catch {
+      await checkHttp(notification, secrets);
+      await notification.body?.cancel();
+    } catch (error) {
+      logError('mcp-bridge', error, [...secrets]);
       // The notification is best-effort. Tool discovery still verifies the connection.
     }
     return session;
@@ -291,12 +299,13 @@ function createClient(url: string, resolvedHeaders: Record<string, string>, time
 
   return {
     async close() {
-      const session = await initialized?.catch(() => undefined);
+      const session = await initialized;
       if (!session?.sessionId) return;
       const headers = new Headers(baseHeaders);
       headers.set('Mcp-Session-Id', session.sessionId);
       headers.set('MCP-Protocol-Version', session.protocolVersion);
       const response = await http(url, { method: 'DELETE', redirect: 'error', headers, signal: AbortSignal.timeout(timeoutMs) });
+      await checkHttp(response, secrets);
       await response.body?.cancel();
     },
     async request(method: string, params?: object) {
@@ -306,7 +315,7 @@ function createClient(url: string, resolvedHeaders: Record<string, string>, time
       const response = await post({ id, method, params }, session);
       // Reopen an expired session for later requests. Surface this failure without replaying a tool call.
       if (response.status === 404 && session.sessionId && initialized === current) initialized = undefined;
-      return readReply(response, id);
+      return readReply(response, id, secrets);
     },
   };
 }
@@ -370,7 +379,7 @@ async function connect(cfg: McpCapabilityConfig, options: ConnectOptions): Promi
     async function withClient<T>(operation: (client: ReturnType<typeof open>) => Promise<T>) {
       const client = shared ?? open();
       try { return await operation(client); }
-      finally { if (!shared) await client.close().catch(() => {}); }
+      finally { if (!shared) await client.close().catch(error => logError('mcp-bridge', error, [...secrets])); }
     }
     const allowed = cfg.allowedTools && new Set(cfg.allowedTools);
     const prefix = sanitizeIdentifier(cfg.toolPrefix ?? cfg.name);
@@ -410,13 +419,14 @@ async function connect(cfg: McpCapabilityConfig, options: ConnectOptions): Promi
             }
             return scrubJson(result.structuredContent ?? result.content ?? [], scrub);
           } catch (error) {
-            throw Error(scrub(error instanceof Error ? error.message : 'MCP tool call failed'));
+            throw Error(logError('mcp-bridge', error, [...secrets]));
           }
         },
       });
     });
     return { ...pack, enabled: true, setupHint: cfg.setupHint === undefined ? undefined : scrub(cfg.setupHint), tools };
-  } catch {
+  } catch (error) {
+    logError('mcp-bridge', error, [...secrets]);
     return disabled('外部 MCP 服务不可达或初始化失败（' + cfg.name + '）');
   }
 }

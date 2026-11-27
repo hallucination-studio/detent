@@ -4,6 +4,7 @@ import type { DetentExtensions, WebhookExtension } from '../extensions.js';
 import { SessionBusy } from '../orchestrator/turn-runtime.js';
 import { sendEventNotification } from './notifier.js';
 import { z } from 'zod';
+import { logError } from '../gitlab/redact.js';
 import type { GitLabClient } from '../gitlab/client.js';
 import { hasBotMention } from '../gitlab/command-parser.js';
 import { isCiStatusEvent } from '../gitlab/webhook.js';
@@ -34,7 +35,8 @@ export async function loadHubEventPolicy(gitlab: Pick<GitLabClient, 'getReposito
   if (file === null) return { present: false, rules: [] };
   try {
     return { present: true, rules: schema.parse(JSON.parse(file)).rules };
-  } catch {
+  } catch (error) {
+    logError('event-policy', error);
     return { present: true, rules: [] };
   }
 }
@@ -69,7 +71,9 @@ export async function evaluateEventPolicy(policy: Policy, event: NormalizedGitLa
       });
       const chosen = choices.find(choice => answer?.type === 'choice' && choice === answer.choice);
       if (chosen) return { action: chosen, rule };
-    } catch { /* Use the Hub's fallback when the decision service is unavailable. */ }
+    } catch (error) {
+      logError('event-policy', error);
+    }
   }
   return { action: rule.fallbackAction ?? 'notify', rule };
 }
@@ -112,6 +116,7 @@ export async function runHubEvent(gitlab: Pick<GitLabClient, 'createIssue'>, con
   try {
     await orchestrator.wakeSession(session, 'inbox');
   } catch (error) {
+    logError('event-policy', error);
     if (!(error instanceof SessionBusy)) throw error;
   }
 }

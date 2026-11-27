@@ -115,9 +115,9 @@ flowchart TD
 
 ### Jev 语义风控
 
-Core 的 `DecisionClient` 以一次 POST 提交 choice、noul、score 三问，兼容百炼 Decision Model API 和 TypeSafe System One。默认关闭。Bash 硬门禁优先，静态安全命令免网络请求。语义放行要求无外部影响概率达到阈值（默认 0.9），只读分类的影响分上限为 0.6，编码可接受工作区开发类且影响分不超过 1.4。其余结果和网络、协议错误在编码时发审批卡，在只读和 Plan 时拒绝。
+Core 的 `DecisionClient` 以一次 POST 提交 choice、noul、score 三问，兼容百炼 Decision Model API 和 TypeSafe System One。默认关闭。Bash 硬门禁优先，静态安全命令免网络请求。语义放行要求无外部影响概率达到阈值（默认 0.9），只读模式的影响分上限为 1.2，编码可接受工作区开发类且影响分不超过 1.4。其余结果和网络、协议错误在编码时发审批卡，在只读和 Plan 时拒绝。
 
-Delivery 共享同一实例。只读巡检可在静态白名单外评估诊断命令，要求纯只读、无副作用概率达标、影响分 ≤ 0.6；资产黑名单和账号授权校验始终生效。只读巡检失败直接拒绝。生产任务、发版、需审批的关单与 Plan 沿用人工审批和权限检查。服务端隔离 Jev 密钥，错误与评论脱敏。
+Delivery 共享同一实例。只读巡检可在静态白名单外评估诊断命令，要求 pure_readonly、0.75 ≤ noul ≤ 1、0 ≤ impact ≤ 1.35；资产黑名单和账号授权校验始终生效。硬拒绝与静态放行（如 `ss -lntp`）均免 Jev 调用。语义拒绝保留 choice、noul、impact，Jev 默认超时 6000 ms。生产任务、发版、需审批的关单与 Plan 沿用人工审批和权限检查。服务端隔离 Jev 密钥，错误与评论脱敏。
 
 ### 2.2 `@detent/core` 暴露的 4 个极简扩展契约（供 `@detent/delivery` 及未来其他模块接入）
 
@@ -470,8 +470,8 @@ Core 从 Hub 默认分支递归读取 `agents/` 和 `skills/`。`agents/<id>/AGE
 
 1. Delivery 每轮重读 Hub 定义及 Issue 标签。匹配标签时按确定性规则选择，唯一的只读匹配优先于其他匹配，其余冲突返回引导。缺失 `requires` 时在创建沙箱前返回能力名、配置指引和就绪选项。
 2. 无匹配标签的普通轮次使用同一个 `DecisionClient` 评估 `hub_agent_routing`。输入包括工单标题、描述、非状态标签和最多四条去重后的近期用户消息，排除 Bot 与系统评论。三问校验是否存在唯一候选、`clear_match` 是否达到 `JEV_ROUTING_THRESHOLD`（默认 0.8）及 `ambiguity` 是否不超过 1.2。
-3. 高置信度且能力已就绪时，编排器在当前租约内先将权限模式持久化为 `plan`，再写回 Agent 标签，本轮评论附路由提示。后续轮次按该标签选择。候选需要未开通能力且没有更强的就绪候选时直接返回同一张能力卡。其余不确定的请求可回退到默认 Agent。没有默认 Agent 时，Triage 以只读模式运行，无扩展能力工具，区分已就绪与未开通的能力，最多询问三个必要问题并回到 `IDLE`。用户补充信息后可再次路由。
-4. 具备项目普通审批权限的成员可用 `/use <id 或标签> [补充需求]` 切换。旧轮次停止后，编排器在租约内作废待审单，先持久化 Plan 重置，再替换 Agent 标签并启动新轮次。`purpose === 'approval'` 只按现有标签或默认 Agent 重读授权，无 Jev 调用或 Triage 轮次。
+3. 高置信度且能力已就绪时，编排器在当前租约内先将权限模式持久化为 `plan`，再写回 Agent 标签，本轮评论附路由提示。后续轮次按该标签选择。候选需要未开通能力且没有更强的就绪候选时直接返回同一张能力卡。有就绪 Agent 时，协调者用 Claude Code 原生 `--agents` 注册其 Hub 提示和 Skills，每次用前台 `Task(subagent_type=…)` 委派给一位 Agent。父进程检查工具白名单、账号与只读范围，按 Task 调用 ID 释放权限。只读巡检报告回到 `IDLE`，工具轨迹展示 Task 与子工具的参数、结果。同一 Issue 后续委派给受治理 Agent 时生成 Plan 卡，批准后在原 Session 实施并开 MR。缺少必要信息时可先澄清。用户补充信息后可再次路由。
+4. 具备项目普通审批权限的成员可用 `/use <id 或标签> [补充需求]` 切换。旧轮次停止后，编排器在租约内作废待审单，先持久化 Plan 重置，再替换 Agent 标签并启动新轮次。`purpose === 'approval'` 按待审单的委派范围或现有标签、默认 Agent 重读授权，无 Jev 调用或 Triage 轮次。
 
 ### 7.3 声明式外部 MCP 能力包
 
@@ -594,3 +594,5 @@ Issue 的 `/help` 按当前 Hub 定义列出场景、标签和就绪状态。Iss
 Issue 编排器在帮助、运行和审批时分别加载 Hub 默认分支的 `capabilities.json`。不存在时使用启动配置，文档损坏时关闭能力包。Core 解析通用 MCP，Delivery 通过 `resolveCapabilities` 解释业务配置；运行中的门禁与角色解析共享当前快照。代理发现和执行分别管理连接，SSE 消息端点须与握手地址同源。认证头和密钥只保留在服务端。Hub 的流程扩展字段随选中的 profile 进入工具上下文。
 
 Hub 的 `auth` 引用 `$secret:JMS_AK_ID` 和 `$secret:JMS_AK_SECRET`，供巡检与任务中心共用。先使用流程 `account`，其次使用 Hub `default_account`。两者均未设置时，逐资产按 JumpServer 返回顺序选择首个有效授权账号，跳过停用账号和以 `@` 开头的虚拟账号。巡检按账号分组并汇总结果。单个 Ansible 任务要求所有目标使用同一账号，否则须指定共同的 `account` 或分组执行。缺少有效账号时，错误指出对应资产。执行工具继续核对 MR 合并 SHA、最新流水线及审批记录。
+
+JumpServer 的即时作业与带变量的 Playbook 定义均显式提交 `is_periodic: false`。兼容接口的 HTML 404 分别回退到资产详情的 `permed_accounts` 与 Ansible 执行日志，后者去除 NUL 填充。其他 HTTP 错误在父进程记录状态和脱敏原文，工具轨迹保留短摘要。失败执行写入 `delivery_executions`，最新执行成功后才可自动关单。

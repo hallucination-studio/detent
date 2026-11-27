@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { kafkaCommands, kafkaTitle } from './suites/kafka.js';
 import { imageMirror } from './offline-mcp.js';
 
 export function offlineJev() {
@@ -23,7 +24,7 @@ export function offlineJev() {
       const ambiguity = clarified ? 0.1 : 2;
       routingRequests.push({ recentMessages, confidence, ambiguity });
       return Response.json({ answers: {
-        agent: { type: 'choice', choice: 'image-sync' }, clear_match: { type: 'noul', noul: confidence },
+        agent: { type: 'choice', choice: state.issue_title === kafkaTitle ? '__none__' : 'image-sync' }, clear_match: { type: 'noul', noul: confidence },
         ambiguity: { type: 'score', score: ambiguity },
       } });
     }
@@ -38,7 +39,7 @@ export function offlineJev() {
     }
     const manual = state.command === 'printf config-loader-ok | cut -c 1-6';
     const remote = state.surface === 'remote_jumpserver_readonly_inspect';
-    if (remote) assert.equal(state.command, 'ss -lntp');
+    if (remote) assert.ok([...kafkaCommands, 'date', 'hostname', 'hostname -s', 'date -u'].includes(state.command), 'Unexpected Jev command ' + state.command);
     else {
       assert.equal(state.surface, 'local_ephemeral_workspace_bash');
       assert.equal(state.mode, 'coding');
@@ -52,8 +53,8 @@ export function offlineJev() {
     assert.equal(questions.impact.type, 'score');
     requests.push(state.command);
     return Response.json({ answers: {
-      [category]: { type: 'choice', choice: manual ? 'uncertain' : remote ? 'pure_readonly' : 'readonly_inspect' },
-      [safety]: { type: 'noul', noul: manual ? 0.5 : 0.96 }, impact: { type: 'score', score: manual ? 2 : 0 },
+      [category]: { type: 'choice', choice: manual ? 'uncertain' : remote ? state.command === 'hostname -s' ? 'state_mutating' : 'pure_readonly' : 'readonly_inspect' },
+      [safety]: { type: 'noul', noul: manual ? 0.5 : remote ? 0.79 : 0.96 }, impact: { type: 'score', score: manual ? 2 : state.command === 'date -u' ? 1.4 : remote ? 0.76 : 0 },
     } });
   }
   return { requests, routingRequests, eventDecisions, handle };

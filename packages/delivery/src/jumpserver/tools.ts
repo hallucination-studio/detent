@@ -1,8 +1,8 @@
-import { defineExtensionTool, escapeMarkdownCell, neutralizeQuickActions, redactGitUrl, type AnyDetentExtensionTool, type ExtensionToolContext, type DecisionClient } from '@detent/core';
+import { defineExtensionTool, escapeMarkdownCell, logError, neutralizeQuickActions, redactGitUrl, type AnyDetentExtensionTool, type ExtensionToolContext, type DecisionClient } from '@detent/core';
 import { z } from 'zod';
-import { redactSecrets, type DeliveryConfig } from '../config.js';
+import { authSecrets, redactSecrets, type DeliveryConfig } from '../config.js';
 import type { JobResultResponse, JumpServerClient } from './client.js';
-import { evaluateRemoteInspectCommand, findBlockedAssets, isHardBlockedRemoteInspectCommand, normalizeInspectCommand, validatePlaybookPath, validateReadonlyInspectCommand } from './guards.js';
+import { evaluateRemoteInspectCommand, findBlockedAssets, normalizeInspectCommand, validatePlaybookPath, validateReadonlyInspectCommand } from './guards.js';
 
 export interface DeliveryExecutionRecord {
   sessionId: string;
@@ -62,13 +62,12 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
       async guard(input, ctx) {
         const prefixes = [...config.inspectAllowPrefixes, ...(ctx.workflow?.allowPrefixes ?? [])];
         const command = validateReadonlyInspectCommand(input.command, prefixes);
-        if (!decision) {
-          if (!command.ok) return command;
-          return isHardBlockedRemoteInspectCommand(input.command) ? deny('巡检命令不在只读白名单') : checkAssets(input.asset_ids);
+        if (!command.ok) {
+          if (!decision || 'hardBlocked' in command) return command;
+          const evaluation = await evaluateRemoteInspectCommand(decision, input.command);
+          if (!evaluation.allowed) return deny(evaluation.reason + '。变更操作请使用 delivery::env-change 提交 Ansible MR 并审批。');
         }
-        if (!isHardBlockedRemoteInspectCommand(input.command) &&
-            (command.ok || await evaluateRemoteInspectCommand(decision, input.command))) return checkAssets(input.asset_ids);
-        return deny('未通过只读巡检风控。变更操作请使用 delivery::env-change 提交 Ansible MR 并审批。');
+        return checkAssets(input.asset_ids);
       },
       execute(input, ctx) {
         return client.runReadonlyInspect({
@@ -128,8 +127,9 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
             jumpserverJobId: job.jobId, jumpserverJobUrl: job.jobUrl,
             playbookPath: input.playbook_path, commitSha: input.commit_sha, targetAssets: input.asset_ids, status: job.status,
           });
-        } catch {
-          throw Error(redactSecrets(`任务 ${job.jobId} 已提交（${job.jobUrl}），审批单 ${approvalId} 的追踪记录写入失败。请核对已有任务，避免重复提交。`, config));
+        } catch (error) {
+          const detail = logError('delivery-audit', error, [...authSecrets(config.jumpserverJobAuth), ...authSecrets(config.jumpserverReadonlyAuth)]);
+          throw Error(redactSecrets(`任务 ${job.jobId} 已提交（${job.jobUrl}），审批单 ${approvalId} 的追踪记录写入失败：${detail}。请核对已有任务，避免重复提交。`, config));
         }
         return {
           jobId: job.jobId, status: job.status, approved: true,

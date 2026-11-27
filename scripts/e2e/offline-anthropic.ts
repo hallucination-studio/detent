@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { matrixTurns } from './suites/jumpserver-matrix.js';
+import { kafkaCommands, kafkaTitle } from './suites/kafka.js';
 import { imageMirror } from './offline-mcp.js';
 
 type Text = { type: 'text'; text: string };
@@ -26,7 +28,7 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
   if (!body.tools?.length) return text('Delivery request');
   const blocks = body.messages.flatMap(m => typeof m.content === 'string' ? [text(m.content)] : m.content);
   const prefix = 'mcp__detent__';
-  const toolName = (name: string) => ['Read', 'Write', 'Bash'].includes(name) ? name : prefix + name;
+  const toolName = (name: string) => ['Read', 'Write', 'Bash', 'Task'].includes(name) ? name : prefix + name;
   const use = (name: string, input: object): Use => {
     assert.ok(body.tools?.some(t => t.name === toolName(name)), 'SDK did not advertise ' + toolName(name));
     return { type: 'tool_use', id: 'toolu_' + randomUUID(), name: toolName(name), input };
@@ -180,11 +182,57 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
     assert.match(JSON.parse(success(push)), /^[a-f0-9]{40}$/);
     return text(report);
   }
+  const delegate = blocks.find((b): b is Text => b.type === 'text' && b.text.startsWith('Kafka handoff: '));
+  if (delegate) {
+    if (delegate.text.includes('inspect')) {
+      assert.equal(sopPath, 'agents/audit/AGENT.md');
+      const assets = result('jms_list_assets');
+      if (!assets) return use('jms_list_assets', {});
+      assert.match(success(assets), /web01/);
+      let history = blocks;
+      const evidence: string[] = [];
+      for (const command of kafkaCommands) {
+        const run = result('jms_readonly_inspect', history);
+        if (!run) return use('jms_readonly_inspect', { asset_ids: ['web01'], command });
+        evidence.push(JSON.parse(success(run)).outputSummary);
+        history = history.slice(history.indexOf(run) + 1);
+      }
+      return text('web01 Kafka 诊断：' + evidence.join('，'));
+    }
+    assert.equal(sopPath, 'agents/code-delivery/AGENT.md');
+    if (delegate.text.includes('plan')) return text('Update kafka.properties in ' + apiRepo + ' and open an MR.');
+    const step = deliverFile(apiRepo, 'fix/kafka-config', 'kafka.properties', 'bootstrap.servers=localhost:9092\n', 'Fix Kafka bootstrap configuration', blocks);
+    return 'type' in step ? step : text('Kafka config MR ' + step.mrWebUrl);
+  }
+  if (system.includes(kafkaTitle)) {
+    assert.match(system, /你负责协调当前 Issue/);
+    const fix = blocks.findIndex(b => b.type === 'text' && b.text.includes('中的 Kafka 配置并开 MR'));
+    const mode = approved >= 0 ? 'implement' : fix >= 0 ? 'plan' : 'inspect';
+    const history = blocks.slice(Math.max(approved, fix, 0));
+    const child = result('Task', history);
+    if (!child) return use('Task', { subagent_type: mode === 'inspect' ? 'audit' : 'code-delivery',
+      description: 'Kafka ' + mode, prompt: 'Kafka handoff: ' + mode + ' ' + apiRepo + '\nWorking directory: ' + workspaceRoot() + '\n' });
+    return text(success(child));
+  }
   assert.ok(issue, 'Missing Hub Issue number in the SDK system prompt');
 
   const userText = body.messages.filter(m => m.role === 'user').flatMap(m =>
     typeof m.content === 'string' ? [m.content] : m.content.flatMap(b => b.type === 'text' ? [b.text] : []));
   const has = (phrase: string) => userText.some(t => t.includes(phrase));
+  if (system.includes('JumpServer contract')) {
+    const prompt = blocks.filter((b): b is Text => b.type === 'text' && Object.keys(matrixTurns).some(key => b.text.includes(key))).at(-1);
+    assert.ok(prompt);
+    const key = Object.keys(matrixTurns).find(key => prompt.text.includes(key))!;
+    let history = blocks.slice(blocks.indexOf(prompt) + 1);
+    const reports = [];
+    for (const input of matrixTurns[key]) {
+      const step = result('jms_readonly_inspect', history);
+      if (!step) return use('jms_readonly_inspect', input);
+      reports.push(contents(step.content));
+      history = history.slice(history.indexOf(step) + 1);
+    }
+    return text(reports.join('\n'));
+  }
   if (/Stage 15 (?:Hub|workflow|denied) account/.test(system)) {
     const status = result('jms_readonly_inspect');
     if (!status) return use('jms_readonly_inspect', { asset_ids: ['web01'], command: system.includes('workflow account') ? 'kafka-topics.sh --list' : 'uptime' });
@@ -273,6 +321,10 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
     return text(report);
   }
 
+  if (system.includes('你负责协调当前 Issue') && system.includes('同步 nginx 镜像')) {
+    assert.match(system, /未开通：[\s\S]*audit：jumpserver/);
+    return text('请提供带 Tag 的完整源镜像地址和目标镜像仓库地址。');
+  }
   if (system.includes('需求澄清与引导模式（只读）')) {
     assert.equal(sopPath, undefined);
     assert.match(system, /本轮仅允许只读检查/);
@@ -373,6 +425,11 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
         shellHistory = shellHistory.slice(shellHistory.indexOf(shell) + 1);
       }
     }
+    if (file === 'kafka.properties' || (file === playbook && system.includes('Verify failed playbook'))) {
+      const read = result('Read', history);
+      if (!read) return use('Read', { file_path: join(workspaceRoot(), 'projects', directory, file) });
+      assert.match(success(read), file === playbook ? /state: reloaded/ : /bootstrap.servers=localhost:19092/);
+    }
     const write = result('Write', history);
     if (!write) return use('Write', { file_path: join(workspaceRoot(), 'projects', directory, file), content });
     assert.ok(success(write).includes(file.split('/').at(-1)!));
@@ -455,7 +512,7 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
 
   assert.ok(blocks.some(b => b.type === 'text' && b.text.includes(plan)), 'Missing restored plan');
   const step = deliverFile(ansibleRepo, 'change/issue-' + issue[1], playbook,
-    '- hosts: all\n  tasks:\n    - name: Reload nginx\n      ansible.builtin.service: { name: nginx, state: reloaded }\n',
+    (system.includes('Verify failed playbook') ? '# Verify service recovery\n' : '') + '- hosts: all\n  tasks:\n    - name: Reload nginx\n      ansible.builtin.service: { name: nginx, state: reloaded }\n',
     'Reload nginx', blocks);
   if ('type' in step) return step;
   const { targetProjectId, mrIid, sha } = step;
@@ -469,12 +526,32 @@ function next(body: Messages, { webRepo, apiRepo, ansibleRepo, securityReport }:
 
   assert.ok(blocks.some(b => b.type === 'text' && b.text.includes(review)), 'Missing restored MR discussion');
   const mergeSha = /合并提交 SHA：([a-f0-9]{40})/.exec(lastMerge.text)![1];
-  const submitted = result('jms_run_ansible_job', turn);
-  if (!submitted) return use('jms_run_ansible_job', { ...job, commit_sha: mergeSha });
+  let executionHistory = turn;
+  const expectFailure = system.includes('Verify failed playbook');
+  if (expectFailure) {
+    const mixed = result('jms_run_ansible_job', turn);
+    if (!mixed) return use('jms_run_ansible_job', { ...job, asset_ids: ['web01', 'web02'], commit_sha: mergeSha });
+    assert.ok(mixed.is_error);
+    assert.match(contents(mixed.content), /共同的 account.*分组执行/);
+    executionHistory = turn.slice(turn.indexOf(mixed) + 1);
+  }
+  const submitted = result('jms_run_ansible_job', executionHistory);
+  if (!submitted) return use('jms_run_ansible_job', { ...job, asset_ids: expectFailure ? ['web02'] : job.asset_ids, commit_sha: mergeSha });
   const submission = JSON.parse(success(submitted));
   assert.equal(submission.commitSha, mergeSha);
   const outcome = result('jms_get_job_result', turn);
   if (!outcome) return use('jms_get_job_result', { job_id: submission.jobId });
+  if (expectFailure) {
+    const failure = JSON.parse(success(outcome));
+    assert.equal(failure.status, 'FAILED');
+    assert.match(failure.outputSummary, /service check failed on web02/);
+    assert.ok(!failure.outputSummary.includes('\u0000'));
+    const close = result('detent_close_issue', turn);
+    if (!close) return use('detent_close_issue', { summary: 'Check failed execution.' });
+    assert.ok(close.is_error);
+    assert.match(contents(close.content), /最新交付执行记录状态为 FAILED/);
+    return text('Playbook failed on web02, leaving this Issue open.');
+  }
   assert.match(success(outcome), /nginx reloaded/);
   const verified = result('jms_readonly_inspect', turn);
   if (!verified) return use('jms_readonly_inspect', inspect);

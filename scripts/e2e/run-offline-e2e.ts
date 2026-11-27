@@ -1,3 +1,5 @@
+import { runJumpServerMatrix, verifyFailedPlaybook } from './suites/jumpserver-matrix.js';
+import { runKafkaHandoff } from './suites/kafka.js';
 import { runHubCapabilities } from './suites/phase5-hub-capabilities.js';
 import assert from 'node:assert/strict';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
@@ -190,6 +192,8 @@ async function main() {
     const project = (path: string) => admin.json<{ id: number; path_with_namespace: string }>('/projects/' + encodeURIComponent(path));
     const projects = await Promise.all([gitlab.hubProjectPath, webRepo, apiRepo, ansibleRepo].map(project));
     const [hubProject, web, api, target] = projects;
+    // Seed the existing dev config before the suite forks this repository.
+    await gitlab.upsertFile(api.id, 'kafka.properties', 'bootstrap.servers=localhost:19092\n', 'Seed dev Kafka configuration');
     assert.equal(hubProject.id, hub);
     assert.equal(new Set(projects.map(p => p.id)).size, 4);
     const releasePath = 'agents/release/AGENT.md';
@@ -243,6 +247,7 @@ async function main() {
       assert.ok(!/https?:\/\/oauth2:(?!\*\*\*@)[^\s/@]+@/i.test(body), 'A Git URL exposed credentials');
     }
     anthropic.checkRequests(checkSecrets);
+    const podStderr: string[] = [];
     async function startPod(id: string, settings: NodeJS.ProcessEnv = {}, service: 'core' | 'delivery' = 'delivery', file = noJmsFile) {
       assert.equal(config.ANTHROPIC_BASE_URL, mock.baseUrl, 'Claude Code requires the loopback mock');
       const pod = spawn(process.execPath, ['--env-file=' + file, '--import', './scripts/e2e/observe-gitlab.mjs', 'packages/' + service + '/dist/server.js'], {
@@ -254,7 +259,11 @@ async function main() {
       pods.add(pod);
       for (const [stream, output] of [[pod.stdout!, process.stdout], [pod.stderr!, process.stderr]] as const) {
         createInterface({ input: stream }).on('line', line => {
-          try { checkSecrets(line); output.write(line + '\n'); }
+          try {
+            checkSecrets(line);
+            if (stream === pod.stderr) podStderr.push(line);
+            output.write(line + '\n');
+          }
           catch { failure ??= Error('A credential appeared in the Pod log'); }
         });
       }
@@ -657,7 +666,7 @@ async function main() {
       { assets: ['web01'], account: 'ops-first', command: 'ss -lntp', principal: 'shared' },
       { assets: ['web02'], account: 'ops-second', command: 'ss -lntp', principal: 'shared' },
     ]);
-    assert.ok(jev.requests.includes('ss -lntp') && jev.requests.length >= 2);
+    assert.ok(!jev.requests.includes('ss -lntp'), 'Equivalent ss flags must use the static allowlist');
     assert.ok((await notes(inspection)).some(n => n.body.includes('Diagnostic report: nginx is active on web01.')));
 
     const change = await openIssue('Reload nginx on web01', 'Prepare and verify a reviewed nginx reload.', 'delivery::env-change');
@@ -714,8 +723,16 @@ async function main() {
     assert.deepEqual(jms.uploads, []);
     assert.deepEqual(jms.executions, []);
 
+    let statusObserved = false;
+    anthropic.beforeNextTool('detent_close_issue', async () => {
+      await gitlab.postNote(hub, change, '/status');
+      await until('successful execution in /status', async () => (await notes(change)).some(n =>
+        n.body.includes('### 交付执行记录') && n.body.includes('SUCCESS') && n.body.includes(jms.executions[0])));
+      statusObserved = true;
+    });
     await award(change, production, 'sre');
     const final = await done(change);
+    assert.ok(statusObserved);
     assert.deepEqual((await records(id, 'session_worktrees')).map(t => t.status), ['ARCHIVED']);
     assert.equal(final.claude_session_id, first.claude_session_id);
     const [decision] = await rows('SELECT * FROM approval_requests WHERE id=?', [production.id]);
@@ -745,7 +762,10 @@ async function main() {
     assert.ok(history.every((row, i) => row.seq === i + 1));
     assert.deepEqual(await readdir(sandbox), []);
     console.log('Stage 15 branch 4 passed: signed multi-account inspection and approved Ansible execution with one AccessKey.');
-    console.log('Verified production approval, execution audit, /status, transcript and sandbox cleanup.');
+    await verifyFailedPlaybook(shared, jms);
+    await runJumpServerMatrix({ ...shared, jev }, jms, jmsServer.baseUrl, hubTemplate, podStderr);
+    await runKafkaHandoff({ ...shared, jev }, jms, api.id);
+    console.log('J-8 passed: production approval, ZIP upload, job parameters, SUCCESS audit, /status and auto-close.');
     await stopPod(true);
     if (gitlab.synthetic) {
       await gitlab.removeFile(hub, 'capabilities.json', 'Verify legacy cluster configuration');

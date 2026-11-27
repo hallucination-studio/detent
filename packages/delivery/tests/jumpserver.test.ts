@@ -112,7 +112,7 @@ it('fails before I/O if the required credential is missing, and never changes ro
     jobId: 'execution', status: 'SUCCESS', outputSummary: expect.stringContaining('load average'),
   });
   expect(JSON.parse(String(fetch.mock.calls[1][1]?.body))).toEqual({
-    instant: true, type: 'adhoc', module: 'shell', args: 'uptime', assets: ['web01'], runas: 'readonly', runas_policy: 'skip', timeout: 30,
+    instant: true, is_periodic: false, type: 'adhoc', module: 'shell', args: 'uptime', assets: ['web01'], runas: 'readonly', runas_policy: 'skip', timeout: 30,
   });
   reply({ status: 'running', summary: {} });
   await readOnly.getJobResult('execution');
@@ -143,7 +143,7 @@ it.each([3, 4])('runs the SHA-pinned playbook with native job parameters on v%s'
   expect(imported['site-sha/roles/test/tasks/main.yml']).toEqual(files['site-sha/roles/test/tasks/main.yml']);
   expect(form.get('scope')).toBe('private');
   expect(String(job[0])).toBe(base + '/api/v1/ops/jobs/');
-  expect(JSON.parse(String(job[1]?.body))).toEqual({ name: expect.stringMatching(/^detent-/), type: 'playbook', playbook: 'playbook-id', runas: 'ops-first', runas_policy: 'skip', assets: ['web01'], comment: 'approved' });
+  expect(JSON.parse(String(job[1]?.body))).toEqual({ name: expect.stringMatching(/^detent-/), type: 'playbook', is_periodic: false, playbook: 'playbook-id', runas: 'ops-first', runas_policy: 'skip', assets: ['web01'], comment: 'approved' });
   expect(String(execution[0])).toBe(base + '/api/v1/ops/job-executions/');
   expect(JSON.parse(String(execution[1]?.body))).toEqual({
     job: 'definition', parameters: version === 3 ? '{"jms_version":2}' : { jms_version: 2 },
@@ -185,7 +185,7 @@ it('keeps secrets out of HTTP/transport errors and inspection output on older re
   const client = new HttpJumpServerClient(loadDeliveryConfig(env));
   const secrets = [env.JUMPSERVER_JOB_TOKEN, env.JUMPSERVER_READONLY_ACCESS_KEY_ID, env.JUMPSERVER_READONLY_ACCESS_KEY_SECRET].join(' / ');
   reply({ detail: secrets }, 403);
-  await expect(client.listAssets({})).rejects.toThrow(/^JumpServer HTTP 403$/);
+  await expect(client.listAssets({})).rejects.toMatchObject({ message: 'JumpServer HTTP 403: {"detail":"*** / *** / ***"}' });
   fetch.mockRejectedValueOnce(Error('network: ' + secrets));
   await expect(client.listAssets({})).rejects.toThrow('network: *** / *** / ***');
   reply({ status: 'failed', summary: { message: secrets } }); reply({}, 404); reply({ data: secrets });
@@ -382,21 +382,25 @@ it('evaluates eligible remote diagnostics once, preserves quoted arguments and c
     'df --sync', 'sed -i s/a/b/ f', 'find . -exec ls', "awk 'system(cmd)'",
   ]) expect(await gate.canUseTool(tool, { asset_ids: ['web01'], command }), command).toMatchObject({ behavior: 'deny' });
   expect(decide).not.toHaveBeenCalled();
-  for (const command of ['ss -lntp', 'journalctl -u nginx -n 20', 'ps aux | grep nginx',
+  await gate.invokeExtension(tool, { asset_ids: ['web01'], command: 'ss -lntp' });
+  expect(decide).not.toHaveBeenCalled();
+  for (const command of ['journalctl -u nginx -n 20', 'ps aux | grep nginx',
     "ps aux | grep 'two  words'", 'curl -sI http://127.0.0.1/healthz']) {
     await gate.invokeExtension(tool, { asset_ids: ['web01'], command });
     expect(decide.mock.lastCall?.[0]).toEqual({ surface: 'remote_jumpserver_readonly_inspect', command });
     expect(client.runReadonlyInspect).toHaveBeenLastCalledWith({ assetIds: ['web01'], account: undefined, command });
   }
-  expect(decide).toHaveBeenCalledTimes(5);
+  expect(decide).toHaveBeenCalledTimes(4);
   await expect(gate.invokeExtension(tool, { asset_ids: ['restricted'], command: 'ss -lntp' })).rejects.toThrow('黑名单');
-  for (const [choice, noul, score] of [['state_mutating', 1, 0], ['pure_readonly', 0.89, 0], ['pure_readonly', 1, 0.61]] as const) {
+  for (const [choice, noul, score] of [['state_mutating', 1, 0], ['pure_readonly', 0.74, 0], ['pure_readonly', 1, 1.4]] as const) {
     decide.mockResolvedValueOnce({ effect: { type: 'choice', choice }, zero_side_effect: { type: 'noul', noul }, impact: { type: 'score', score } });
-    await expect(gate.invokeExtension(tool, { asset_ids: ['web01'], command: 'ss -lntp' })).rejects.toThrow('delivery::env-change');
+    await expect(gate.invokeExtension(tool, { asset_ids: ['web01'], command: 'date' })).rejects.toThrow(`Jev: choice=${choice}, noul=${noul}, impact=${score}`);
   }
+  decide.mockResolvedValueOnce({ effect: { type: 'choice', choice: 'pure_readonly' }, zero_side_effect: { type: 'noul', noul: 0.75 }, impact: { type: 'score', score: 1.35 } });
+  await gate.invokeExtension(tool, { asset_ids: ['web01'], command: 'date' });
   decide.mockRejectedValueOnce(Error('provider timeout'));
-  await expect(gate.invokeExtension(tool, { asset_ids: ['web01'], command: 'ss -lntp' })).rejects.toThrow('delivery::env-change');
-  expect(client.runReadonlyInspect).toHaveBeenCalledTimes(6);
+  await expect(gate.invokeExtension(tool, { asset_ids: ['web01'], command: 'date' })).rejects.toThrow('provider timeout');
+  expect(client.runReadonlyInspect).toHaveBeenCalledTimes(7);
 });
 
 it('lists real, active accounts in server order and falls back to asset detail only on 404', async () => {
@@ -463,7 +467,7 @@ it('requires a common account for playbooks and rejects empty authorizations bef
       () => client.runAnsibleJob({ ...request, account, assetIds })]) {
       reply(['root']);
       reply(['@USER', '@ANON', { username: 'root', is_active: false }]);
-      await expect(invoke()).rejects.toThrow('资产 web02 没有可用的真实授权账号');
+      await expect(invoke()).rejects.toThrow('资产 web02 在 JumpServer 中未给当前 API Key 授权任何登录账号');
     }
   }
   expect(fetch.mock.calls.every(([url, init]) => String(url).endsWith('/accounts/') && init?.method === 'GET')).toBe(true);

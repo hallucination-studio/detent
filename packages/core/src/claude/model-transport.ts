@@ -1,8 +1,35 @@
-import { redactGitUrl, scrubJson } from '../gitlab/redact.js';
+import { formatHttpError, logError, redactGitUrl, scrubJson } from '../gitlab/redact.js';
 import { once } from 'node:events';
-import { createServer, request as httpRequest } from 'node:http';
+import { createServer, request as httpRequest, type IncomingMessage } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import type { AddressInfo } from 'node:net';
+
+async function readModelError(response: IncomingMessage, status: number, secrets: readonly string[]) {
+  const buffer = Buffer.alloc(2048);
+  let size = 0;
+  let incomplete = false;
+  try {
+    for await (const chunk of response) {
+      size += (chunk as Buffer).copy(buffer, size);
+      if (size === buffer.length) { incomplete = true; break; }
+    }
+  } catch (error) {
+    const detail = logError('model-transport', error, secrets, 'Model HTTP ' + status);
+    if (!size) return detail;
+    incomplete = true;
+  }
+  const text = new TextDecoder().decode(buffer.subarray(0, size), { stream: incomplete });
+  if (!incomplete) return text;
+
+  // The last retained bytes may be only a prefix of a credential.
+  let end = text.length;
+  for (const secret of secrets) {
+    for (let i = Math.max(0, text.length - secret.length); i < end; i++) {
+      if (secret.startsWith(text.slice(i))) { end = i; break; }
+    }
+  }
+  return text.slice(0, end) + (end < text.length ? '***…' : '…');
+}
 
 // Claude Code runs shell tools with its own environment. Authenticate only the
 // upstream Messages request in the parent and stream SSE back to this turn.
@@ -10,6 +37,7 @@ export async function openModelTransport(baseUrl: string, apiKey: string, secret
   const base = new URL(baseUrl);
   if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash)
     throw Error('Invalid ANTHROPIC_BASE_URL');
+  const credentials = [apiKey, ...secrets].filter(Boolean);
   const server = createServer(async (req, res) => {
     const path = req.url ?? '';
     if (req.method !== 'POST' || !/^\/v1\/messages(?:\/count_tokens)?(?:\?[^#]*)?$/.test(path) ||
@@ -25,11 +53,12 @@ export async function openModelTransport(baseUrl: string, apiKey: string, secret
       for await (const chunk of req) chunks.push(Buffer.from(chunk));
       const message = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       for (const key of ['messages', 'system', 'tools', 'metadata']) {
-        if (Object.hasOwn(message, key)) message[key] = scrubJson(message[key], value => redactGitUrl(value, secrets));
+        if (Object.hasOwn(message, key)) message[key] = scrubJson(message[key], value => redactGitUrl(value, credentials));
       }
       body = JSON.stringify(message);
-    } catch {
-      res.writeHead(400).end('Invalid model request');
+    } catch (error) {
+      const detail = logError('model-transport', error, credentials);
+      res.writeHead(400).end('Invalid model request: ' + detail);
       return;
     }
     const headers: Record<string, string> = { 'content-type': 'application/json' };
@@ -39,21 +68,24 @@ export async function openModelTransport(baseUrl: string, apiKey: string, secret
       if (typeof value === 'string') headers[name] = value;
     }
     const send = base.protocol === 'https:' ? httpsRequest : httpRequest;
-    const upstream = send(base.href.replace(/\/$/, '') + path, { method: 'POST', headers }, response => {
-      // Do not pass through redirects, authentication headers or provider error diagnostics.
-      if (!response.statusCode || response.statusCode >= 300) {
-        response.resume();
-        res.writeHead(response.statusCode ?? 502).end('Model request failed');
+    function socketError(error: unknown) {
+      const detail = logError('model-transport', error, credentials);
+      if (res.headersSent) res.destroy();
+      else res.writeHead(502).end('Model request failed: ' + detail);
+    }
+    const upstream = send(base.href.replace(/\/$/, '') + path, { method: 'POST', headers }, async response => {
+      const status = response.statusCode ?? 502;
+      if (status >= 300) {
+        const raw = await readModelError(response, status, credentials);
+        logError('model-transport', 'Model HTTP ' + status, credentials, raw);
+        res.writeHead(status).end(formatHttpError('Model', status, raw, credentials));
         return;
       }
-      res.writeHead(response.statusCode, { 'content-type': response.headers['content-type'] ?? 'application/json' });
-      response.on('error', () => res.destroy());
+      res.writeHead(status, { 'content-type': response.headers['content-type'] ?? 'application/json' });
+      response.on('error', socketError);
       response.pipe(res);
     });
-    upstream.on('error', () => {
-      if (res.headersSent) res.destroy();
-      else res.writeHead(502).end('Model request failed');
-    });
+    upstream.on('error', socketError);
     res.on('close', () => upstream.destroy());
     upstream.end(body);
   });

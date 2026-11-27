@@ -16,7 +16,11 @@ export async function playbookUpload(
   url.searchParams.set('sha', request.commitSha);
   // GitLab's HotlinkingDetector rejects archive downloads carrying Node fetch's default Sec-Fetch-Mode: cors.
   const res = await fetch(url, { headers: { 'PRIVATE-TOKEN': gitlab.gitlabToken }, mode: 'same-origin', redirect: 'error', signal });
-  if (!res.ok || !res.body) throw Error('GitLab archive HTTP ' + res.status);
+  if (!res.ok) {
+    const raw = await res.text().catch(error => String(error));
+    throw Error('GitLab archive HTTP ' + res.status + (raw ? ': ' + raw : ''));
+  }
+  if (!res.body) throw Error('GitLab archive response has no body');
 
   // Bound both the download and inflation before allocating the working tree.
   const maxBytes = 64 * 1024 * 1024;

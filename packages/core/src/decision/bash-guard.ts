@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { redactGitUrl } from '../gitlab/redact.js';
+import { logError, redactGitUrl } from '../gitlab/redact.js';
 import { isHubScopePath } from '../workspace/hub-paths.js';
 import type { DecisionClient, DecisionQuestion } from './jev-client.js';
 
@@ -78,11 +78,12 @@ export async function evaluateLocalBash(decision: DecisionClient, command: strin
       command: redactGitUrl(command), description: typeof description === 'string' ? redactGitUrl(description) : '',
     }, questions);
     if (category.type !== 'choice' || safety.type !== 'noul' || impact.type !== 'score' ||
-        !Object.hasOwn(questions.category.criteria, category.choice)) throw Error();
+        !Object.hasOwn(questions.category.criteria, category.choice)) throw Error('Invalid Jev Bash decision');
     const allowed = (category.choice === 'readonly_inspect' || (!readonly && category.choice === 'workspace_dev')) &&
-      safety.noul >= decision.threshold && safety.noul <= 1 && impact.score >= 0 && impact.score <= (readonly ? 0.6 : 1.4);
+      safety.noul >= decision.threshold && safety.noul <= 1 && impact.score >= 0 && impact.score <= (readonly ? 1.2 : 1.4);
     return { allowed, confidence: safety.noul, riskNote: `分类 ${category.choice}，安全概率 ${safety.noul.toFixed(2)}，影响等级 ${impact.score.toFixed(2)}` };
-  } catch {
-    return { allowed: false, riskNote: '决策评估超时或不可用' };
+  } catch (error) {
+    const detail = logError('bash-guard', error);
+    return { allowed: false, riskNote: '决策评估超时或不可用：' + detail };
   }
 }

@@ -1,5 +1,5 @@
 import { renderNote } from './note-streamer.js';
-import { configuredSecrets, redactGitUrl } from './redact.js';
+import { configuredSecrets, formatHttpError, logError, redactGitUrl } from './redact.js';
 import type { AppConfig } from '../config.js';
 import type { GitLabUser, SessionStatus } from '../types.js';
 
@@ -87,8 +87,8 @@ const labels: Record<SessionStatus, string> = {
 };
 export { redactGitUrl };
 export class GitLabError extends Error {
-  constructor(readonly status: number) {
-    super('GitLab HTTP ' + status);
+  constructor(readonly status: number, detail = 'GitLab HTTP ' + status) {
+    super(detail);
   }
 }
 async function onNotFound<T, F>(request: Promise<T>, fallback: F): Promise<T | F> {
@@ -113,8 +113,18 @@ export class GitLabClient {
       redirect: 'error',
       signal: AbortSignal.timeout(30000),
       body: body && JSON.stringify(body),
+    }).catch(error => {
+      throw Error(logError('gitlab', error, this.secrets, method + ' ' + path));
     });
-    if (!response.ok) throw new GitLabError(response.status);
+    if (!response.ok) {
+      const context = method + ' ' + path + ' HTTP ' + response.status;
+      const raw = await response.text().catch(error => {
+        logError('gitlab', error, this.secrets, context);
+        return '';
+      });
+      logError('gitlab', context, this.secrets, raw);
+      throw new GitLabError(response.status, formatHttpError('GitLab', response.status, raw, this.secrets));
+    }
     return response;
   }
   private async json<T>(path: string, method = 'GET', body?: object): Promise<T> {

@@ -191,7 +191,7 @@ export async function runMrScenarios(h: Harness) {
     assert.equal(repliesInThread.length, 1);
     const body = repliesInThread[0].body;
     assert.match(body, /Reviewed both the config defaults and the override\./);
-    assert.match(body, /<details><summary>📎 执行记录（[1-9]\d* 步）[\s\S]*查看 MR 评审讨论[\s\S]*<\/details>/);
+    assert.match(body, /<details><summary>🔍 工具调用轨迹（[1-9]\d* 步）[\s\S]*detent_list_mr_discussions[\s\S]*<\/details>/);
     replies.push(body);
   }
   assert.equal(replies[0], replies[1]);

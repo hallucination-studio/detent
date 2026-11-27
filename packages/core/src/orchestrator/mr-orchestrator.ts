@@ -201,7 +201,8 @@ export class MergeRequestOrchestrator extends TurnRuntime {
     const channel = this.channel(s, discussions[0]);
     const { controller } = active;
     const host = new EphemeralSandbox(this.config, this.repo, this.gitlab);
-    const redact = (text: string) => redactGitUrl(text, configuredSecrets(this.config));
+    const secrets = configuredSecrets(this.config);
+    const redact = (text: string) => redactGitUrl(text, secrets);
     let sandbox: TurnSandbox | undefined;
     let streamer: NoteStreamer | undefined;
     try {
@@ -225,7 +226,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
       s.status = plan ? 'PLANNING' : 'CODING';
       await this.repo.updateSessionState(s.id, { status: s.status, activeNoteId: note.id,
         permissionMode: s.permissionMode, claudeSessionId: s.claudeSessionId });
-      streamer = new NoteStreamer(this.config.noteStreamThrottleMs, body => channel.updateNote(note.id, redact(body) + footer), async () => '');
+      streamer = new NoteStreamer(this.config.noteStreamThrottleMs, body => channel.updateNote(note.id, body + footer), async () => '', secrets);
       sandbox = await host.prepareTurnSandbox(s);
       const tree = await host.ensureMrWorktree(sandbox, s.id, { sourceProjectId: mr.source_project_id, sourceBranch: mr.source_branch, targetBranch: mr.target_branch });
       const transcript = new TranscriptHydrator(this.repo, configuredSecrets(this.config));

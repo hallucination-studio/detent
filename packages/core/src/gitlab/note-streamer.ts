@@ -15,13 +15,17 @@ function backtickFence(text: string, minimum: number) {
   return '`'.repeat(length);
 }
 
+function inlineCode(text: string) {
+  const literal = text.replace(/[\r\n]+/g, ' ');
+  const fence = backtickFence(literal, 1);
+  return fence.length === 1 ? fence + literal + fence : fence + ' ' + literal + ' ' + fence;
+}
+
 export function escapeTableCell(text: string, format: 'text' | 'code' = 'text') {
   const value = text.replace(/[\r\n]+/g, ' ');
   if (format === 'text') return value.replace(/[\\|`\[\]<>]/g, '\\$&');
   const literal = value.replace(/(\\*)\|/g, '$1$1\\|');
-  const fence = backtickFence(literal, 1);
-  if (fence.length === 1) return fence + literal + fence;
-  return fence + ' ' + literal + ' ' + fence;
+  return inlineCode(literal);
 }
 
 function codeFence(text: string, lang = '') {
@@ -102,8 +106,32 @@ export function renderToolApprovalCard(
     : codeFence(JSON.stringify(a.toolInput, null, 2), 'json');
   return renderNote(['### 🛡️ 工具执行审批', a.toolName, details, footer].join('\n\n'));
 }
+export interface ToolStep {
+  id: string;
+  name: string;
+  input: string;
+  result: string;
+}
+
+function renderTrace(steps: Map<string, ToolStep>) {
+  if (!steps.size) return '';
+  const lines = ['<details><summary>🔍 工具调用轨迹（' + steps.size + ' 步）</summary>', ''];
+  let index = 0;
+  for (const { name, input, result } of steps.values()) {
+    index++;
+    if (steps.size > 60 && index > 30 && index <= steps.size - 30) {
+      if (index === 31) lines.push('', `…（中间省略 ${steps.size - 60} 步）…`, '');
+      continue;
+    }
+    const indent = ' '.repeat(String(index).length + 2);
+    lines.push(`${index}. **${inlineCode(name)}** ${inlineCode(input)}  `,
+      `${indent}↳ ${inlineCode(result)}`);
+  }
+  return [...lines, '', '</details>'].join('\n');
+}
+
 export class NoteStreamer {
-  private steps: string[] = [];
+  private steps = new Map<string, ToolStep>();
   private timer?: NodeJS.Timeout;
   private pending = Promise.resolve('');
   private revision = 0;
@@ -113,35 +141,16 @@ export class NoteStreamer {
     private throttle: number,
     private update: (body: string) => Promise<void>,
     private summary: () => Promise<string>,
+    private secrets?: readonly string[],
   ) {}
   private draft = '';
   appendText(delta: string) {
     this.draft += delta;
     this.schedule();
   }
-  push(step: string) {
-    if (this.steps.at(-1) === step) return;
-    this.steps.push(step);
+  push(step: ToolStep) {
+    this.steps.set(step.id, step);
     this.schedule();
-  }
-  private traceSteps() {
-    const steps: string[] = [];
-    let project: string | undefined;
-    const reads = new Set<string>();
-    const flushReads = () => {
-      if (reads.size > 1) steps.push(`读取 ${project} 内 ${reads.size} 个文件`);
-      else steps.push(...reads);
-      reads.clear();
-    };
-    for (const step of this.steps) {
-      const directory = /^读取 ([^/]+)\/.+/.exec(step)?.[1];
-      if (directory !== project) flushReads();
-      project = directory;
-      if (project) reads.add(step);
-      else steps.push(step);
-    }
-    flushReads();
-    return steps;
   }
   private schedule() {
     this.revision++;
@@ -157,15 +166,8 @@ export class NoteStreamer {
       .then(async previous => {
         if (this.written === this.revision) return previous;
         const revision = this.revision;
-        const steps = this.traceSteps();
-        const trace = steps.length && [
-          '<details><summary>📎 执行记录（' + steps.length + ' 步）</summary>',
-          '',
-          ...steps.map((s) => '- ' + escapeTableCell(s, 'code')),
-          '',
-          '</details>',
-        ].join('\n');
-        const body = renderNote([this.heading, this.draft, trace, await this.summary()].filter(Boolean).join('\n\n'));
+        const body = renderNote([this.heading, this.draft, renderTrace(this.steps), await this.summary()]
+          .filter(Boolean).join('\n\n'), this.secrets);
         await this.update(body);
         this.written = revision;
         return body;

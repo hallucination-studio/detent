@@ -194,6 +194,7 @@ export class SessionOrchestrator extends TurnRuntime {
         this.config.noteStreamThrottleMs,
         (body) => channel.updateNote(note.id, body),
         () => this.summary(s.id),
+        configuredSecrets(this.config),
       );
       const systemPrompt = buildSystemPrompt(
         s,

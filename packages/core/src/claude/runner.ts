@@ -1,6 +1,7 @@
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-code';
 import { z } from 'zod';
-import path from 'node:path';
+import type { ToolStep } from '../gitlab/note-streamer.js';
+import { ToolTrace } from './tool-trace.js';
 import buffer from 'node:buffer';
 import { configuredSecrets, redactGitUrl } from '../gitlab/redact.js';
 import { openModelTransport } from './model-transport.js';
@@ -9,7 +10,7 @@ import { formatInboxMessages } from '../orchestrator/turn-runtime.js';
 import type { IssueSessionRow, SessionInboxRow } from '../types.js';
 import type { TurnSandbox } from '../workspace/ephemeral-sandbox.js';
 import { schemas, type ToolName, type WorkspaceTools } from '../workspace/mcp-tools.js';
-import type { PermissionGate } from './permission-gate.js';
+import { ToolDenied, type PermissionGate } from './permission-gate.js';
 
 const textDelta = z.object({
   type: z.literal('content_block_delta'),
@@ -26,47 +27,15 @@ export interface TurnInput {
   controller: AbortController;
   gate: PermissionGate;
   tools: WorkspaceTools;
-  progress: (step: string) => void;
+  progress: (step: ToolStep) => void;
   appendText?: (delta: string) => void;
 }
 export interface ClaudeRunner {
   run(turn: TurnInput): Promise<string>;
 }
-const toolLabels: Record<string, string> = {
-  detent_list_projects: '查询 GitLab 仓库列表',
-  detent_close_worktree: '归档工作树',
-  detent_commit_and_push: '提交推送分支',
-  detent_create_mr: '创建或更新 Merge Request',
-  detent_get_pipeline_status: '查询流水线状态',
-  detent_get_pipeline_job_log: '查看流水线任务日志',
-  detent_get_mr_diff: '查看 MR 代码变更',
-  detent_list_mr_discussions: '查看 MR 评审讨论',
-  detent_sync_target_branch: '同步目标分支',
-  detent_check_project_onboarding: '检查仓库接入状态',
-  detent_onboard_project: '配置仓库 Webhook',
-  detent_list_tags: '查询历史 Tag',
-  detent_create_release: '创建 Tag / Release',
-};
-
-export function formatToolProgress(name: string, input: Record<string, unknown>, sandbox: TurnSandbox,
-  redact: (value: string) => string, description?: string, jevConfidence?: number): string | null {
-  let label = Object.hasOwn(toolLabels, name) ? toolLabels[name] : description;
-  if (['Glob', 'Grep', 'detent_close_issue'].includes(name)) return null;
-  if (name === 'Read' || name === 'Edit' || name === 'Write') {
-    if (typeof input.file_path !== 'string') return null;
-    const relative = path.relative(sandbox.workspaceRoot, path.resolve(sandbox.workspaceRoot, input.file_path));
-    const projectPath = /^projects\/([^/]+\/.+)$/.exec(relative)?.[1];
-    if (name === 'Read' && !projectPath) return null;
-    label = (name === 'Read' ? '读取 ' : '修改 ') + (projectPath ?? relative);
-  } else if (name === 'Bash' && typeof input.command === 'string') {
-    label = '执行命令：' + input.command.replaceAll(sandbox.workspaceRoot + '/', '').replaceAll(sandbox.workspaceRoot, '.').replaceAll(sandbox.rootDir, '.');
-  } else if (name === 'detent_checkout_project' || name === 'detent_checkout_worktree') {
-    label = '检出仓库 ' + input.project;
-  }
-  if (!label) return null;
-  const clean = redact(label).replace(/\s+/g, ' ').trim();
-  const summary = clean.length > 100 ? clean.slice(0, 99) + '…' : clean;
-  return name === 'Bash' && jevConfidence !== undefined ? summary + '（已自动放行）' : summary;
+const mcpMetadata = z.object({ _meta: z.object({ 'claudecode/toolUseId': z.string() }) });
+function mcpToolId(extra: unknown) {
+  return mcpMetadata.safeParse(extra).data?._meta['claudecode/toolUseId'];
 }
 
 export class SdkClaudeRunner implements ClaudeRunner {
@@ -76,53 +45,59 @@ export class SdkClaudeRunner implements ClaudeRunner {
     const secrets = configuredSecrets(this.config);
     const redact = (value: string) => redactGitUrl(value, secrets);
     const id = session.claudeSessionId!;
-    const canUseTool = async (name: string, input: Record<string, unknown>) => {
-      const { jevConfidence, ...result } = await gate.canUseTool(name, input);
-      if (result.behavior === 'allow') {
-        const step = formatToolProgress(name, input, sandbox, redact, undefined, jevConfidence);
-        if (step) t.progress(step);
+    const trace = new ToolTrace(t.progress, redact);
+    const failed = new Set<string>();
+    const canUseTool = async (name: string, input: Record<string, unknown>, step = trace.handler(name, input)) => {
+      const { jevConfidence: _confidence, ...decision } = await gate.canUseTool(name, input);
+      if (decision.behavior === 'deny') {
+        failed.add(step.id);
+        trace.update(step, decision.message, '⛔ 已拦截：');
+      } else {
+        trace.pending(step);
       }
-      return result;
+      return decision;
     };
-    const invoke = async (name: ToolName, input: Record<string, unknown>) => {
-      const permission = await canUseTool(name, input);
-      if (permission.behavior === 'deny') throw Error(permission.message);
-      t.controller.signal.throwIfAborted();
-      return t.tools.invoke(name, permission.updatedInput);
-    };
-    const result = async (operation: Promise<unknown>) => {
+    const invoke = async (name: string, input: Record<string, unknown>, extra: unknown,
+      operation: (step: ToolStep) => Promise<unknown>) => {
+      const step = trace.handler('mcp__detent__' + name, input, mcpToolId(extra));
+      trace.pending(step);
       try {
-        const text = JSON.stringify(await operation, (_key, value) => typeof value === 'string' ? redact(value) : value);
-        return { content: [{ type: 'text' as const, text: text ?? '' }] };
+        const output = await operation(step);
+        const text = JSON.stringify(output, (_key, value) => typeof value === 'string' ? redact(value) : value);
+        trace.update(step, output);
+        return { content: [{ type: 'text' as const, text: redact(text ?? '') }] };
       } catch (error) {
-        throw Error(redact(error instanceof Error ? error.message : String(error)));
+        const message = error instanceof Error ? error.message : String(error);
+        if (!failed.has(step.id)) trace.update(step, message, error instanceof ToolDenied ? '⛔ 已拦截：' : '❌ ');
+        failed.add(step.id);
+        throw Error(redact(message));
       }
     };
     const server = createSdkMcpServer({
       name: 'detent',
       tools: [
         ...(t.allowedWorkspaceTools ?? Object.keys(schemas) as ToolName[]).map(name =>
-          tool(name, 'GitLab workspace: ' + name, schemas[name], async (input) =>
-            result(invoke(name, input)),
-          ),
+          tool(name, 'GitLab workspace: ' + name, schemas[name], (input, extra) =>
+            invoke(name, input, extra, async step => {
+              const decision = await canUseTool(name, input, step);
+              if (decision.behavior === 'deny') throw Error(decision.message);
+              t.controller.signal.throwIfAborted();
+              return t.tools.invoke(name, decision.updatedInput);
+            })),
         ),
         ...Array.from(gate.extensionTools, ([id, extension]) =>
-          tool(extension.name, redact(extension.description), extension.schema, async (input) => {
-            const output = await result(gate.invokeExtension(id, input));
-            const step = formatToolProgress(extension.name, input, sandbox, redact, extension.description);
-            if (step) t.progress(step);
-            return output;
-          }),
+          tool(extension.name, redact(extension.description), extension.schema, (input, extra) =>
+            invoke(extension.name, input, extra, () => gate.invokeExtension(id, input))),
         ),
         tool(
           'AskUserQuestion',
           'Ask a question on GitLab',
           { questions: z.array(z.object({ question: z.string() })).min(1) },
-          async (input) => {
-            const decision = await canUseTool('AskUserQuestion', input);
+          (input, extra) => invoke('AskUserQuestion', input, extra, async step => {
+            const decision = await canUseTool('AskUserQuestion', input, step);
             if (decision.behavior === 'deny') throw Error(decision.message);
-            return result(Promise.resolve(decision.updatedInput.answers));
-          },
+            return decision.updatedInput.answers;
+          }),
         ),
       ],
     });
@@ -158,12 +133,24 @@ export class SdkClaudeRunner implements ClaudeRunner {
       const messages = query({
         prompt: redact(t.prompt),
         options: {
-          hooks: drainInbox && { PostToolUse: [{ hooks: [async () => {
-            const items = await drainInbox();
-            return items.length ? { hookSpecificOutput: {
-              hookEventName: 'PostToolUse', additionalContext: redact(formatInboxMessages(items, this.config.jevApiKey)),
-            } } : {};
-          }] }] },
+          hooks: {
+            PreToolUse: [{ hooks: [async (input, toolUseID) => {
+              if (input.hook_event_name === 'PreToolUse') {
+                trace.sdkCall(toolUseID, input.tool_name, input.tool_input, true);
+              }
+              return {};
+            }] }],
+            PostToolUse: [{ hooks: [async (input, toolUseID) => {
+              if (input.hook_event_name === 'PostToolUse') {
+                const step = trace.sdkCall(toolUseID, input.tool_name, input.tool_input);
+                if (!failed.has(step.id)) trace.update(step, input.tool_response);
+              }
+              const items = await drainInbox?.();
+              return items?.length ? { hookSpecificOutput: {
+                hookEventName: 'PostToolUse', additionalContext: redact(formatInboxMessages(items, this.config.jevApiKey)),
+              } } : {};
+            }] }],
+          },
           stderr: (chunk) => {
             diagnostic = (diagnostic + chunk).slice(-2000);
           },
@@ -215,8 +202,24 @@ export class SdkClaudeRunner implements ClaudeRunner {
       };
       t.controller.signal.addEventListener('abort', interrupt, { once: true });
       if (t.controller.signal.aborted) interrupt();
+      // Validation can fail before either hook or the permission callback fires.
+      const calls = new Map<string, { name: string; input: unknown }>();
       for await (const message of messages) {
         if (message.session_id !== id) throw Error('Claude session identity changed');
+        if (message.type === 'assistant') {
+          for (const block of message.message.content)
+            if (block.type === 'tool_use') calls.set(block.id, { name: block.name, input: block.input });
+        }
+        if (message.type === 'user' && Array.isArray(message.message.content)) {
+          for (const block of message.message.content) {
+            if (block.type !== 'tool_result') continue;
+            const call = calls.get(block.tool_use_id);
+            calls.delete(block.tool_use_id);
+            if (!block.is_error) continue;
+            const step = trace.lookup(block.tool_use_id) ?? (call && trace.sdkCall(block.tool_use_id, call.name, call.input));
+            if (step && !failed.has(step.id)) trace.update(step, block.content, '❌ ');
+          }
+        }
         if (message.type === 'stream_event' && t.appendText) {
           const fragment = textDelta.safeParse(message.event);
           if (fragment.success) t.appendText(fragment.data.delta.text);

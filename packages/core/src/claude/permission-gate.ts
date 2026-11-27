@@ -21,6 +21,7 @@ type Input = Record<string, unknown>;
 type GateResult = PermissionResult & { approvalId?: string; jevConfidence?: number };
 type Decision = 'APPROVED' | 'REJECTED';
 const deny = (message: string): PermissionResult => ({ behavior: 'deny', message });
+export class ToolDenied extends Error {}
 export class ColdHold extends Error {
   constructor(pending: ApprovalRequestRow) {
     super(renderStatus('WAITING_TOOL', pending));
@@ -178,11 +179,11 @@ export class PermissionGate {
     const tool = this.extensionTools.get(id);
     if (!tool) throw Error('未启用此工具');
     const decision = await this.canUseTool(id, input);
-    if (decision.behavior === 'deny') throw Error(decision.message);
+    if (decision.behavior === 'deny') throw new ToolDenied(decision.message);
     const ctx = decision.approvalId ? { ...this.extensionContext, approvalId: decision.approvalId } : this.extensionContext;
     if (tool.policy === 'always_approve') {
       const checked = await tool.guard?.(decision.updatedInput, ctx);
-      if (checked && !checked.ok) throw Error(checked.reason);
+      if (checked && !checked.ok) throw new ToolDenied(checked.reason);
     }
     this.ctx.controller.signal.throwIfAborted();
     return tool.execute(decision.updatedInput, ctx);

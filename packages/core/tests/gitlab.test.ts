@@ -1,4 +1,5 @@
-import { formatToolProgress } from '../src/claude/runner.js';
+import { ToolTrace } from '../src/claude/tool-trace.js';
+import { configuredSecrets, redactGitUrl } from '../src/gitlab/redact.js';
 import { it, expect, vi } from 'vitest';
 import { createMrChannel } from '../src/orchestrator/channel.js';
 import { stripBotMention, hasBotMention, parseNoteIntent, parseEmojiIntent } from '../src/gitlab/command-parser.js';
@@ -138,7 +139,7 @@ it('coalesces 20 events, serializes final flush and redacts approval cards and t
     const url = 'https://oauth2:secret@git/repo';
     const update = vi.fn(async () => {});
     const streamer = new NoteStreamer(200, update, async () => renderSummary([], []));
-    for (let i = 0; i < 20; i++) streamer.push('step ' + i + ' ' + url);
+    for (let i = 0; i < 20; i++) streamer.push({ id: String(i), name: 'Read', input: 'step ' + i, result: url });
     streamer.appendText('正在分析');
     await vi.advanceTimersByTimeAsync(200);
     await streamer.flush();
@@ -146,7 +147,7 @@ it('coalesces 20 events, serializes final flush and redacts approval cards and t
     const body = update.mock.calls.flat().join('');
     for (const fragment of [
       '正在分析',
-      '📎 执行记录（20 步）',
+      '🔍 工具调用轨迹（20 步）',
       'step 19',
       '<details>',
       'oauth2:***@',
@@ -168,29 +169,45 @@ it('coalesces 20 events, serializes final flush and redacts approval cards and t
   }
 });
 
-it('keeps Hub discovery silent and summarizes only business actions with redacted arguments', async () => {
-  const sandbox = { rootDir: '/turn', workspaceRoot: '/turn/work', claudeHome: '/turn/home' };
-  const format = (name: string, input = {}, description?: string, confidence?: number) =>
-    formatToolProgress(name, input, sandbox, text => text.replaceAll('private-value', '***'), description, confidence);
-  for (const name of ['Glob', 'Grep', 'detent_close_issue']) expect(format(name)).toBeNull();
-  for (const file of ['CLAUDE.md', 'agents/a/AGENT.md', 'skills/s/SKILL.md', 'README.md', 'events.json', '/etc/projects/x/y', 'projects/../secret'])
-    expect(format('Read', { file_path: file })).toBeNull();
-  for (const name of ['Edit', 'Write'])
-    expect(format(name, { file_path: 'projects/web/private-value.ts' })).toBe('修改 web/***.ts');
-  expect(format('detent_checkout_worktree', { project: 'apps/web' })).toBe('检出仓库 apps/web');
-  expect(format('Bash', { command: 'echo private-value' }, undefined, 0)).toBe('执行命令：echo ***（已自动放行）');
-  expect(format('remote__inspect', {}, '检查 private-value')).toBe('检查 ***');
-  const stream = new NoteStreamer(200, vi.fn(), async () => '');
-  expect(await stream.flush()).toBe('⏳ 正在处理…');
-  for (const file of ['web/a', 'web/a', 'web/sub/b', 'api/a', 'web/c']) {
-    const step = format('Read', { file_path: '/turn/work/projects/' + file });
-    expect(step).toBe('读取 ' + file);
-    stream.push(step!);
+it('renders every invocation separately with its raw paths and redacted arguments and results', async () => {
+  const credentials = { GITLAB_TOKEN: 'git-secret', ANTHROPIC_API_KEY: 'model-secret', JEV_API_KEY: 'jev-secret',
+    GITLAB_WEBHOOK_SECRET: 'hook-secret', MYSQL_PASSWORD: 'sql-secret' };
+  const config = { ...loadConfig(credentials), additionalSecrets: ['extra-"secret'] };
+  const secrets = configuredSecrets(config);
+  const sensitive = [...Object.values(credentials), ...config.additionalSecrets].join(' ');
+  const stream = new NoteStreamer(200, vi.fn(), async () => sensitive, secrets);
+  const trace = new ToolTrace(step => stream.push(step), text => redactGitUrl(text, secrets));
+  const path = '/turn/./Hub  Workspace/CLAUDE.md';
+  const names = ['Glob', 'Grep', 'Read', 'Read', 'Edit', 'Write', 'Bash', 'mcp__detent__detent_list_projects', 'mcp__remote__scan'];
+  for (const [index, name] of names.entries()) {
+    const step = trace.sdkCall(String(index), name, { path, value: sensitive });
+    trace.pending(step);
+    trace.update(step, { output: [sensitive] });
   }
-  for (let i = 0; i < 2; i++) stream.push(format('detent_list_projects')!);
-  const body = await stream.flush('完成');
-  expect(body).toContain('📎 执行记录（4 步）');
-  expect(body.match(/^- .+$/gm)).toEqual(['- `读取 web 内 2 个文件`', '- `读取 api/a`', '- `读取 web/c`', '- `查询 GitLab 仓库列表`']);
+  const body = await stream.flush('finished');
+  const masked = '*** *** *** *** *** ***';
+  expect(body).toContain('🔍 工具调用轨迹（9 步）');
+  for (const [index, name] of names.entries()) {
+    expect(body).toContain(`${index + 1}. **\`${name.replace(/^mcp__detent__/, '')}\`** \`${JSON.stringify({ path, value: masked })}\`  \n   ↳ \`${JSON.stringify({ output: [masked] })}\``);
+  }
+  expect(body).not.toContain('secret');
+  expect(body).not.toContain('执行中');
+});
+
+it('limits long previews before fencing and keeps the first and last 30 numbered invocations', async () => {
+  const stream = new NoteStreamer(200, vi.fn(), async () => '');
+  const trace = new ToolTrace(step => stream.push(step), text => text.replaceAll('test-secret', '***'));
+  const value = 'x'.repeat(290) + 'test-secret' + '😀'.repeat(20);
+  for (let i = 1; i <= 63; i++) trace.update(trace.sdkCall(String(i), 'Read', { i, value }), value);
+  const body = await stream.flush();
+  expect(body).toContain('🔍 工具调用轨迹（63 步）');
+  expect(body.match(/^\d+\. /gm)).toHaveLength(60);
+  expect(body).toContain('…（中间省略 3 步）…');
+  expect(body).toMatch(/30\. [^\n]+…`/);
+  expect(body).toMatch(/34\. [^\n]+…`/);
+  expect(body).not.toMatch(/^3[123]\. /m);
+  expect(body).toContain('↳ `' + 'x'.repeat(290) + '***😀😀😀…`');
+  expect(body).not.toMatch(/test-sec|�/);
 });
 
 it('publishes a text-only result without empty sections or executable quick actions', async () => {

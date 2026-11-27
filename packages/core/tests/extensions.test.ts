@@ -170,7 +170,71 @@ it('registers only enabled extensions with the SDK and disables Bash in both lay
   expect(guard).toHaveBeenLastCalledWith(input, expect.objectContaining({ approvalId: approval.id }));
   expect(execute).toHaveBeenCalledWith(input, guard.mock.calls[1][1]);
   expect(execute).toHaveBeenCalledOnce();
-  expect(progress.mock.calls).toEqual([['Count entries'], ['Example tool']]);
+  expect(progress.mock.calls.map(([{ name, input, result }]) => [name, input, result])).toEqual([
+    ['count', '{"entries":[4,5]}', '⏳ 执行中…'], ['count', '{"entries":[4,5]}', '2'],
+    ['example', '{"item":"sample"}', '⏳ 执行中…'], ['example', '{"item":"sample"}', 'SAMPLE'],
+  ]);
+  expect(new Set(progress.mock.calls.map(([step]) => step.id)).size).toBe(2);
+});
+
+it('correlates SDK permissions, MCP handlers, hooks and streamed errors without an inbox', async () => {
+  const { ctx, execute, guard } = await setup('default', 'readonly');
+  const { session, controller, config } = ctx;
+  const gate = new PermissionGate({ ...ctx, workspaceRoot: process.cwd() });
+  config.additionalSecrets = ['private-value'];
+  const sandbox = { workspaceRoot: ctx.workspaceRoot, rootDir: '/turn', claudeHome: '/home' };
+  const tools = new WorkspaceTools(new EphemeralSandbox(config, ctx.repo, ctx.gitlab), sandbox, session.id);
+  const progress = vi.fn();
+  vi.mocked(query).mockImplementationOnce(({ options }) => (async function* () {
+    const signal = { signal: controller.signal };
+    const hookInput = { cwd: ctx.workspaceRoot, transcript_path: '', session_id: 'session' };
+    const before = (id: string, name: string, input: unknown) => options!.hooks!.PreToolUse![0].hooks[0]({
+      ...hookInput, hook_event_name: 'PreToolUse', tool_name: name, tool_input: input,
+    }, id, signal);
+    const after = (id: string, name: string, input: unknown, output: unknown) => options!.hooks!.PostToolUse![0].hooks[0]({
+      ...hookInput, hook_event_name: 'PostToolUse', tool_name: name, tool_input: input, tool_response: output,
+    }, id, signal);
+    const file = { file_path: 'CLAUDE.md' };
+    for (const id of ['first', 'second']) {
+      await before(id, 'Read', file);
+      await options!.canUseTool!('Read', file, signal);
+    }
+    await after('second', 'Read', file, { text: 'successful private-value' });
+    const denied = { file_path: '/outside' };
+    await before('denied', 'Read', denied);
+    await options!.canUseTool!('Read', denied, signal);
+    yield { type: 'assistant', session_id: 'session', message: { content: [
+      { type: 'tool_use', id: 'invalid', name: 'Glob', input: { pattern: 'private-value' } },
+    ] } };
+    yield { type: 'user', session_id: 'session', message: { content: ['first', 'denied', 'invalid'].map(tool_use_id => ({
+      type: 'tool_result', tool_use_id, is_error: true, content: 'failed private-value',
+    })) } };
+    const handler = vi.mocked(createSdkMcpServer).mock.lastCall![0].tools!.find(t => t.name === 'example')!.handler;
+    for (const id of ['success', 'error', 'blocked']) {
+      await before(id, toolId, input);
+      const meta = { _meta: { 'claudecode/toolUseId': id } };
+      if (id === 'success') {
+        await handler(input, meta);
+        await after(id, toolId, input, 'SDK private-value');
+      } else {
+        if (id === 'error') execute.mockRejectedValueOnce(Error('error private-value'));
+        else guard.mockResolvedValueOnce({ ok: false, reason: 'denied private-value' });
+        await expect(handler(input, meta)).rejects.toThrow('***');
+      }
+    }
+    yield { type: 'result', subtype: 'success', session_id: 'session', result: 'finished' };
+  })() as ReturnType<typeof query>);
+  await new SdkClaudeRunner(config).run({ gate, controller, session, sandbox, tools, resume: false,
+    prompt: '', systemPrompt: '', progress });
+  const steps = new Map(progress.mock.calls.map(([step]) => [step.id, step]));
+  expect([...steps.values()].map(s => [s.id, s.name, s.result])).toEqual([
+    ['first', 'Read', '❌ failed ***'], ['second', 'Read', '{"text":"successful ***"}'],
+    ['denied', 'Read', '⛔ 已拦截：此模式或路径不允许文件操作'], ['invalid', 'Glob', '❌ failed ***'],
+    ['success', 'example', 'SDK ***'], ['error', 'example', '❌ error ***'], ['blocked', 'example', '⛔ 已拦截：denied ***'],
+  ]);
+  expect(steps.get('invalid').input).toBe('{"pattern":"***"}');
+  expect(progress.mock.calls[0][0]).toMatchObject({ id: 'first', result: '⏳ 执行中…' });
+  expect(JSON.stringify(progress.mock.calls)).not.toContain('private-value');
 });
 
 it('expires a request if its custom card fails to render', async () => {
@@ -233,7 +297,7 @@ it.each(['plan', 'default'] as const)('uses the default SDK mode and locks reado
   const options = vi.mocked(query).mock.lastCall![0].options!;
   const command = 'git -C ' + workspaceRoot + '/projects/app status ' + workspaceRoot + ' ' + 'x'.repeat(100);
   expect(await options.canUseTool!('Bash', { command }, { signal: controller.signal })).toMatchObject({ behavior: 'deny' });
-  expect(progress).not.toHaveBeenCalled();
+  expect(progress).toHaveBeenCalledWith(expect.objectContaining({ name: 'Bash', input: JSON.stringify({ command }), result: expect.stringMatching(/^⛔ 已拦截：/) }));
   expect(options).toMatchObject({
     permissionMode: 'default', disallowedTools: expect.arrayContaining(['Edit', 'Write']),
   });

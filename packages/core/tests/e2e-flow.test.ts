@@ -119,15 +119,16 @@ it('resumes a cold Bash approval, answers a hot question and reports two MRs and
             directory_name: dir,
             commit_message: 'implement',
           });
-          await t.tools.invoke('detent_create_mr', {
+          const mrInput = {
             project: i + 2,
             source_branch: 'issue/42',
             target_branch: 'main',
             title: 'feature',
-          });
+          };
+          const mr = await t.tools.invoke('detent_create_mr', mrInput);
+          t.progress({ id: String(i), name: 'detent_create_mr', input: JSON.stringify(mrInput), result: JSON.stringify(mr) });
         }
         await log('done');
-        t.progress('完成两个项目');
         return '完成';
       }),
     };
@@ -196,6 +197,7 @@ it('resumes a cold Bash approval, answers a hot question and reports two MRs and
       lockedByPod: null,
       lastMessageSeq: 3,
     });
+    expect(gitlab.notes.some(body => body.includes('🔍 工具调用轨迹（2 步）') && body.includes('2. **`detent_create_mr`**'))).toBe(true);
     expect(ids.size).toBe(1);
     expect(runner.run.mock.calls[2][0].prompt).toContain('工具 Bash，参数 {"command":"npm install ioredis"}');
     expect(new Set(dirs).size).toBe(3);

@@ -407,7 +407,8 @@ async function main() {
     const clarification = `请将 ${source_image} 同步到 ${target_image}。`;
     await gitlab.postNote(hub, mirror, clarification);
     const mirrorPlan = await pendingCard(mirror, 'Plan', ['🧭 已进入', '实施方案审批',
-      source_image, target_image, '检查目标镜像是否存在']);
+      source_image, target_image, '🔍 工具调用轨迹（2 步）', '1. **`Read`**', 'mirror-to-harbor/SKILL.md',
+      '2. **`harbor-sync__check_image_exists`**', JSON.stringify({ target_image })]);
     const routed = await state(mirror, 'WAITING_PLAN', triage.last_message_seq);
     assert.equal(routed.permission_mode, 'plan');
     assert.equal(routed.claude_session_id, triage.claude_session_id);
@@ -446,7 +447,8 @@ async function main() {
     const reviewNote = (await notes(code)).find(n => n.body.includes('Please review and merge both MRs'));
     assert.ok(reviewNote && mrs.every(m => reviewNote.body.includes(m.mr_web_url)));
     assert.equal((await gitlab.getIssue(hub, code)).state, 'opened');
-    assert.ok(reviewNote.body.includes('已自动放行'));
+    assert.match(reviewNote.body, /\*\*`Bash`\*\* [^\n]*pwd; ls -la[^\n]*\n +↳ `/);
+    assert.ok(!reviewNote.body.includes('⏳ 执行中…'));
     assert.ok(jev.requests.includes('pwd; ls -la') && jev.requests.some(command => command.startsWith('git -C ')));
     assert.ok(!(await records(review.id, 'approval_requests')).some(a => a.tool_name === 'Bash'));
     const firstMr = mrs.find(m => m.target_project_id === web.id)!;
@@ -493,7 +495,7 @@ async function main() {
     const inlineNotes = (await gitlab.getDiscussion(api.id, inlineMr.iid, thread.id)).notes;
     assert.equal(inlineNotes[0].type, 'DiffNote');
     assert.ok(inlineNotes.some(n => n.author.username === bot.username && n.body.includes('Added the requested greeting regression test.') &&
-      /<details><summary>📎 执行记录（[1-9]\d* 步）/.test(n.body)));
+      /<details><summary>🔍 工具调用轨迹（[1-9]\d* 步）/.test(n.body)));
     const reviewed = await gitlab.getMr(api.id, inlineMr.iid);
     assert.notEqual(reviewed.sha, inlineMr.sha);
     assert.ok((await gitlab.getFile(api.id, 'test-greeting.sh', reviewed.sha)).includes('Hello from ' + apiRepo));

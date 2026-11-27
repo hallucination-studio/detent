@@ -136,8 +136,10 @@ it('checks out the assigned source, registers only MR tools, resolves a real sha
     expect(await readFile(path.join(dir, 'tracked'), 'utf8')).toContain('<<<<<<<');
     expect(await t.gate.preflight('Edit', { file_path: path.join(dir, 'tracked') })).toMatchObject({ behavior: 'allow' });
     await writeFile(path.join(dir, 'tracked'), 'resolved');
-    await push(tree.directoryName);
-    t.progress('提交推送分支');
+    const registered = vi.mocked(createSdkMcpServer).mock.lastCall![0].tools!;
+    await registered.find(tool => tool.name === 'detent_commit_and_push')!.handler({
+      directory_name: tree.directoryName, commit_message: 'resolve conflict',
+    }, {});
     return 'CI fixed';
   });
   expect((await send(opened)).statusCode).toBe(202);
@@ -146,7 +148,7 @@ it('checks out the assigned source, registers only MR tools, resolves a real sha
   expect(await git(['rev-parse', 'main'], remote, root)).toBe(targetBefore);
   expect(await git(['rev-parse', 'feature^2'], remote, root)).toBe(targetBefore);
   expect(gitlab.updateMergeRequestNote).toHaveBeenCalledWith(2, 1, expect.any(Number),
-    expect.stringMatching(/CI fixed[\s\S]*<details><summary>📎 执行记录（1 步）[\s\S]*提交推送分支[\s\S]*<\/details>/));
+    expect.stringMatching(/CI fixed[\s\S]*<details><summary>🔍 工具调用轨迹（1 步）[\s\S]*detent_commit_and_push[\s\S]*<\/details>/));
   expect(gitlab.syncIssueStatusLabel).not.toHaveBeenCalled();
   expect(await readdir(config.ephemeralRoot)).toEqual([]);
 });
@@ -213,14 +215,13 @@ it('batches inline review and delivers hot steering to PostToolUse, replying in 
     const result = await hook({ hook_event_name: 'PostToolUse', cwd: t.sandbox.workspaceRoot, transcript_path: '',
       session_id: t.session.claudeSessionId!, tool_name: 'Read', tool_input: {}, tool_response: 'ok' }, undefined, { signal: t.controller.signal });
     expect(result).toMatchObject({ hookSpecificOutput: { additionalContext: '@dev: tracked:4 change 4' } });
-    t.progress('read review diff');
     return 'review addressed';
   });
   await worker.wakeSession(s, 'inbox');
   expect((await session()).status).toBe('IDLE');
   expect(run).toHaveBeenCalledOnce();
   const body = gitlab.updateMergeRequestDiscussionNote.mock.lastCall?.at(-1);
-  expect(body).toMatch(/review addressed[\s\S]*<details>[\s\S]*read review diff[\s\S]*<\/details>/);
+  expect(body).toMatch(/review addressed[\s\S]*<details>[\s\S]*Read[\s\S]*<\/details>/);
   for (const index of [2, 3, 4]) expect(gitlab.createMergeRequestDiscussionNote).toHaveBeenCalledWith(2, 1, 'review-' + index, String(body).split('\n\n> 💡')[0]);
 });
 

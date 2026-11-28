@@ -13,7 +13,7 @@ import { InMemoryDetentRepository } from '../../core/tests/memory-repository.js'
 import { playbookUpload } from '../src/jumpserver/playbook.js';
 import {
   createJumpServerTools, HttpJumpServerClient, loadDeliveryConfig, validatePlaybookPath, validateReadonlyInspectCommand,
-  type AnsibleJobRequest, type DeliveryConfig, type DeliveryExecutionTracker, type JumpServerClient,
+  type AnsibleJobRequest, type DeliveryConfig, type DeliveryExecutionTracker, type JumpServerAsset, type JumpServerClient,
 } from '../src/index.js';
 
 vi.mock('@anthropic-ai/claude-code', async original => ({
@@ -81,7 +81,7 @@ it('signs the exact readonly request-target, date and accept headers, including 
   const { fetch, reply } = http();
   reply({ results: [{ id: '1', name: 'web', address: '10.0.0.1', other: 'ignored' }] });
   const client = new HttpJumpServerClient(loadDeliveryConfig(env));
-  expect(await client.listAssets({ nodeId: 'node-id', search: 'web prod', limit: 2 })).toEqual([{ id: '1', name: 'web', address: '10.0.0.1' }]);
+  expect(await client.listAssets({ nodeId: 'node-id', search: 'web prod', limit: 2 })).toEqual([{ id: '1', name: 'web', address: '10.0.0.1', isActive: true }]);
   const [[url, init]] = fetch.mock.calls;
   const path = '/api/v1/perms/users/self/nodes/node-id/assets/?limit=2&search=web+prod';
   expect(String(url)).toBe(base + path);
@@ -316,8 +316,9 @@ async function setup(mode: PermissionMode = 'default', config: DeliveryConfig = 
 
 it.each(['plan', 'default'] as const)('gates readonly inspection and lists assets in %s mode', async mode => {
   const { client, gate, gitlab, tools } = await setup(mode);
-  await gate.invokeExtension(asTool('list_assets'), { node_id: 'node', search: 'web', limit: 3 });
-  expect(client.listAssets).toHaveBeenCalledExactlyOnceWith({ nodeId: 'node', search: 'web', limit: 3 });
+  expect(await gate.invokeExtension(asTool('list_nodes'), {})).toEqual([]);
+  await gate.invokeExtension(asTool('list_assets'), { node_id: 'node', search: 'web', labels: ['env:prod'], limit: 3 });
+  expect(client.listAssets).toHaveBeenCalledExactlyOnceWith({ nodeId: 'node', search: 'web', labels: ['env:prod'], limit: 3 });
   for (const command of safeCommands) await gate.invokeExtension(asTool('shell'), { asset_ids: ['web01'], commands: [command] });
   expect(client.runShell).toHaveBeenCalledTimes(safeCommands.length);
   for (const command of unsafeCommands) {
@@ -577,4 +578,70 @@ it('requires a common account for playbooks and rejects empty authorizations bef
     }
   }
   expect(fetch.mock.calls.every(([url, init]) => String(url).endsWith('/accounts/') && init?.method === 'GET')).toBe(true);
+});
+
+it.each([
+  ['missing', null, '目标资产不存在或未授权：host'],
+  ['inactive', { isActive: false }, '目标资产已停用，禁止执行：web (host)'],
+  ['blocked node', { nodes: ['/DEFAULT/prod/db/primary'] }, '目标资产命中黑名单保护规则，禁止操作：host'],
+  ['blocked label', { labels: ['Tier:CORE'] }, '目标资产命中黑名单保护规则，禁止操作：host'],
+] satisfies [string, Partial<JumpServerAsset> | null, string][])('denies a %s target on inspection, job approval and card rendering', async (_kind, metadata, reason) => {
+  const config = { ...loadDeliveryConfig(env), blockedAssets: ['/default/prod/db', 'label:tier:core'] };
+  const { client, tracker, session, repo, mr } = await setup();
+  await repo.upsertMergeRequest(mr);
+  const getAsset = vi.fn(async (id: string) => metadata && { id, name: 'web', address: '10.0.0.1', ...metadata });
+  const tools = createJumpServerTools({ config, tracker, client: { ...client, getAsset } });
+  const job = tools.find(tool => tool.name === 'jms_job')!;
+  const shell = tools.find(tool => tool.name === 'jms_shell')!;
+  const ctx = { repo, session, workspaceRoot: '.', permissionMode: 'default' as const };
+  const args = { ...input, asset_ids: ['host', 'host'] };
+  expect(await job.guard!(args, ctx)).toEqual({ ok: false, reason });
+  await expect(job.renderApprovalCard!('approval', args, ctx)).rejects.toThrow(reason);
+  expect(await shell.guard!({ asset_ids: args.asset_ids, commands: ['uptime'] }, ctx)).toEqual({ ok: false, reason });
+  expect(getAsset.mock.calls).toEqual([['host'], ['host'], ['host', 'readonly']]);
+  expect(client.runShell).not.toHaveBeenCalled();
+  expect(client.runAnsibleJob).not.toHaveBeenCalled();
+});
+
+it('renders unique hosts, escapes target metadata, and bounds the approval preview', async () => {
+  const config = loadDeliveryConfig(env);
+  const { client, tracker, session, repo, mr } = await setup();
+  await repo.upsertMergeRequest(mr);
+  const getAsset = vi.fn(async (id: string) => ({
+    id, name: 'worker-' + id, address: '10.0.0.' + id,
+    ...(id === '1' && { nodes: ['/DEFAULT/prod/app'], labels: ['env:prod', 'note:|' + env.JUMPSERVER_JOB_TOKEN] }),
+  }));
+  const tools = createJumpServerTools({ config, tracker, client: { ...client, getAsset } });
+  const render = tools.find(tool => tool.name === 'jms_job')!.renderApprovalCard!;
+  const ctx = { repo, session, workspaceRoot: '.', permissionMode: 'default' as const };
+  const ids = Array.from({ length: 13 }, (_, i) => String(i + 1));
+  const card = await render('approval', { ...input, asset_ids: [ids[0], ...ids] }, ctx);
+  expect(getAsset.mock.calls.map(([id]) => id)).toEqual(ids);
+  expect(card).toContain('共 13 台：`worker-1 (10.0.0.1)` [节点: `/DEFAULT/prod/app` · 标签: `env:prod、note:\\|***` · ID: `1`]');
+  expect(card).toContain('`worker-12 (10.0.0.12)` [ID: `12`]<br>… 共 13 台');
+  expect(card).not.toContain('worker-13');
+});
+
+it('exposes readonly node search through the tool schema', async () => {
+  const { client, session, repo } = await setup();
+  const listNodes = vi.fn().mockResolvedValue([{ id: 'n', name: 'App', fullPath: '/Apps', assetsAmount: 2 }]);
+  const tools = createJumpServerTools({ config: loadDeliveryConfig(env), client: { ...client, listNodes } });
+  const nodes = tools.find(tool => tool.name === 'jms_list_nodes')!;
+  const query = { search: 'pp', limit: 1 };
+  expect(nodes.policy).toBe('readonly');
+  expect(z.object(nodes.schema).safeParse({ limit: 201 }).success).toBe(false);
+  expect(await nodes.execute(query, { session, repo, workspaceRoot: '.', permissionMode: 'plan' })).toHaveLength(1);
+  expect(listNodes).toHaveBeenCalledExactlyOnceWith(query);
+});
+
+it('rechecks target activity when an approved job resumes', async () => {
+  const { client, repo, mr, gate, replay } = await setup();
+  const host = { id: input.asset_ids[0], name: 'web', address: '10.0.0.1', isActive: true };
+  const getAsset = vi.fn(async () => ({ ...host }));
+  Object.assign(client, { getAsset });
+  await repo.upsertMergeRequest(mr);
+  await expect(gate.invokeExtension(asTool('job'), input)).rejects.toBeInstanceOf(ColdHold);
+  host.isActive = false;
+  await expect(replay(input)).rejects.toThrow('目标资产已停用，禁止执行：web (web01)');
+  expect(client.runAnsibleJob).not.toHaveBeenCalled();
 });

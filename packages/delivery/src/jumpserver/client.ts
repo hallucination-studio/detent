@@ -11,9 +11,13 @@ export type JumpServerAuth =
   | { kind: 'signature'; accessKeyId: string; accessKeySecret: string }
   | { kind: 'bearer'; token: string };
 
-const asset = z.object({ id: z.string(), name: z.string(), address: z.string() });
-export type JumpServerAsset = z.infer<typeof asset>;
-export interface AssetQuery { search?: string; nodeId?: string; limit?: number }
+export interface JumpServerNode { id: string; name: string; fullPath: string; assetsAmount: number }
+export interface NodeQuery { search?: string; limit?: number }
+export interface JumpServerAsset {
+  id: string; name: string; address: string;
+  nodes?: string[]; labels?: string[]; platform?: string; comment?: string; isActive?: boolean;
+}
+export interface AssetQuery { search?: string; nodeId?: string; labels?: string[]; limit?: number }
 export interface ShellRequest { assetIds: string[]; commands: string[]; account?: string }
 export interface AnsibleJobRequest {
   account?: string;
@@ -36,6 +40,8 @@ export type ReadonlyInspectResult = JobResultResponse | {
   status: 'SUCCESS' | 'FAILED'; outputSummary: string; groups: InspectionGroup[];
 };
 export interface JumpServerClient {
+  listNodes?(query: NodeQuery): Promise<JumpServerNode[]>;
+  getAsset?(assetId: string, role?: 'readonly'): Promise<JumpServerAsset | null>;
   listAssets(query: AssetQuery): Promise<JumpServerAsset[]>;
   runShell(request: ShellRequest): Promise<ReadonlyInspectResult>;
   runAnsibleJob(request: AnsibleJobRequest): Promise<AnsibleJobSubmission>;
@@ -60,6 +66,23 @@ const detail = z.object({
     .pipe(z.enum(['pending', 'running', 'success', 'failed', 'timeout', 'canceled', 'error'])).transform(s => statusMap[s]),
   summary: z.record(z.unknown()).nullable(),
 });
+const nodeFields = z.object({
+  id: z.string().optional(), name: z.string().nullish(), value: z.string().nullish(), full_value: z.string().nullish(),
+});
+const nodeRows = z.array(nodeFields.extend({ id: z.string(), assets_amount: z.number().nullish() }));
+const nodePage = z.union([
+  nodeRows.transform(results => ({ results, next: null })),
+  z.object({ results: nodeRows, next: z.string().nullish() }),
+]);
+const asset = z.object({
+  id: z.string(), name: z.string(), address: z.string(),
+  nodes: z.array(z.union([z.string(), nodeFields])).nullish(),
+  nodes_display: z.array(z.string()).nullish(),
+  labels: z.array(z.union([z.string().trim(), z.object({ name: z.string().trim(), value: z.string().trim() })
+    .transform(label => label.name + ':' + label.value)])).nullish(),
+  platform: z.union([z.string(), z.object({ name: z.string() })]).nullish(),
+  comment: z.string().nullish(), is_active: z.boolean().nullish(),
+});
 const assets = z.array(asset);
 const assetPage = z.union([assets, z.object({ results: assets }).transform(page => page.results)]);
 const resource = z.object({ id: z.string().min(1) });
@@ -78,10 +101,15 @@ class HttpError extends Error {
   }
 }
 
+function authPrincipal(auth: JumpServerAuth) {
+  return auth.kind === 'signature' ? 'key:' + auth.accessKeyId : 'token:' + createHash('sha256').update(auth.token).digest('hex');
+}
+
 export class HttpJumpServerClient implements JumpServerClient {
   private readonly base: string;
   private useWebSocketLogs = false;
   private accountsEndpointSupported = true;
+  private readonly nodeCache = new Map<string, { tree: Promise<Map<string, JumpServerNode>>; expiresAt: number }>();
   private readonly accountCache = new Map<string, { accounts: string[]; expiresAt: number }>();
 
   constructor(
@@ -151,21 +179,113 @@ export class HttpJumpServerClient implements JumpServerClient {
     }
   }
 
-  async listAssets({ search, nodeId, limit = 50 }: AssetQuery) {
+  private async loadNodeTree(auth: JumpServerAuth) {
+    const tree = new Map<string, JumpServerNode>();
+    const endpoint = 'perms/users/self/nodes/';
+    const signal = AbortSignal.timeout(this.config.jumpserverTimeoutMs);
+    const seen = new Set<string>();
+    let query = '';
+    do {
+      if (seen.has(query)) throw Error('Repeated JumpServer node page');
+      seen.add(query);
+      let page;
+      try {
+        page = await this.request(auth, endpoint + query, nodePage, undefined, { signal, fallbackOn404: !query });
+      } catch (error) {
+        // Older installations only expose node names inline on assets.
+        if (!query && error instanceof HttpError && error.status === 404) return tree;
+        throw error;
+      }
+      for (const row of page.results) {
+        const fullPath = row.full_value?.trim();
+        if (row.id !== 'favorite' && fullPath) tree.set(row.id, {
+          id: row.id, name: row.name?.trim() || row.value?.trim() || fullPath, fullPath, assetsAmount: row.assets_amount ?? 0,
+        });
+      }
+      // Use only the pagination query. Keep credentials on the original permitted endpoint.
+      query = page.next ? new URL(page.next, this.base).search : '';
+    } while (query);
+    return tree;
+  }
+
+  private async nodeTree(auth: JumpServerAuth) {
+    const principal = authPrincipal(auth);
+    const cached = this.nodeCache.get(principal);
+    if (cached && Date.now() < cached.expiresAt) return cached.tree;
+    // Parallel asset detail lookups share the same in-flight tree request.
+    const tree = this.loadNodeTree(auth);
+    this.nodeCache.set(principal, { tree, expiresAt: Date.now() + 60000 });
+    try {
+      return await tree;
+    } catch (error) {
+      if (this.nodeCache.get(principal)?.tree === tree) this.nodeCache.delete(principal);
+      throw error;
+    }
+  }
+
+  async listNodes({ search, limit = 100 }: NodeQuery = {}): Promise<JumpServerNode[]> {
+    const tree = await this.nodeTree(requireAuth(this.config.jumpserverReadonlyAuth, 'readonly'));
+    const needle = search?.trim().toLowerCase();
+    return [...tree.values()]
+      .filter(node => !needle || node.fullPath.toLowerCase().includes(needle) || node.name.toLowerCase().includes(needle))
+      .slice(0, limit).map(node => ({
+        ...node, id: this.redact(node.id), name: this.redact(node.name), fullPath: this.redact(node.fullPath),
+      }));
+  }
+
+  private normalizeAsset(raw: z.infer<typeof asset>, tree?: Map<string, JumpServerNode>): JumpServerAsset {
+    const nodes = new Set<string>();
+    for (const node of raw.nodes ?? []) {
+      const path = typeof node === 'string' ? tree?.get(node)?.fullPath || node :
+        tree?.get(node.id ?? '')?.fullPath || node.full_value || node.value || node.name || node.id;
+      if (path?.trim()) nodes.add(path.trim());
+    }
+    for (const display of raw.nodes_display ?? []) {
+      const path = display.trim();
+      if (path) nodes.add(path);
+    }
+    const leafNames = new Set([...nodes].filter(path => path.startsWith('/')).map(path => path.split('/').at(-1)));
+    const paths = [...nodes].filter(path => !leafNames.has(path));
+    const platform = (typeof raw.platform === 'string' ? raw.platform : raw.platform?.name)?.trim();
+    const comment = raw.comment?.trim();
+    return {
+      id: this.redact(raw.id), name: this.redact(raw.name), address: this.redact(raw.address), isActive: raw.is_active !== false,
+      ...(paths.length > 0 && { nodes: paths.map(path => this.redact(path)) }),
+      ...(raw.labels && { labels: raw.labels.map(label => this.redact(label)) }),
+      ...(platform && { platform: this.redact(platform) }),
+      ...(comment && { comment: this.redact(comment) }),
+    };
+  }
+
+  async listAssets({ search, nodeId, labels, limit = 50 }: AssetQuery) {
     const auth = requireAuth(this.config.jumpserverReadonlyAuth, 'readonly');
-    const query = new URLSearchParams({ limit: String(limit) });
+    const query = new URLSearchParams({ limit: String(labels?.length ? Math.max(limit, 200) : limit) });
     if (search) query.set('search', search);
     const scope = nodeId ? 'nodes/' + segment(nodeId) + '/' : '';
     const rows = await this.request(auth, 'perms/users/self/' + scope + 'assets/?' + query, assetPage);
-    return rows.slice(0, limit).map(({ id, name, address }) => ({
-      id: this.redact(id), name: this.redact(name), address: this.redact(address),
-    }));
+    const required = labels?.map(label => label.trim().toLowerCase()) ?? [];
+    const matches = rows.filter(row => row.is_active !== false &&
+      required.every(label => row.labels?.some(value => value.toLowerCase() === label))).slice(0, limit);
+    const tree = matches.some(row => row.nodes?.length) ? await this.nodeTree(auth) : undefined;
+    return matches.map(row => this.normalizeAsset(row, tree));
+  }
+
+  async getAsset(assetId: string, auth?: JumpServerAuth | 'readonly') {
+    const credential = auth === 'readonly' ? requireAuth(this.config.jumpserverReadonlyAuth, 'readonly') :
+      auth ?? requireAuth(this.config.jumpserverJobAuth ?? this.config.jumpserverReadonlyAuth, 'asset');
+    let row;
+    try {
+      row = await this.request(credential, 'perms/users/self/assets/' + segment(assetId) + '/', asset, undefined, { fallbackOn404: true });
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 404) return null;
+      throw error;
+    }
+    return this.normalizeAsset(row, row.nodes?.length ? await this.nodeTree(credential) : undefined);
   }
 
   async listAssetAccounts(assetId: string, auth = requireAuth(this.config.jumpserverReadonlyAuth, 'readonly'), signal?: AbortSignal): Promise<string[]> {
     const path = 'perms/users/self/assets/' + segment(assetId) + '/';
-    const principal = auth.kind === 'signature' ? 'key:' + auth.accessKeyId : 'token:' + createHash('sha256').update(auth.token).digest('hex');
-    const key = JSON.stringify([principal, assetId]);
+    const key = JSON.stringify([authPrincipal(auth), assetId]);
     const now = Date.now();
     const cached = this.accountCache.get(key);
     if (cached && now < cached.expiresAt) return [...cached.accounts];

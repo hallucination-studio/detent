@@ -1,7 +1,7 @@
 import { defineExtensionTool, escapeMarkdownCell, logError, neutralizeQuickActions, redactGitUrl, type AnyDetentExtensionTool, type ExtensionToolContext, type DecisionClient } from '@detent/core';
 import { z } from 'zod';
 import { authSecrets, redactSecrets, type DeliveryConfig } from '../config.js';
-import type { JobResultResponse, JumpServerClient } from './client.js';
+import type { JobResultResponse, JumpServerAsset, JumpServerClient } from './client.js';
 import { findBlockedAssets, normalizeShellCommand, validatePlaybookPath, validateShellCommands } from './guards.js';
 
 export interface DeliveryExecutionRecord {
@@ -48,14 +48,34 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
   client: JumpServerClient; config: DeliveryConfig; tracker?: DeliveryExecutionTracker; decision?: DecisionClient; defaultAccount?: string;
   onTerminalResult?: (sessionId: string, jobId: string, result: JobResultResponse) => Promise<void>;
 }): AnyDetentExtensionTool[] {
-  const checkAssets = (ids: string[]) => findBlockedAssets(ids, config.blockedAssets).length
-    ? deny('目标资产在黑名单中，禁止操作') : allow;
+  async function resolveTargetAssets(assetIds: string[], role?: 'readonly') {
+    const ids = [...new Set(assetIds)];
+    let resolved: JumpServerAsset[] | undefined;
+    if (client.getAsset) {
+      const getAsset = client.getAsset.bind(client);
+      const rows = await Promise.all(ids.map(id => role ? getAsset(id, role) : getAsset(id)));
+      resolved = [];
+      for (const [i, asset] of rows.entries()) {
+        if (!asset) return deny(redactSecrets('目标资产不存在或未授权：' + ids[i], config));
+        if (asset.isActive === false) return deny(redactSecrets('目标资产已停用，禁止执行：' + asset.name + ' (' + asset.id + ')', config));
+        resolved.push(asset);
+      }
+    }
+    const blocked = findBlockedAssets(resolved ?? ids, config.blockedAssets);
+    if (blocked.length) return deny(redactSecrets('目标资产命中黑名单保护规则，禁止操作：' + blocked.join('、'), config));
+    return { ok: true as const, resolved };
+  }
 
   return [
     defineExtensionTool({
-      name: 'jms_list_assets', description: '查询当前凭证获授权的 JumpServer 资产', policy: 'readonly',
-      schema: { search: text(128).optional(), node_id: text(128).optional(), limit: id.max(200).optional() },
-      execute: input => client.listAssets({ search: input.search, nodeId: input.node_id, limit: input.limit }),
+      name: 'jms_list_nodes', description: '查询当前凭证获授权的 JumpServer 资产节点树（按业务/环境层级定位目标节点）', policy: 'readonly',
+      schema: { search: text(128).optional(), limit: id.max(200).optional() },
+      execute: async input => client.listNodes ? client.listNodes({ search: input.search, limit: input.limit }) : [],
+    }),
+    defineExtensionTool({
+      name: 'jms_list_assets', description: '查询当前凭证获授权的活跃 JumpServer 资产，支持按关键词、节点 ID（node_id）与标签（labels，如 ["env:prod"]）筛选', policy: 'readonly',
+      schema: { search: text(128).optional(), node_id: text(128).optional(), labels: z.array(text(128)).max(20).optional(), limit: id.max(200).optional() },
+      execute: input => client.listAssets({ search: input.search, nodeId: input.node_id, labels: input.labels, limit: input.limit }),
     }),
     defineExtensionTool({
       name: 'jms_shell', description: '在授权资产上批量执行只读巡检命令（一次可传入多条命令合并执行）', policy: 'readonly',
@@ -66,7 +86,7 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
           .describe('待执行的只读命令列表（每项为单条非交互式只读命令，如 ps/ss/df/uptime/free，勿用 top/htop 等终端交互程序；多条命令请拆成数组元素，勿用 ; 或 && 拼接）'),
       },
       async guard(input, ctx) {
-        const targets = checkAssets(input.asset_ids);
+        const targets = await resolveTargetAssets(input.asset_ids, 'readonly');
         if (!targets.ok) return targets;
         const prefixes = [...config.inspectAllowPrefixes, ...(ctx.workflow?.allowPrefixes ?? [])];
         const checked = await validateShellCommands(input.commands, prefixes, decision);
@@ -89,9 +109,10 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
           const path = validatePlaybookPath(input.playbook_path);
           if (!path.ok) return path;
         }
-        const targets = checkAssets(input.asset_ids);
-        if (!targets.ok) return targets;
-        return verifyMerge(input, ctx, config.blockFailedPipeline);
+        const verified = await verifyMerge(input, ctx, config.blockFailedPipeline);
+        if (!verified.ok) return verified;
+        const targets = await resolveTargetAssets(input.asset_ids);
+        return targets.ok ? allow : targets;
       },
       async renderApprovalCard(approvalId, input, ctx) {
         const verified = await verifyMerge(input, ctx, config.blockFailedPipeline);
@@ -101,13 +122,31 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
         if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) throw Error('无效的 MR 链接');
         const cell = (value: string, format: 'text' | 'code' = 'text') =>
           escapeMarkdownCell(redactSecrets(value, config), format);
+        const targets = await resolveTargetAssets(input.asset_ids);
+        if (!targets.ok) throw Error(targets.reason);
+        const hosts = targets.resolved;
+        let targetCell;
+        if (hosts) {
+          const details = hosts.slice(0, 12).map(host => {
+            const fields = [
+              host.nodes?.length && '节点: ' + cell(host.nodes.join('、'), 'code'),
+              host.labels?.length && '标签: ' + cell(host.labels.join('、'), 'code'),
+              'ID: ' + cell(host.id, 'code'),
+            ].filter(Boolean);
+            return cell(host.name + ' (' + host.address + ')', 'code') + ' [' + fields.join(' · ') + ']';
+          });
+          if (hosts.length > 12) details.push('… 共 ' + hosts.length + ' 台');
+          targetCell = '共 ' + hosts.length + ' 台：' + details.join('<br>');
+        } else {
+          targetCell = cell(JSON.stringify(input.asset_ids), 'code');
+        }
         const ref = cell(mr.targetProjectPath + '!' + mr.mrIid);
         const mergedBy = mr.mergedBy ? '@' + mr.mergedBy.replace(/^@/, '') : '未知';
         const table = [
           '| 项目 | 内容 |', '| :--- | :--- |',
           '| 已合并 MR | [' + ref + '](<' + url.href.replaceAll('|', '%7C') + '>)（由 ' + cell(mergedBy, 'code') + ' 合并） |',
           '| 提交 SHA | ' + cell(input.commit_sha, 'code') + ' |',
-          '| 目标资产 | ' + cell(JSON.stringify(input.asset_ids), 'code') + ' |',
+          '| 目标资产 | ' + targetCell + ' |',
           '| 目标仓库 | ' + cell(mr.targetProjectPath, 'code') + ' |',
           input.playbook_path ? '| Playbook | ' + cell(input.playbook_path, 'code') + ' |'
             : '| 作业命令 | ' + input.command!.split('\n').map(line => cell(line, 'code')).join('<br>') + ' |',
@@ -126,8 +165,9 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
         const verified = await verifyMerge(input, ctx, config.blockFailedPipeline);
         if (!verified.ok) throw Error(verified.reason);
         const { mr } = verified;
+        const assetIds = [...new Set(input.asset_ids)];
         const job = await client.runAnsibleJob({
-          account: ctx.workflow?.account ?? defaultAccount, assetIds: input.asset_ids, repository: mr.targetProjectPath, playbookPath: input.playbook_path,
+          account: ctx.workflow?.account ?? defaultAccount, assetIds, repository: mr.targetProjectPath, playbookPath: input.playbook_path,
           command: input.command, commitSha: input.commit_sha, extraVars: input.extra_vars,
           comment: `Detent ${ctx.session.id} / ${mr.targetProjectPath}!${mr.mrIid} / ${input.commit_sha} / ${approvalId}`,
         });
@@ -136,7 +176,7 @@ export function createJumpServerTools({ client, config, tracker, decision, defau
             sessionId: ctx.session.id, mrId: mr.id, approvalId, agentProfile: ctx.profileName ?? 'unified',
             jumpserverJobId: job.jobId, jumpserverJobUrl: job.jobUrl,
             playbookPath: input.playbook_path ?? ('cmd: ' + input.command!).slice(0, 255),
-            commitSha: input.commit_sha, targetAssets: input.asset_ids,
+            commitSha: input.commit_sha, targetAssets: assetIds,
             status: job.status === 'PENDING' ? 'PENDING' : 'RUNNING',
           });
         } catch (error) {

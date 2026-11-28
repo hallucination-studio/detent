@@ -1,4 +1,5 @@
 import { logError, type DecisionClient } from '@detent/core';
+import type { JumpServerAsset } from './client.js';
 
 const deny = (reason: string) => ({ ok: false as const, reason });
 export function normalizeShellCommand(command: string) {
@@ -101,9 +102,20 @@ export function validatePlaybookPath(playbookPath: string) {
   return { ok: true as const };
 }
 
-export function findBlockedAssets(assetIds: readonly string[], blockedAssets: readonly string[]): string[] {
-  const blocked = new Set(blockedAssets.map(id => id.trim().toLowerCase()));
-  return assetIds.filter(id => blocked.has(id.trim().toLowerCase()));
+export function findBlockedAssets(
+  assets: readonly (string | Pick<JumpServerAsset, 'id' | 'name' | 'address' | 'nodes' | 'labels'>)[],
+  blockedAssets: readonly string[],
+): string[] {
+  const rules = blockedAssets.map(rule => rule.trim().toLowerCase()).filter(Boolean);
+  return assets.filter(asset => rules.some(rule => {
+    if (typeof asset === 'string') return asset.trim().toLowerCase() === rule;
+    if (rule.startsWith('label:')) return asset.labels?.some(label => label.trim().toLowerCase() === rule.slice(6));
+    if (rule.startsWith('/')) return asset.nodes?.some(node => {
+      const path = node.trim().toLowerCase();
+      return path === rule || path.startsWith(rule + '/');
+    });
+    return [asset.id, asset.name, asset.address].some(value => value.trim().toLowerCase() === rule);
+  })).map(asset => typeof asset === 'string' ? asset : asset.id);
 }
 
 // Match the executable of every pipe stage, including shell/command wrappers.

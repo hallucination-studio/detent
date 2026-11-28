@@ -78,7 +78,7 @@ it.each(['injected', 'http', 'disabled'] as const)('assembles %s tools alongside
     expect(release.tools.map(tool => tool.name)).toEqual(['detent_list_tags', 'detent_create_release']);
     expect(jumpserver).toMatchObject({ name: 'jumpserver', enabled: mode !== 'disabled', setupHint: expect.stringContaining('jumpserver.base_url') });
     expect(jumpserver.tools.map(tool => tool.name)).toEqual(mode === 'disabled' ? [] :
-      ['jms_list_assets', 'jms_shell', 'jms_job', 'jms_job_status']);
+      ['jms_list_nodes', 'jms_list_assets', 'jms_shell', 'jms_job', 'jms_job_status']);
   } finally {
     await app.close();
   }

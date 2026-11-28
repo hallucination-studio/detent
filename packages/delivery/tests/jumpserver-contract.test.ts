@@ -349,3 +349,94 @@ it('aborts an upgraded WebSocket when the task log stalls', async () => {
   await vi.waitFor(() => expect(closed).toBe(true));
   expect(fixture.upgrades).toHaveLength(1);
 });
+
+it('normalizes permitted v3/v4 assets and applies all exact labels before limiting results', async () => {
+  const { client, fetch } = setup();
+  const nodePath = '/DEFAULT/Production/' + gitlab.secrets.CUSTOM;
+  fetch.mockResolvedValueOnce(Response.json({ results: [
+    { id: 'favorite', value: 'Favorites', full_value: '/Favorites' },
+    { id: 'empty', value: 'Empty', full_value: '  ' },
+    { id: 'apps', value: 'Applications', full_value: nodePath, assets_amount: 4 },
+    { id: credentials.job, name: gitlab.gitlabToken, full_value: '/Departments' },
+  ] }));
+  expect(await client.listNodes({ search: 'proDUCtion', limit: 1 })).toEqual([
+    { id: 'apps', name: 'Applications', fullPath: '/DEFAULT/Production/***', assetsAmount: 4 },
+  ]);
+  expect(await client.listNodes({ search: 'APPLICATIONS' })).toHaveLength(1);
+  expect(await client.listNodes()).toHaveLength(2);
+  expect((await client.listNodes())[1]).toEqual({ id: '***', name: '***', fullPath: '/Departments', assetsAmount: 0 });
+
+  const common = { name: gitlab.gitlabToken, address: '10.0.0.1', nodes: ['apps'] };
+  const rows = [
+    { ...common, id: 'disabled', labels: ['env:prod', 'tier:core'], is_active: false },
+    { ...common, id: 'prefix', labels: ['env:production', 'tier:core'] },
+    { ...common, id: 'single', labels: ['env:prod'] },
+    { ...common, id: 'v4', labels: [{ name: 'env', value: 'Prod' }, { name: 'Tier', value: 'core' }],
+      nodes: [{ id: 'apps', value: 'apps' }], platform: { name: 'Linux' }, comment: '  ' + credentials.job + '  ' },
+    { ...common, id: 'v3', labels: ['Env:Prod', 'tier:Core'], platform: 'Linux', comment: '  ', nodes_display: ['/Other'] },
+    { ...common, id: 'more', labels: ['Env:Prod', 'tier:Core'] },
+  ];
+  fetch.mockResolvedValueOnce(Response.json({ results: rows }));
+  expect(await client.listAssets({ nodeId: 'apps', labels: ['ENV:prod', 'tier:CORE'], limit: 2 })).toEqual([
+    { id: 'v4', name: '***', address: common.address, nodes: ['/DEFAULT/Production/***'], platform: 'Linux',
+      comment: '***', labels: ['env:Prod', 'Tier:core'], isActive: true },
+    { id: 'v3', name: '***', address: common.address, nodes: ['/DEFAULT/Production/***', '/Other'], platform: 'Linux',
+      labels: ['Env:Prod', 'tier:Core'], isActive: true },
+  ]);
+  expect(fetch.mock.calls.map(([url]) => String(url))).toEqual([
+    base + '/api/v1/perms/users/self/nodes/', base + '/api/v1/perms/users/self/nodes/apps/assets/?limit=200',
+  ]);
+  for (const [, init] of fetch.mock.calls)
+    expect(new Headers(init?.headers).get('authorization')).toContain('keyId="' + credentials.accessKeyId + '"');
+});
+
+it('uses inline asset paths when the nodes endpoint is absent, and distinguishes detail 404 from other errors', async () => {
+  const { client, fetch } = setup();
+  const raw = { id: 'web', name: 'web', address: gitlab.gitlabToken, nodes: [
+    { id: 'n1', full_value: '/DEFAULT/A', value: 'A' }, { value: 'B' }, { name: 'C' }, 'D',
+  ], nodes_display: ['A', '/DEFAULT/E'], labels: [gitlab.secrets.CUSTOM] };
+  fetch.mockResolvedValueOnce(Response.json([raw, { ...raw, id: 'old', is_active: false }]))
+    .mockResolvedValueOnce(new Response(null, { status: 404 }));
+  const expected = { id: 'web', name: 'web', address: '***', nodes: ['/DEFAULT/A', 'B', 'C', 'D', '/DEFAULT/E'], labels: ['***'] };
+  expect(await client.listAssets({})).toEqual([{ ...expected, isActive: true }]);
+  fetch.mockResolvedValueOnce(Response.json({ ...raw, is_active: false }));
+  expect(await client.getAsset('old/web', 'readonly')).toEqual({ ...expected, isActive: false });
+  expect(String(fetch.mock.lastCall?.[0])).toBe(base + accountsPath + 'old%2Fweb/');
+  fetch.mockResolvedValueOnce(new Response(null, { status: 404 }));
+  expect(await client.getAsset('absent')).toBeNull();
+  fetch.mockResolvedValueOnce(new Response(null, { status: 403 }));
+  await expect(client.getAsset('forbidden')).rejects.toMatchObject({ status: 403 });
+});
+
+it('shares concurrent tree lookups per principal and refreshes them after expiry', async () => {
+  const { client, fetch } = setup();
+  const raw = { id: 'host', name: 'host', address: '10.0.0.1', nodes: [{ id: 'branch', name: 'inline' }] };
+  let revision = 1;
+  fetch.mockImplementation(async (url, init) => {
+    if (String(url) === base + accountsPath + 'host/') return Response.json(raw);
+    expect(String(url)).toBe(base + '/api/v1/perms/users/self/nodes/');
+    const job = new Headers(init?.headers).get('authorization') === 'Bearer ' + credentials.job;
+    return Response.json([{ id: 'branch', full_value: (job ? '/jobs/' : '/inspect/') + revision }]);
+  });
+  await client.listNodes();
+  const [first, second] = await Promise.all([client.getAsset('host'), client.getAsset('host')]);
+  expect(first?.nodes).toEqual(['/jobs/1']);
+  expect(second).toEqual(first);
+  expect((await client.getAsset('host', 'readonly'))?.nodes).toEqual(['/inspect/1']);
+  expect(fetch.mock.calls.filter(([url]) => String(url).endsWith('/nodes/'))).toHaveLength(2);
+  revision++;
+  vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 60_001);
+  expect((await client.getAsset('host'))?.nodes).toEqual(['/jobs/2']);
+});
+
+it('finds authorized nodes on later pages before applying the search and limit', async () => {
+  const { client, fetch } = setup();
+  const path = '/api/v1/perms/users/self/nodes/';
+  fetch.mockResolvedValueOnce(Response.json({
+    results: [{ id: 'skip', full_value: '/other' }], next: path + '?offset=1',
+  })).mockResolvedValueOnce(Response.json({ results: [{ id: 'found', full_value: '/DEFAULT/apps' }], next: null }));
+  expect(await client.listNodes({ search: 'apps', limit: 1 })).toEqual([
+    { id: 'found', fullPath: '/DEFAULT/apps', name: '/DEFAULT/apps', assetsAmount: 0 },
+  ]);
+  expect(fetch.mock.calls.map(([url]) => String(url))).toEqual([base + path, base + path + '?offset=1']);
+});

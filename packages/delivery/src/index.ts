@@ -17,7 +17,7 @@ export { matchMergeRequestWebhook, loadDeliveryConfig, HttpJumpServerClient, cre
 export { buildBatchShellScript, evaluateRemoteInspectCommand, validateShellCommands, validateReadonlyInspectCommand, validatePlaybookPath } from './jumpserver/guards.js';
 export type { DeliveryConfig, JumpServerClient, DeliveryExecutionTracker };
 export type {
-  JumpServerAuth, JumpServerAsset, AssetQuery, ShellRequest, ReadonlyInspectResult, AnsibleJobRequest,
+  JumpServerAuth, JumpServerNode, NodeQuery, JumpServerAsset, AssetQuery, ShellRequest, ReadonlyInspectResult, AnsibleJobRequest,
   AnsibleJobSubmission, JobResultResponse,
 } from './jumpserver/client.js';
 export type { DeliveryExecutionRecord } from './jumpserver/tools.js';

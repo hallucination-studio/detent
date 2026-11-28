@@ -15,6 +15,8 @@ export interface RealE2EStackState {
   mysql: { host: string; port: number; user: string; password: string; database: string };
   targetAssetName: string;
   targetAssetAddress: string;
+  targetAssetId: string;
+  stagingAssetId: string;
   targetContainerName: string;
 }
 
@@ -69,10 +71,26 @@ from django.db import transaction
 from accounts.models import Account
 from assets.models import Host, Node, Platform, Protocol
 from authentication.models import AccessKey
+from labels.models import Label
 from orgs.utils import set_to_default_org
 from perms.const import ActionChoices
 from perms.models import AssetPermission
 from users.models import User
+
+def provision_host(name, address, platform, node, labels):
+    host, _ = Host.objects.update_or_create(name=name, defaults={
+        "address": address, "platform": platform, "is_active": True,
+    })
+    host.nodes.set([node])
+    # v4 stores LabeledResource rows against the parent Asset.
+    host.res_labels.exclude(label__in=labels).delete()
+    for label in labels:
+        host.res_labels.get_or_create(label=label)
+    Protocol.objects.update_or_create(asset=host, name="ssh", defaults={"port": 22})
+    Account.objects.update_or_create(asset=host, username="ops", name="ops", defaults={
+        "secret": "detent-e2e-ops", "secret_type": "password", "is_active": True,
+    })
+    return host
 
 set_to_default_org()
 with transaction.atomic():
@@ -80,21 +98,25 @@ with transaction.atomic():
     key = AccessKey.objects.filter(user=admin, is_active=True).first()
     if key is None:
         key = AccessKey.objects.create(user=admin)
-    host, _ = Host.objects.update_or_create(name="target-node-01", defaults={
-        "address": "target-node-01", "platform": Platform.objects.get(name="Linux"), "is_active": True,
-    })
-    host.nodes.add(Node.org_root())
-    Protocol.objects.update_or_create(asset=host, name="ssh", defaults={"port": 22})
-    Account.objects.update_or_create(asset=host, username="ops", name="ops", defaults={
-        "secret": "detent-e2e-ops", "secret_type": "password", "is_active": True,
-    })
+    prod_node = Node.create_node_by_full_value("/DEFAULT/prod/app")
+    staging_node = Node.create_node_by_full_value("/DEFAULT/staging/app")
+    env_prod, _ = Label.objects.get_or_create(name="env", value="prod")
+    env_staging, _ = Label.objects.get_or_create(name="env", value="staging")
+    svc_kafka, _ = Label.objects.get_or_create(name="service", value="demo-kafka")
+    linux = Platform.objects.get(name="Linux")
+    host = provision_host("target-node-01", "target-node-01", linux, prod_node, [env_prod, svc_kafka])
+    staging_host = provision_host("staging-node-01", "127.0.0.2", linux, staging_node, [env_staging, svc_kafka])
     perm, _ = AssetPermission.objects.update_or_create(name="detent-e2e-perm", defaults={
         "accounts": ["ops"], "protocols": ["ssh"], "is_active": True,
         "actions": ActionChoices.connect | ActionChoices.upload | ActionChoices.download,
     })
     perm.users.set([admin])
-    perm.assets.set([host])
-print("DETENT_STATE=" + json.dumps({"accessKeyId": str(key.id), "accessKeySecret": key.secret}))
+    perm.nodes.set([prod_node, staging_node])
+    perm.assets.set([host, staging_host])
+print("DETENT_STATE=" + json.dumps({
+    "accessKeyId": str(key.id), "accessKeySecret": key.secret,
+    "targetAssetId": str(host.id), "stagingAssetId": str(staging_host.id),
+}))
 `;
 
 function bootstrap(args: string[], input: string, keys: string[]): Record<string, string> {
@@ -160,8 +182,8 @@ async function checkGitlab(state: RealE2EStackState) {
   if ((await response.json()).username !== 'root') throw Error('GitLab token did not authenticate as root');
 }
 
-async function checkAsset(state: RealE2EStackState) {
-  const path = '/api/v1/perms/users/self/assets/?search=' + encodeURIComponent(state.targetAssetName);
+async function permissionRows<T>(state: RealE2EStackState, resource: 'assets' | 'nodes'): Promise<T[]> {
+  const path = '/api/v1/perms/users/self/' + resource + '/';
   const date = new Date().toUTCString();
   const signature = createHmac('sha256', state.jumpserverAccessKeySecret)
     .update(`(request-target): get ${path}\naccept: application/json\ndate: ${date}`).digest('base64');
@@ -170,9 +192,29 @@ async function checkAsset(state: RealE2EStackState) {
     Authorization: `Signature keyId="${state.jumpserverAccessKeyId}",algorithm="hmac-sha256",headers="(request-target) accept date",signature="${signature}"`,
   });
   const data = await response.json();
-  const assets = Array.isArray(data) ? data : data.results;
-  if (!Array.isArray(assets) || !assets.some(a => a.name === state.targetAssetName && a.address === state.targetAssetAddress))
-    throw Error(`JumpServer did not return the authorized asset ${state.targetAssetName}`);
+  const rows = Array.isArray(data) ? data : data.results;
+  if (!Array.isArray(rows)) throw Error('Unexpected JumpServer response for ' + path);
+  return rows;
+}
+
+async function checkAsset(state: RealE2EStackState) {
+  type Asset = { id: string; name: string; address: string; labels: { name: string; value: string }[] };
+  const [nodes, assets] = await Promise.all([
+    permissionRows<{ full_value: string }>(state, 'nodes'), permissionRows<Asset>(state, 'assets'),
+  ]);
+  for (const [env, name, address, id] of [
+    ['prod', state.targetAssetName, state.targetAssetAddress, state.targetAssetId],
+    ['staging', 'staging-node-01', '127.0.0.2', state.stagingAssetId],
+  ]) {
+    const path = '/DEFAULT/' + env + '/app';
+    if (!nodes.some(node => node.full_value === path)) throw Error('Missing authorized JumpServer node ' + path);
+    const asset = assets.find(a => a.id === id && a.name === name && a.address === address);
+    if (!asset) throw Error('Missing authorized JumpServer asset ' + name);
+    for (const [key, value] of [['env', env], ['service', 'demo-kafka']]) {
+      if (!asset.labels?.some(label => label.name === key && label.value === value))
+        throw Error(`JumpServer asset ${name} lacks label ${key}:${value}`);
+    }
+  }
 }
 
 function checkServices() {
@@ -210,9 +252,10 @@ async function up() {
   console.log('Provisioning the GitLab token and JumpServer asset permission.');
   const gitlab = bootstrap(['gitlab', 'gitlab-rails', 'runner', '-'], gitlabBootstrap, ['token']);
   const jms = bootstrap(['jms-core', 'python3', '/opt/jumpserver/apps/manage.py', 'shell'], jumpserverBootstrap,
-    ['accessKeyId', 'accessKeySecret']);
+    ['accessKeyId', 'accessKeySecret', 'targetAssetId', 'stagingAssetId']);
   const state: RealE2EStackState = { gitlabUrl, gitlabAdminToken: gitlab.token, jumpserverUrl,
     jumpserverAccessKeyId: jms.accessKeyId, jumpserverAccessKeySecret: jms.accessKeySecret,
+    targetAssetId: jms.targetAssetId, stagingAssetId: jms.stagingAssetId,
     mysql, targetAssetName: target, targetAssetAddress: target, targetContainerName: targetContainer };
   await checkGitlab(state);
   await waitFor('JumpServer signed asset lookup', 30, () => checkAsset(state));

@@ -3,7 +3,7 @@ import { expect, it, vi } from 'vitest';
 import type { DecisionClient } from '@detent/core';
 import { InMemoryDetentRepository } from '../../core/tests/memory-repository.js';
 import { loadDeliveryConfig } from '../src/config.js';
-import { buildBatchShellScript, isHardBlockedRemoteInspectCommand, validateShellCommands } from '../src/jumpserver/guards.js';
+import { buildBatchShellScript, findBlockedAssets, isHardBlockedRemoteInspectCommand, validateShellCommands } from '../src/jumpserver/guards.js';
 import { createJumpServerTools } from '../src/jumpserver/tools.js';
 
 async function inspectGuard(choice = 'pure_readonly', noul = 0.79, score = 0.76, enableJev = true) {
@@ -148,4 +148,15 @@ it('quotes batch headers literally and reports each exit status while completing
   expect(run.stdout.split('\n')).toEqual([
     `=== [1/3] ${quoted} ===`, 'space  and %s', '[rc=0]', '=== [2/3] false ===', '[rc=1]', '=== [3/3] true ===', '[rc=0]', '',
   ]);
+});
+
+it('matches blocked identifiers, whole labels and node subtrees case-insensitively', () => {
+  const host = {
+    id: 'asset-01', name: 'DB-01', address: '10.20.0.1',
+    nodes: ['/DEFAULT/prod/db/primary'], labels: ['tier:Core', 'env:prod'],
+  };
+  for (const rule of [' ASSET-01 ', 'db-01', host.address, '/default/PROD/db', '/default/prod/db/PRIMARY', 'LABEL:TIER:CORE'])
+    expect(findBlockedAssets([host, 'other'], [rule]), rule).toEqual([host.id]);
+  expect(findBlockedAssets([host], ['/default/prod/d', '/default/prod/db/prim', 'label:tier:co', 'env:prod', 'db'])).toEqual([]);
+  expect(findBlockedAssets(['Web', 'api'], [' web '])).toEqual(['Web']);
 });

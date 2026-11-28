@@ -162,7 +162,7 @@ class Scenario {
     return session;
   }
 
-  async approveProduction(iid: number, afterSeq: number, tool: string, beforeApproval: () => Promise<void>) {
+  async approveProduction(iid: number, afterSeq: number, tool: string, beforeApproval: (card: RowDataPacket) => Promise<void>) {
     const session = await this.state(iid, 'WAITING_TOOL', afterSeq);
     assert.equal(session.locked_by_pod, null, 'Worker is still holding the lease for ' + tool);
     const card = await this.card(session, 'TOOL_USE', tool);
@@ -175,7 +175,7 @@ class Scenario {
     });
     const stillPending = await this.card(await this.state(iid, 'WAITING_TOOL'), 'TOOL_USE', tool);
     assert.equal(stillPending.id, card.id);
-    await beforeApproval();
+    await beforeApproval(stillPending);
     await this.approve(iid, card, 'sre');
     return { card, session };
   }
@@ -195,26 +195,47 @@ class Scenario {
     }));
   }
 
-  // Join actual CLI tool_use and successful tool_result blocks by call ID.
-  // Prompts, tool definitions and a model's description of a call cannot satisfy this check.
-  async shellEvidence(session: Session, evidence: RegExp, afterSeq = 0, afterTime = 0) {
+  async *transcriptBlocks(session: Session, afterSeq = 0) {
     const messages = await this.rows('SELECT raw_json_line FROM session_messages WHERE session_id=? AND seq>? ORDER BY seq',
       [session.id, afterSeq]);
-    const calls = new Set<string>();
     for (const m of messages) {
       const entry = JSON.parse(m.raw_json_line);
       const content = entry.message?.content;
       if (!Array.isArray(content)) continue;
-      for (const block of content) {
-        if (block.type === 'tool_use' && /^(?:mcp__detent__)?jms_shell$/.test(block.name) &&
-            (!afterTime || Date.parse(entry.timestamp) >= afterTime)) calls.add(block.id);
-        if (block.type !== 'tool_result' || !calls.has(block.tool_use_id) || block.is_error) continue;
-        const texts = typeof block.content === 'string' ? [block.content] :
-          (block.content ?? []).map((part: { text?: string }) => part.text ?? '');
-        for (const text of texts) {
-          // The CLI can prepend its MCP tool label before the serialized result.
-          if (/"status"\s*:\s*"SUCCESS"/.test(text) && evidence.test(text)) return;
+      for (const block of content) yield { role: entry.type, timestamp: entry.timestamp, block };
+    }
+  }
+
+  async assertDiscoveryBeforePlan(session: Session) {
+    const pending = new Set<string>();
+    let discovered = false;
+    for await (const { role, block } of this.transcriptBlocks(session)) {
+      if (role === 'assistant' && block.type === 'tool_use') {
+        const tool = block.name.replace(/^mcp__detent__/, '');
+        if (tool === 'detent_submit_plan') {
+          assert.ok(discovered, 'Plan was submitted before a successful JumpServer node or asset lookup');
+          return;
         }
+        if ((tool === 'jms_list_nodes' || tool === 'jms_list_assets') && typeof block.id === 'string') pending.add(block.id);
+      }
+      if (role === 'user' && block.type === 'tool_result' && pending.delete(block.tool_use_id) && !block.is_error) {
+        discovered = true;
+      }
+    }
+    throw Error('Missing detent_submit_plan tool call in session ' + session.id);
+  }
+
+  async shellEvidence(session: Session, evidence: RegExp, afterSeq = 0, afterTime = 0) {
+    const calls = new Set<string>();
+    for await (const { block, timestamp } of this.transcriptBlocks(session, afterSeq)) {
+      if (block.type === 'tool_use' && /^(?:mcp__detent__)?jms_shell$/.test(block.name) &&
+          (!afterTime || Date.parse(timestamp) >= afterTime)) calls.add(block.id);
+      if (block.type !== 'tool_result' || !calls.has(block.tool_use_id) || block.is_error) continue;
+      const texts = typeof block.content === 'string' ? [block.content] :
+        (block.content ?? []).map((part: { text?: string }) => part.text ?? '');
+      for (const text of texts) {
+        // The CLI can prepend its MCP tool label before the serialized result.
+        if (/"status"\s*:\s*"SUCCESS"/.test(text) && evidence.test(text)) return;
       }
     }
     throw Error('Missing successful JumpServer inspection with target evidence in session ' + session.id);
@@ -243,8 +264,9 @@ class Scenario {
     await this.targetConfig(128);
   }
 
-  async configPlan(iid: number) {
+  async configPlan(iid: number, { requireAssetDiscovery = false } = {}) {
     const plan = await this.state(iid, 'WAITING_PLAN');
+    if (requireAssetDiscovery) await this.assertDiscoveryBeforePlan(plan);
     await this.shellEvidence(plan, /max_connections\s*=\s*128\b/);
     await this.approve(iid, await this.card(plan, 'PLAN'), 'dev');
     return plan;
@@ -308,10 +330,26 @@ class Scenario {
     return reviewed;
   }
 
+  async assertAnsibleApproval(iid: number, card: RowDataPacket) {
+    const input = typeof card.tool_input === 'string' ? JSON.parse(card.tool_input) : card.tool_input;
+    const { targetAssetId, stagingAssetId, targetAssetName } = this.ctx.stack;
+    assert.ok(targetAssetId && stagingAssetId, 'Missing JumpServer asset IDs. Refresh the fixture with npm run e2e:up');
+    assert.ok(Array.isArray(input.asset_ids), 'Job approval lacks an asset list');
+    assert.ok(!input.asset_ids.includes(stagingAssetId), 'Job approval includes staging-node-01');
+    assert.deepEqual(input.asset_ids, [targetAssetId], 'Job approval must select only ' + targetAssetName);
+    const note = await this.gl.getIssueNote(this.ctx.hub, iid, card.gitlab_note_id);
+    const targets = note.body.split('\n').find(line => /^\|\s*目标资产\s*\|/.test(line));
+    assert.ok(targets, 'GitLab approval note ' + note.id + ' lacks its target asset row');
+    assert.match(targets, /\btarget-node-01\b(?!-)/);
+    assert.match(targets, /\/DEFAULT\/prod\/app\b(?![/-])/);
+    assert.match(targets, /\benv:prod\b(?!-)/);
+  }
+
   async executeMerged(iid: number, issue: Session, mr: MR, beforeApproval: () => Promise<void>, evidence: RegExp[], entries?: string[]) {
     this.trackNotes(iid);
     const sha = await this.gl.mergeMergeRequest(mr.target_project_id, mr.iid, mr.sha);
-    const { card, session } = await this.approveProduction(iid, issue.last_message_seq, 'jms_job', async () => {
+    const { card, session } = await this.approveProduction(iid, issue.last_message_seq, 'jms_job', async pending => {
+      if (entries) await this.assertAnsibleApproval(iid, pending);
       assert.equal((await this.rows('SELECT id FROM delivery_executions WHERE session_id=?', [issue.id])).length, 0);
       await beforeApproval();
     });
@@ -418,9 +456,9 @@ async function sop4(h: Scenario) {
   await h.resetConfig();
   const legacy = 'legacy/cleanup_logs.yml';
   const original = await h.gl.fileBytes(ansible.id, legacy, 'main');
-  const iid = await h.open('调整 target-node-01 的连接数和请求超时',
-    `请通过 ${ansible.path_with_namespace} 更新 target-node-01 的 /etc/detent-demo/app.conf，把 max_connections 从 128 提高到 512，并增加 request_timeout=30。请执行变更并确认两项设置都已生效。`, 'delivery::env-change');
-  const plan = await h.configPlan(iid);
+  const iid = await h.open('调整生产环境 demo-kafka 的连接数和请求超时',
+    `请通过 ${ansible.path_with_namespace} 更新生产环境（prod）demo-kafka 主机的 /etc/detent-demo/app.conf，把 max_connections 从 128 提高到 512，并增加 request_timeout=30。请不要影响 staging 环境主机，执行变更并确认两项设置都已生效。`, 'delivery::env-change');
+  const plan = await h.configPlan(iid, { requireAssetDiscovery: true });
   const { issue, mr } = await h.openedMr(iid, plan, ansible);
   assert.deepEqual(await h.gl.fileBytes(ansible.id, legacy, mr.sha), original);
   const entries = await ansibleEntryPoints(h.gl, mr, false);

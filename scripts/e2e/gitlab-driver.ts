@@ -85,6 +85,7 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
       return issue.iid;
     },
     getIssue(id: number, iid: number) { return api.json<Issue>(issues(id, iid)); },
+    getIssueNote(id: number, iid: number, noteId: number) { return api.json<Note>(issues(id, iid) + '/notes/' + noteId); },
     listIssueNotes(id: number, iid: number) { return api.all<Note>(issues(id, iid) + '/notes?order_by=created_at&sort=desc'); },
     async awardThumbsUp(id: number, iid: number, noteId: number, actor: Actor) {
       await api.request(issues(id, iid) + '/notes/' + noteId + '/award_emoji', 'POST', { name: 'thumbsup' }, tokens[actor]);

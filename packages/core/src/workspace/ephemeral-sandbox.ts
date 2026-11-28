@@ -25,7 +25,7 @@ export type WorkspaceGitLab = Pick<
   | 'listPipelines'
   | 'getPipelineJobs'
   | 'getJobTrace'
-> & Partial<Pick<GitLabClient, 'getBotIdentity'>>;
+> & Partial<Pick<GitLabClient, 'getBotIdentity' | 'getMergeRequest' | 'listMergeRequestDiffs' | 'mergeMergeRequest' | 'createIssueNote'>>;
 
 export function git(args: string[], cwd: string, home: string, input = '', auth?: URL): Promise<string> {
   const env: NodeJS.ProcessEnv = {

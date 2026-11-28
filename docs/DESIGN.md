@@ -167,7 +167,7 @@ export interface DetentExtensionTool<TSchema extends z.ZodRawShape = z.ZodRawSha
 
 使用 `defineExtensionTool({ schema, ... })` 定义每个工具，回调的入参类型从该工具的 Zod Schema 推导。返回的工具可放入同一个 `readonly AnyDetentExtensionTool[]`。对于获批的 `always_approve` 调用，执行前复检和执行函数均收到对应审批记录的 `ctx.approvalId`。
 
-人工批准后，Issue 编排器在租约内重新加载当前能力和轮次角色，检查非只读、工具白名单、审批人权限、原参数的 Zod Schema 及实时 guard。声明 `directExecuteOnApproval` 的工具须能以空工作区执行。异步 `handoff` 更新 IDLE、标签与进度评论，并在原租约下检查收件箱。同步 `resume` 将脱敏的结构化执行结果交给模型，新的工具调用仍需独立授权。未声明的工具沿用冷恢复路径。Plan 与工具裁决会尽力在原 GitLab 评论追加结果、操作者和拒绝原因。
+批准后，Issue 编排器在租约内重新加载当前能力和轮次角色，检查非只读、工具白名单、审批人权限、原参数的 Zod Schema 及实时 guard。声明 `directExecuteOnApproval` 的工具须能以空工作区执行。异步 `handoff` 更新 IDLE、标签与进度评论，并在原租约下检查收件箱。同步 `resume` 将脱敏的结构化执行结果交给模型，新的工具调用仍需独立授权。未声明的工具沿用冷恢复路径。Plan 与工具裁决会尽力在原 GitLab 评论追加结果、操作者和拒绝原因。
 
 #### 扩展点 2：外部 Webhook 事件扩展与受控会话唤醒（`resumeSession`）
 - `SessionOrchestrator.resumeSession(sessionId: string, prompt: string, options?: { permissionMode?: PermissionMode; beforeRun?: (session: IssueSessionRow) => Promise<boolean> })`：
@@ -194,6 +194,10 @@ export interface TurnProfile {
   canApprove?: (params: { projectId: number; userId: number; username: string; approvalType: ApprovalType; toolName: string; toolInput?: Record<string, unknown> }) => Promise<boolean>;
 }
 ```
+
+Issue 编码轮次的 `detent_merge_mr` 由 `canBotMergeMr` 授权。Core 校验会话归属、实时 MR、流水线与完整文件清单，按 head SHA 合并并归档独占工作树。Delivery 核对非生产 owner，检查改名前后所有路径。对 Bot 负责的非生产作业，`shouldAutoApproveAsBot` 在沙箱销毁后复核实时资产。Bot 与人工投票共用审批记录、原卡回写和批准直执；`formatApprovalDenial` 可在拒绝时点名负责人。
+
+`detent_create_hub_issue` 在已批准的 Issue 编码轮次中创建一张后续工单，校验 Hub 流程标签并附来源标记。子会话的入箱记录持久标识父子关系，独立租约异步唤醒。派生工单禁止再次派生。release 在 pre 的 `promotion_gate` 通过后按请求交接给生产 env-change 工单。晋级前按实际配置、运行版本与健康逐服务核对前置环境；阻断后的越级发布须由目标环境人类负责人具名说明原因。
 
 #### 扩展点 4：审计生命周期回调（`SessionLifecycleHooks`）
 - 审批记录从 PENDING 更新为 APPROVED、REJECTED 或 EXPIRED 后，成功写入决策的一方调用 `onApprovalResolved(approval, session)`。
@@ -376,7 +380,7 @@ erDiagram
 
 `gitlab-release` 的 `detent_trigger_pipeline` 在编码阶段触发目标仓库流水线并自动登记回调。每次最多传 20 个变量，变量名最多 255 字符，单值最多 1000 字符。`detent_await_pipeline` 可按 ID 或 ref 等待，已结束的流水线（含 skipped）直接返回状态及 jobs。等待 GitLab 异步创建某个 ref 的流水线须由用户或 SOP 明确要求。登记后复查一次，覆盖首次读取与订阅提交之间的终态竞态。两种工具在异步等待时结束本轮、释放租约。
 
-`skills/env-topology/SKILL.md` 定义每个环境的配置文件、资产、审批交接及 `promotion_gate`。发布先记录稳定 Tag，再按环境分别修改配置、离线验证、提 MR、人工合并、部署和核验。需要跨仓验收时由该文件指定 gate；失败后停止晋级，沿同一套动作回退故障环境并保留工单。独立的日常运维也复用此流程。
+`skills/env-topology/SKILL.md` 定义每个环境的配置文件、资产、审批交接及 `promotion_gate`。发布先记录稳定 Tag，再按环境分别修改配置、离线验证、提 MR、由负责人合并、部署和核验。需要跨仓验收时由该文件指定 gate；失败后停止晋级，沿同一套动作回退故障环境并保留工单。独立的日常运维也复用此流程。
 
 模型代理在父进程脱敏并认证请求，向上游发送 Messages 和 token 计数请求前，将模型名统一为配置的 `CLAUDE_MODEL`。
 
@@ -536,6 +540,6 @@ Issue 编排器在帮助、运行和审批时分别加载 Hub 默认分支的 `c
 
 Hub 的 `auth` 引用 `$secret:JMS_AK_ID` 和 `$secret:JMS_AK_SECRET`，供巡检与任务中心共用。先使用流程 `account`，其次使用 Hub `default_account`。两者均未设置时，逐资产按 JumpServer 返回顺序选择首个有效授权账号，跳过停用账号和以 `@` 开头的虚拟账号。巡检按账号分组并汇总结果。单个 Ansible 任务要求所有目标使用同一账号，否则须指定共同的 `account` 或分组执行。缺少有效账号时，错误指出对应资产。执行工具继续核对 MR 合并 SHA、最新流水线及审批记录。
 
-`gitlab-release.approver_tier` 缺省为 prod，非法值会禁用能力并给出 setupHint。非只读流程显式启用发布工具且声明 standard 能力时，可由服务 Owner 批准 Tag。配置 `jumpserver.environments` 后，`jms_job` 发卡与执行前对全部实时资产核验环境的 match 和 blocked_assets。投票时再读当前 SOP、能力及审批单的 environment 和 asset_ids，仅当环境明确为 standard 且每台资产均通过复核时允许普通成员批准；其余一律要求 prod。prod 流程、建仓、自助接入和 prod 外部能力均要求生产审批。
+`gitlab-release.approver_tier` 缺省为 prod，非法值会禁用能力并给出 setupHint。非只读流程显式启用发布工具且声明 standard 能力时，可由服务 Owner 批准 Tag。配置 `jumpserver.environments` 后，`jms_job` 发卡与执行前对全部实时资产核验环境的 match 和 blocked_assets。未配置 owner 时按既有审批等级投票。配置人类 owner 后，仅名单内项目成员在实时资产校验通过时可以放行。生产环境禁止 Bot 担任负责人。prod 流程、建仓、自助接入和 prod 外部能力均要求生产审批。
 
 JumpServer 的即时作业与带变量的 Playbook 定义均显式提交 `is_periodic: false`。兼容接口的 HTML 404 分别回退到资产详情的 `permed_accounts` 与 Ansible 执行日志，后者去除 NUL 填充。其他 HTTP 错误在父进程记录状态和脱敏原文，工具轨迹保留短摘要。失败执行写入 `delivery_executions`，最新执行成功后才可自动关单。

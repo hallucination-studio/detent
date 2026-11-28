@@ -20,8 +20,8 @@ type GateResult = PermissionResult & { approvalId?: string };
 const deny = (message: string): PermissionResult => ({ behavior: 'deny', message });
 export class ToolDenied extends Error {}
 export class ColdHold extends Error {
-  constructor(pending: ApprovalRequestRow) {
-    super(pending.approvalType === 'ASK_USER' ? '💬 需要你的确认，请查看下方问题并直接回复。' :
+  constructor(readonly approval: ApprovalRequestRow) {
+    super(approval.approvalType === 'ASK_USER' ? '💬 需要你的确认，请查看下方问题并直接回复。' :
       '📋 已提交操作审批，请在下方的审批卡中点 👍 放行或 👎 拒绝。');
   }
 }
@@ -201,6 +201,7 @@ export class PermissionGate {
         ?? renderToolApprovalCard(a, requireProd ? '生产审批人' : '项目成员');
       const note = await this.channel.createNote(renderNote(card, this.secrets));
       await repo.updateApprovalNoteId(a.id, note.id);
+      a.gitlabNoteId = note.id;
     } catch (error) {
       await resolveApproval(repo, s, a.id, 'EXPIRED', 'detent', '审批卡片发布失败', this.ctx.onApprovalResolved, this.secrets);
       throw error;

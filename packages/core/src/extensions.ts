@@ -8,7 +8,7 @@ import type { GitLabClient } from './gitlab/client.js';
 import type { SessionOrchestrator } from './orchestrator/session-orchestrator.js';
 import type { McpCapabilityConfig } from './extensions/mcp-bridge.js';
 import type { WorkflowApproverTier } from './workflows/hub-agents.js';
-import type { ApprovalRequestRow, ApprovalType, IssueSessionRow, PermissionMode } from './types.js';
+import type { ApprovalRequestRow, ApprovalType, IssueSessionRow, PermissionMode, SessionMergeRequestRow } from './types.js';
 
 export type ToolGovernancePolicy = 'readonly' | 'coding_auto' | 'always_approve';
 
@@ -64,7 +64,20 @@ export interface SandboxScope {
   sharedSkills?: readonly string[];
 }
 
+interface ApprovalVote {
+  projectId: number;
+  userId: number;
+  username: string;
+  approvalType: ApprovalType;
+  toolName: string;
+  toolInput?: Record<string, unknown>;
+}
 export interface TurnProfile {
+  canBotMergeMr?(params: {
+    mr: SessionMergeRequestRow; diffs: readonly { old_path: string; new_path: string }[]; environment?: string;
+  }): Promise<{ ok: true } | { ok: false; reason: string }>;
+  shouldAutoApproveAsBot?(approval: Pick<ApprovalRequestRow, 'approvalType' | 'toolName' | 'toolInput'>): boolean | Promise<boolean>;
+  formatApprovalDenial?(params: ApprovalVote): string | undefined | Promise<string | undefined>;
   workflow?: WorkflowToolConfig;
   closePolicy?: IssueClosePolicy;
   canCloseIssue?(ctx: { session: IssueSessionRow; repo: DetentRepository }): Promise<{ ok: true } | { ok: false; reason: string }>;
@@ -75,21 +88,14 @@ export interface TurnProfile {
   sandboxScope?: SandboxScope;
   enabledExtensionTools?: readonly string[];
   disableBash?: boolean;
-  canApprove?(params: {
-    projectId: number;
-    userId: number;
-    username: string;
-    approvalType: ApprovalType;
-    toolName: string;
-    toolInput?: Record<string, unknown>;
-  }): Promise<boolean>;
+  canApprove?(params: ApprovalVote): Promise<boolean>;
 }
 
 export type TurnProfileResolver = (ctx: {
   session: IssueSessionRow;
   repo: DetentRepository;
   gitlab: Pick<GitLabClient, 'getIssue' | 'hasApprovalPermission'> &
-    Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile'>>;
+    Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile' | 'getBotIdentity' | 'isBotUser'>>;
   capabilities?: readonly DetentCapabilityPack[];
   purpose?: 'turn' | 'approval';
   approval?: Pick<ApprovalRequestRow, 'approvalType' | 'toolName'> & Partial<Pick<ApprovalRequestRow, 'toolInput'>>;

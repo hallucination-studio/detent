@@ -152,8 +152,9 @@ Core 加载 Hub SOP、检查所需能力并提供受审批的 GitLab 发版工�
 - Core 在 `gitlab-release` 内按项目、ID 或 ref 持久化流水线等待，触发时自动订阅。用含 skipped 的终态、未创建、并发及重放事件验证等待登记、状态更新、一次唤醒、关单拦截和过期清理。断言重复系统事件跳过抢租约，晚到回调跳过已关闭会话。
 - Delivery 以审批单的原始工具参数和当前 Hub 配置计算审批级别。验证 Owner 可批准显式 standard 的 Tag 和 pre 作业，跨环境资产被拒，等待审批时资产移出、黑名单变化、能力撤销或 prod SOP 均不能降低门槛。
 - 集成 E2E 串起 Tag 构建回调、pre 配置 MR、跨仓晋级流水线和 prod 交接。失败场景验证阻断、保持工单打开及通过独立 MR 恢复上一稳定 Tag。
-- 真实 SOP10 在运行时改写测试 Hub 的环境矩阵。Developer 合并和放行 pre，Maintainer 接棒 prod，并核验 Developer 的生产审批被拒、两个命名空间的 Helm 状态和实际镜像版本、工单关闭及 Worktree 归档。
+- 真实 SOP10 在运行时改写测试 Hub 的环境矩阵。Bot 合并 pre 文件并在原卡批准直执，服务单通过实际 HTTP 冒烟后派生生产单并关单。核验生产负责人的 MR 合并、点名拒绝非负责人、批准直执、两个命名空间的就绪副本、镜像、两单终态与归档。
 - 真实 SOP11 在 SOP10 验收后的同一集群开独立 env-change 工单。验证仅改生产 values，Developer 的执行审批被拒，SRE 合并并批准后 prod 恢复上一稳定镜像，pre 的镜像、Deployment 和 Helm revision 保持一致，回滚工单自动关闭并归档。单独选择 SOP11 时自动先跑 SOP10，各自使用完整的场景时限。
+- SOP12 核验 pre 实际版本落后时生产单保持打开、普通成员无法强批；目标人类负责人记录风险后方可提交生产 MR。
 - SOP4、SOP7 验证存量仓库按原结构最小修改，SOP8、SOP9 校验新仓的 Ansible 和 Helm 基线。
 
 ## V4 演进实施计划：Issue 自动闭环终止条件与真实服务栈 SOP E2E

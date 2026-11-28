@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 
 type Actor = 'dev' | 'sre' | 'reporter';
-type Issue = { iid: number; state: string; labels: string[] };
+type Issue = { iid: number; state: string; labels: string[]; description: string; web_url: string; author: { username: string } };
 type Note = { id: number; body: string; author: { username: string }; system: boolean; type?: string };
 type DiffRefs = { base_sha: string; start_sha: string; head_sha: string };
 type InlinePosition = DiffRefs & { position_type: 'text'; old_path: string; new_path: string; new_line: number };
 type MR = {
   iid: number; state: string; source_project_id: number; target_project_id: number; sha: string;
   source_branch: string; target_branch: string; assignees: { id: number; username: string }[]; diff_refs: DiffRefs | null;
+  merge_commit_sha: string; merge_user: { username: string } | null;
 };
 type Discussion = { id: string; notes: Note[] };
 type Project = { id: number; path_with_namespace: string };
@@ -87,13 +88,17 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
     getIssue(id: number, iid: number) { return api.json<Issue>(issues(id, iid)); },
     getIssueNote(id: number, iid: number, noteId: number) { return api.json<Note>(issues(id, iid) + '/notes/' + noteId); },
     listIssueNotes(id: number, iid: number) { return api.all<Note>(issues(id, iid) + '/notes?order_by=created_at&sort=desc'); },
+    noteAwards(id: number, iid: number, note: number) {
+      return api.all<{ name: string; user: { username: string } }>(issues(id, iid) + '/notes/' + note + '/award_emoji');
+    },
     async awardThumbsUp(id: number, iid: number, noteId: number, actor: Actor) {
       await api.request(issues(id, iid) + '/notes/' + noteId + '/award_emoji', 'POST', { name: 'thumbsup' }, tokens[actor]);
     },
-    async postNote(id: number, iid: number, body: string) {
-      await api.request(issues(id, iid) + '/notes', 'POST', { body }, tokens.dev);
+    async postNote(id: number, iid: number, body: string, actor: Actor = 'dev') {
+      await api.request(issues(id, iid) + '/notes', 'POST', { body }, tokens[actor]);
     },
     getMr(id: number, iid: number) { return api.json<MR>(mr(id, iid)); },
+    listMrs(id: number) { return api.all<{ iid: number }>(project(id) + '/merge_requests?scope=all'); },
     mrDiffs(id: number, iid: number) {
       return api.all<{ old_path: string; new_path: string; new_file: boolean; deleted_file: boolean; diff: string }>(mr(id, iid) + '/diffs');
     },
@@ -108,14 +113,6 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
     },
     getDiscussion(id: number, iid: number, discussion: string) {
       return api.json<Discussion>(mr(id, iid) + '/discussions/' + encodeURIComponent(discussion));
-    },
-    async permitDeveloperMerge(id: number) {
-      const path = project(id) + '/protected_branches';
-      const rule = await api.lookup<{ merge_access_levels: { access_level: number }[] }>(path + '/main');
-      if (rule?.merge_access_levels.some(level => level.access_level === 30)) return;
-      // GitLab CE ignores allowed_to_merge updates. Replace the rule on this run's fresh chart project.
-      if (rule) await api.request(path + '/main', 'DELETE');
-      await api.request(path, 'POST', { name: 'main', merge_access_level: 30, push_access_level: 40 });
     },
     async mergeMergeRequest(id: number, iid: number, sha?: string, actor: 'dev' | 'sre' = 'sre') {
       const path = mr(id, iid) + '/merge';

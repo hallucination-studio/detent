@@ -19,7 +19,7 @@ export {
 export { escapeTableCell as escapeMarkdownCell, neutralizeQuickActions, renderApprovalCard } from './gitlab/note-streamer.js';
 export { createWebhookApp, normalizeGitLabEvent } from './gitlab/webhook.js';
 export { SessionOrchestrator, SessionBusy } from './orchestrator/session-orchestrator.js';
-export type { DetentRepository } from './db/repository.js';
+export { recordMergedMr, type DetentRepository } from './db/repository.js';
 export type { ApprovalRequestRow, ApprovalType, IssueSessionRow, SessionKind, SessionInboxRow, InboxStatus, NormalizedGitLabEvent, PermissionMode, SessionMergeRequestRow } from './types.js';
 export type {
   AnyDetentExtensionTool, ExtensionToolContext, ExtensionWebhookEvent, DetentCapabilityPack, DetentExtensions, DetentExtensionTool, SessionLifecycleHooks,

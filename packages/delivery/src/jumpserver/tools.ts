@@ -1,6 +1,6 @@
-import { defineExtensionTool, escapeMarkdownCell, logError, renderApprovalCard, type AnyDetentExtensionTool, type ExtensionToolContext, type DecisionClient, type DetentCapabilityPack, type WorkflowApproverTier } from '@detent/core';
+import { defineExtensionTool, escapeMarkdownCell, logError, renderApprovalCard, type AnyDetentExtensionTool, type ExtensionToolContext, type DecisionClient, type DetentCapabilityPack } from '@detent/core';
 import { z } from 'zod';
-import { authSecrets, redactSecrets, type DeliveryConfig } from '../config.js';
+import { authSecrets, environmentConfig, isBotName, isProdEnv, mentionOwners, ownerSetupHint, redactSecrets, type DeliveryConfig } from '../config.js';
 import type { JobResultResponse, JumpServerAsset, JumpServerClient } from './client.js';
 import { findBlockedAssets, matchAssets, normalizeShellCommand, validatePlaybookPath, validateShellCommands } from './guards.js';
 
@@ -47,16 +47,14 @@ async function verifyMerge(input: JobInput, ctx: ExtensionToolContext, blockFail
 
 interface JumpServerOptions {
   client: JumpServerClient; config: DeliveryConfig; tracker?: DeliveryExecutionTracker; decision?: DecisionClient; defaultAccount?: string;
+  botUsername?: string;
   onTerminalResult?: (sessionId: string, jobId: string, result: JobResultResponse) => Promise<void>;
 }
 
-function environmentConfig(config: DeliveryConfig, environment?: string) {
-  return environment && config.environments && Object.hasOwn(config.environments, environment)
-    ? config.environments[environment] : undefined;
-}
-
-async function resolveTargetAssets({ client, config }: JumpServerOptions, assetIds: string[], role: 'readonly' | 'job', environment?: string) {
-  const scope = environmentConfig(config, environment);
+async function resolveTargetAssets({ client, config, botUsername }: JumpServerOptions, assetIds: string[], role: 'readonly' | 'job', environment?: string) {
+  const invalid = role === 'job' && ownerSetupHint(config.environments, botUsername);
+  if (invalid) return deny(invalid);
+  const scope = environmentConfig(config.environments, environment);
   if (role === 'job' && config.environments && Object.keys(config.environments).length && !scope)
     return deny('请选择已配置的环境：' + Object.keys(config.environments).join('、'));
   const ids = [...new Set(assetIds)];
@@ -83,21 +81,21 @@ async function resolveTargetAssets({ client, config }: JumpServerOptions, assetI
 }
 
 export interface JumpServerCapability extends DetentCapabilityPack {
-  jobApprovalTier(input?: Record<string, unknown>): Promise<WorkflowApproverTier>;
+  environments: DeliveryConfig['environments'];
+  validJobTargets(input?: Record<string, unknown>): Promise<boolean>;
 }
 
 export function createJumpServerCapability(name: string, options: JumpServerOptions): JumpServerCapability {
-  return { name, enabled: true, tools: createJumpServerTools(options),
-    async jobApprovalTier(input) {
+  return { name, enabled: true, tools: createJumpServerTools(options), environments: options.config.environments,
+    async validJobTargets(input) {
       const env = typeof input?.environment === 'string' ? input.environment : undefined;
-      if (environmentConfig(options.config, env)?.approverTier !== 'standard') return 'prod';
       const ids = jobSchema.asset_ids.safeParse(input?.asset_ids);
-      if (!ids.success) return 'prod';
+      if (!ids.success || !environmentConfig(options.config.environments, env)) return false;
       try {
-        return (await resolveTargetAssets(options, ids.data, 'job', env)).ok ? 'standard' : 'prod';
+        return (await resolveTargetAssets(options, ids.data, 'job', env)).ok;
       } catch (error) {
         logError('delivery-approval', error, authSecrets(options.config.jumpserverJobAuth));
-        return 'prod';
+        return false;
       }
     },
   };
@@ -193,11 +191,12 @@ export function createJumpServerTools(options: JumpServerOptions): AnyDetentExte
         ];
         if (input.extra_vars) rows.push(['变更变量', cell(JSON.stringify(input.extra_vars), 'code')]);
         rows.push(['变更原因', cell(input.reason ?? '未提供')]);
-        const production = ctx.workflow?.approverTier === 'prod' ||
-          environmentConfig(config, input.environment)?.approverTier !== 'standard';
+        const env = environmentConfig(config.environments, input.environment);
+        const production = ctx.workflow?.approverTier === 'prod' || isProdEnv(input.environment, env?.approverTier);
+        const humanOwners = env?.owners?.length && !env.owners.some(o => isBotName(o, options.botUsername));
         const title = production ? '生产变更执行审批' : '环境变更执行审批';
         return redactSecrets(renderApprovalCard({ icon: '🚀', title, badge: input.environment, rows, approvalId,
-          approverHint: production ? '生产审批人' : '项目成员' }), config);
+          approverHint: humanOwners ? '环境负责人 ' + mentionOwners(env.owners!) : production ? '生产审批人' : '项目成员' }), config);
       },
       async execute(input, ctx) {
         const { approvalId } = ctx;

@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, posix } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Pool, RowDataPacket } from 'mysql2/promise';
@@ -165,7 +166,7 @@ class Scenario {
     return session;
   }
 
-  async approveProduction(iid: number, afterSeq: number, tool: string, beforeApproval: (card: RowDataPacket) => Promise<void>) {
+  async approveProduction(iid: number, afterSeq: number, tool: string, beforeApproval: (card: RowDataPacket) => Promise<void>, denial = /生产审批权限|Maintainer/i) {
     const session = await this.state(iid, 'WAITING_TOOL', afterSeq);
     assert.equal(session.locked_by_pod, null, 'Worker is still holding the lease for ' + tool);
     const card = await this.card(session, 'TOOL_USE', tool);
@@ -174,7 +175,7 @@ class Scenario {
     await this.gl.awardThumbsUp(this.ctx.hub, iid, card.gitlab_note_id, 'dev');
     await this.until('production permission denial on Issue #' + iid, async () => {
       assert.equal((await this.card(session, 'TOOL_USE', tool)).id, card.id, 'Developer bypassed production approval');
-      return (await notes()).find(n => !existing.has(n.id) && !n.system && n.author.username === 'detent-bot' && /生产审批权限|Maintainer/i.test(n.body));
+      return (await notes()).find(n => !existing.has(n.id) && !n.system && n.author.username === 'detent-bot' && denial.test(n.body));
     });
     const stillPending = await this.card(await this.state(iid, 'WAITING_TOOL'), 'TOOL_USE', tool);
     assert.equal(stillPending.id, card.id);
@@ -229,11 +230,11 @@ class Scenario {
     throw Error('Missing detent_submit_plan tool call in session ' + session.id);
   }
 
-  async shellEvidence(session: Session, evidence: RegExp, afterSeq = 0, afterTime = 0) {
+  async shellEvidence(session: Session, evidence: RegExp, afterSeq = 0, afterTime = 0, command?: RegExp) {
     const calls = new Set<string>();
     for await (const { block, timestamp } of this.transcriptBlocks(session, afterSeq)) {
       if (block.type === 'tool_use' && /^(?:mcp__detent__)?jms_shell$/.test(block.name) &&
-          (!afterTime || Date.parse(timestamp) >= afterTime)) calls.add(block.id);
+          (!afterTime || Date.parse(timestamp) >= afterTime) && (!command || command.test(JSON.stringify(block.input.commands)))) calls.add(block.id);
       if (block.type !== 'tool_result' || !calls.has(block.tool_use_id) || block.is_error) continue;
       const texts = typeof block.content === 'string' ? [block.content] :
         (block.content ?? []).map((part: { text?: string }) => part.text ?? '');
@@ -502,20 +503,29 @@ async function sop4(h: Scenario) {
 async function sop5(h: Scenario) {
   const { web } = h.ctx;
   const sha = await h.gl.headSha(web.id);
-  const tag = 'v1.0.0';
-  const iid = await h.open('发布 Web 正式版', `请把 ${web.path_with_namespace} 当前 main 的最新提交发布为 v1.0.0 正式版，打上 Tag 并发布 GitLab Release。这次不涉及环境部署。`, 'delivery::release');
-  const plan = await h.approvePlan(iid);
-  const session = await h.state(iid, 'WAITING_TOOL', plan.last_message_seq);
-  assert.equal(await h.gl.getTag(web.id, tag), null);
-  assert.equal(await h.gl.getRelease(web.id, tag), null);
-  await h.approve(iid, await h.card(session, 'TOOL_USE', 'detent_create_release'), 'dev');
-  await h.done(iid, { afterSeq: session.last_message_seq });
-  assert.equal(await h.gl.headSha(web.id), sha);
-  assert.equal((await h.gl.getTag(web.id, tag))?.commit.id, sha);
-  const release = await h.gl.getRelease(web.id, tag);
-  assert.equal(release?.tag_name, tag);
-  assert.equal(release.commit.id, sha);
-  console.log(`  GitLab Tag and Release ${tag} both point to main at ${sha}`);
+  for (const [tag, request, tagOnly] of [
+    ['v1.0.0', '打上 Tag 并发布 GitLab Release', false],
+    ['v1.0.1', '仅打 Git Tag，不创建 GitLab Release', true],
+  ] as const) {
+    const iid = await h.open('为 Web 定版 ' + tag, `请为 ${web.path_with_namespace} 当前 main 的最新提交${request}，版本为 ${tag}。这次不涉及环境部署。`, 'delivery::release');
+    const plan = await h.approvePlan(iid);
+    const session = await h.state(iid, 'WAITING_TOOL', plan.last_message_seq);
+    assert.equal(await h.gl.getTag(web.id, tag), null);
+    assert.equal(await h.gl.getRelease(web.id, tag), null);
+    await h.approve(iid, await h.card(session, 'TOOL_USE', 'detent_create_release'), 'dev');
+    const closed = await h.done(iid, { afterSeq: session.last_message_seq });
+    assert.equal(await h.gl.headSha(web.id), sha);
+    assert.equal((await h.gl.getTag(web.id, tag))?.commit.id, sha);
+    const release = await h.gl.getRelease(web.id, tag);
+    if (tagOnly) assert.equal(release, null);
+    else {
+      assert.equal(release?.tag_name, tag);
+      assert.equal(release.commit.id, sha);
+    }
+    assert.equal((await h.rows('SELECT id FROM delivery_executions WHERE session_id=?', [closed.id])).length, 0);
+    assert.equal((await h.rows('SELECT id FROM session_merge_requests WHERE session_id=?', [closed.id])).length, 0);
+    console.log(`  GitLab ${tagOnly ? 'Tag only' : 'Tag and Release'} ${tag} at ${sha}, no environment change`);
+  }
 }
 
 async function sop6(h: Scenario) {
@@ -613,7 +623,7 @@ async function sop9(h: Scenario) {
   await checkRelease(stack.targetContainerName, { namespace, replicas: 3 });
 }
 
-const stableTag = '1.36';
+const stableTag = '1.36.0';
 const releaseTag = '1.36.1';
 const releaseNamespace = (hub: number, env: 'pre' | 'prod') => env + '-' + hub;
 
@@ -622,8 +632,8 @@ export async function withReleaseTopology({ hub, web, helm, stack, gitlab }: Pic
   const [original, config] = await Promise.all([gitlab.getFile(hub, topology), gitlab.getFile(hub, 'capabilities.json')]);
   const caps = JSON.parse(config);
   caps.jumpserver.environments = {
-    pre: { match: ['label:env:pre'], approver_tier: 'standard' },
-    prod: { match: ['/DEFAULT/prod/app'] },
+    pre: { match: ['label:env:pre'], approver_tier: 'standard', owner: '@detent-bot' },
+    prod: { match: ['/DEFAULT/prod/app'], approver_tier: 'prod', owner: '@e2e-sre' },
   };
   const pre = releaseNamespace(hub, 'pre');
   const prod = releaseNamespace(hub, 'prod');
@@ -633,14 +643,15 @@ export async function withReleaseTopology({ hub, web, helm, stack, gitlab }: Pic
       '', '## 本次在线生效的环境矩阵',
       `demo-api 的应用仓为 ${web.path_with_namespace}，Helm 配置仓为 ${helm.path_with_namespace}。发布顺序为 pre → prod。`,
       `两套部署共用集群，pre 的命名空间为 ${pre}，prod 为 ${prod}，release 名均为 demo-api。`,
-      'pre 选择 pre-node-01，由 @e2e-dev 合并、放行。prod 选择 target-node-01，在工单 @e2e-sre 交接并由其合并、放行。',
+      '本次拓扑的首个环境是 pre，部署机为 pre-node-01。prod 部署机为 target-node-01。负责人以能力配置为准。',
+      `pre 的 promotion_gate 为端到端 HTTP 冒烟：从 pre 发布机经 Kubernetes Service 代理读取 /api/v1/namespaces/${pre}/services/demo-api:8080/proxy/etc/hostname，响应须为实际 demo-api Pod 的主机名。交接时记录响应与运行版本。`,
       '两个发布机都通过 JumpServer 访问集群，集群的 Helm 参数见 CLAUDE.md。',
     ].join('\n'), 'Set live release topology and handoff');
     await run();
   } finally {
     // Use the untimed fixture client even when a scenario has reached its deadline.
     try {
-      await targetCommand(stack.targetContainerName, 'kubectl', 'delete', 'namespace', pre, prod, '--ignore-not-found', '--timeout=25s');
+      await targetCommand(stack.targetContainerName, 'kubectl', 'delete', 'namespace', pre, prod, '--ignore-not-found', '--timeout=75s');
     } finally {
       for (const [path, contents] of [[topology, original], ['capabilities.json', config]]) {
         if (await gitlab.getFile(hub, path) !== contents) await gitlab.upsertFile(hub, path, contents, 'Restore ' + path);
@@ -652,37 +663,50 @@ export async function withReleaseTopology({ hub, web, helm, stack, gitlab }: Pic
 async function deployedImage(h: Scenario, env: 'pre' | 'prod', tag: string) {
   const namespace = releaseNamespace(h.ctx.hub, env);
   const target = h.ctx.stack.targetContainerName;
-  const [status, metadata, values, deployment] = (await Promise.all([
+  await targetCommand(target, 'kubectl', 'rollout', 'status', 'deployment/demo-api', '-n', namespace, '--timeout=25s');
+  const { stdout } = await run('docker', ['compose', '-p', 'detent-e2e', '-f', fileURLToPath(new URL('./docker-compose.e2e.yml', import.meta.url)),
+    'exec', '-T', 'k3s', 'crictl', 'inspecti', 'busybox:' + tag]);
+  const digests: string[] = JSON.parse(stdout).status.repoDigests;
+  const [status, metadata, values, deployment, pods] = (await Promise.all([
     targetCommand(target, 'helm', 'status', 'demo-api', '-n', namespace, '-o', 'json'),
     targetCommand(target, 'helm', 'get', 'metadata', 'demo-api', '-n', namespace, '-o', 'json'),
     targetCommand(target, 'helm', 'get', 'values', 'demo-api', '-n', namespace, '--all', '-o', 'json'),
     targetCommand(target, 'kubectl', 'get', 'deployment', 'demo-api', '-n', namespace, '-o', 'json'),
+    targetCommand(target, 'kubectl', 'get', 'pods', '-n', namespace, '-o', 'json'),
   ])).map(json => JSON.parse(json));
   assert.equal(status.namespace, namespace);
   assert.equal(status.info.status, 'deployed');
   assert.equal(String(values.image.tag), tag);
   const image = deployment.spec.template.spec.containers[0].image;
   assert.equal(image, 'busybox:' + tag);
-  console.log(`  K3s ${namespace}: Helm deployed revision ${status.version}, Deployment demo-api ${image}`);
-  return { revision: status.version, chartVersion: metadata.version, uid: deployment.metadata.uid, generation: deployment.metadata.generation };
+  assert.equal(deployment.status.availableReplicas, deployment.spec.replicas);
+  const live = pods.items.filter((pod: { metadata: { deletionTimestamp?: string } }) => !pod.metadata.deletionTimestamp);
+  assert.equal(live.length, deployment.spec.replicas);
+  assert.ok(live.length > 0, 'Expected at least one running service Pod');
+  for (const pod of live) {
+    const container = pod.status.containerStatuses[0];
+    assert.equal(pod.spec.containers[0].image, image);
+    assert.ok(container.ready && container.state.running && digests.includes(container.imageID), 'Running Pod image differs from ' + image);
+  }
+  const imageID = live[0].status.containerStatuses[0].imageID;
+  console.log(`  K3s ${namespace}: Helm deployed revision ${status.version}, Deployment demo-api ${image}, running ${imageID}`);
+  return { revision: status.version, chartVersion: metadata.version, uid: deployment.metadata.uid, generation: deployment.metadata.generation, imageID };
 }
 
-async function deployEnvironment(h: Scenario, iid: number, previous: Session, env: 'pre' | 'prod', tag: string, beforeDeploy: () => Promise<void>) {
+async function deployEnvironment(h: Scenario, iid: number, previous: Session, env: 'pre' | 'prod', tag: string, beforeDeploy?: () => Promise<void>) {
   const { hub, helm, stack } = h.ctx;
   const pre = env === 'pre';
   const namespace = releaseNamespace(hub, env);
-  const actor = pre ? 'dev' : 'sre';
   const asset = pre ? stack.preAssetId : stack.targetAssetId;
-  const link = await h.until(env + ' configuration MR', async () => {
-    const rows = await h.rows("SELECT * FROM session_merge_requests WHERE session_id=? AND mr_state='opened'", [previous.id]);
-    if (!rows.length) return;
-    assert.equal(rows.length, 1, 'Expected only the current environment MR');
-    return rows[0];
+  const link = await h.until(env + ' configuration MR ' + (pre ? 'merged by Bot' : 'awaiting SRE'), async () => {
+    const rows = await h.rows('SELECT * FROM session_merge_requests WHERE session_id=?', [previous.id]);
+    assert.ok(rows.length <= 1, 'Each Issue must track only its own environment MR');
+    return rows[0]?.mr_state === (pre ? 'merged' : 'opened') && rows[0];
   });
-  const waiting = await h.state(iid, 'IDLE', previous.last_message_seq);
+  const waiting = pre ? previous : await h.state(iid, 'IDLE', previous.last_message_seq);
   assert.equal(link.target_project_id, helm.id);
   const mr = await h.gl.getMr(helm.id, link.mr_iid);
-  assert.equal(mr.state, 'opened');
+  assert.equal(mr.state, pre ? 'merged' : 'opened');
   const file = 'values-' + env + '.yaml';
   const diffs = await h.gl.mrDiffs(helm.id, mr.iid);
   assert.deepEqual(diffs.map(d => [d.old_path, d.new_path, d.new_file, d.deleted_file]), [[file, file, false, false]]);
@@ -691,9 +715,13 @@ async function deployEnvironment(h: Scenario, iid: number, previous: Session, en
   assert.equal((await h.gl.getIssue(hub, iid)).state, 'opened');
   if (!pre) assert.ok((await h.gl.listIssueNotes(hub, iid)).some(n => n.author.username === 'detent-bot' &&
     n.body.replace(/<details\b[^>]*>[\s\S]*?<\/details>/gi, '').includes('@e2e-sre')), 'Missing production handoff');
-  await beforeDeploy();
-  const merged = await h.gl.mergeMergeRequest(helm.id, mr.iid, mr.sha, actor);
-  console.log(`  e2e-${actor} merged !${mr.iid} at ${merged}, only ${file} changed, image.tag=${tag}`);
+  if (pre) {
+    assert.equal(mr.merge_user?.username, 'detent-bot');
+    assert.equal(link.merged_by, 'detent-bot');
+    assert.equal(link.merge_commit_sha, mr.merge_commit_sha);
+  } else await beforeDeploy?.();
+  const merged = pre ? mr.merge_commit_sha : await h.gl.mergeMergeRequest(helm.id, mr.iid, mr.sha, 'sre');
+  console.log(`  ${pre ? 'detent-bot' : 'e2e-sre'} merged !${mr.iid} at ${merged}, only ${file} changed, image.tag=${tag}`);
   async function checkCard(job: RowDataPacket) {
     const input = typeof job.tool_input === 'string' ? JSON.parse(job.tool_input) : job.tool_input;
     assert.equal(input.environment, env);
@@ -702,18 +730,29 @@ async function deployEnvironment(h: Scenario, iid: number, previous: Session, en
     assert.equal(input.mr_iid, mr.iid);
     assert.equal(input.target_project_id, helm.id);
     assert.ok(input.command.includes(namespace), 'Deployment ignored the live topology');
-    assert.equal((await h.rows('SELECT id FROM delivery_executions WHERE mr_id=?', [link.id])).length, 0);
-    await beforeDeploy();
+    if (!pre) {
+      const note = await h.gl.getIssueNote(hub, iid, job.gitlab_note_id);
+      assert.match(note.body, /> 请环境负责人 @e2e-sre/);
+      assert.equal((await h.rows('SELECT id FROM delivery_executions WHERE mr_id=?', [link.id])).length, 0);
+      await beforeDeploy?.();
+    }
   }
   let session: Session;
   let card: RowDataPacket;
   if (pre) {
-    session = await h.state(iid, 'WAITING_TOOL', waiting.last_message_seq);
-    card = await h.card(session, 'TOOL_USE', 'jms_job');
+    session = previous;
+    card = await h.until('Bot decision on original pre approval card', async () => {
+      const [row] = await h.rows("SELECT * FROM approval_requests WHERE session_id=? AND tool_name='jms_job' AND status='APPROVED'", [session.id]);
+      return row;
+    });
+    assert.equal(card.decided_by, 'detent-bot');
     await checkCard(card);
-    await h.approve(iid, card, 'dev');
+    await h.until('Bot approval written back to GitLab', async () =>
+      (await h.gl.getIssueNote(hub, iid, card.gitlab_note_id)).body.includes('✅ **已批准** · 由 @detent-bot 确认'));
+    assert.ok((await h.gl.noteAwards(hub, iid, card.gitlab_note_id)).some(e => e.name === 'thumbsup' && e.user.username === 'detent-bot'));
   } else {
-    ({ session, card } = await h.approveProduction(iid, waiting.last_message_seq, 'jms_job', checkCard));
+    ({ session, card } = await h.approveProduction(iid, waiting.last_message_seq, 'jms_job', checkCard,
+      /该操作需要环境负责人（@e2e-sre）在审批卡上点 👍 放行/));
   }
   const execution = await h.successfulExecution(card.id);
   assert.equal(execution.commit_sha, merged);
@@ -722,14 +761,15 @@ async function deployEnvironment(h: Scenario, iid: number, previous: Session, en
   return session;
 }
 
-async function approveTopologyPlan(h: Scenario, iid: number, tagProject?: Project) {
+async function approveTopologyPlan(h: Scenario, iid: number, tagProject?: Project, promote = false) {
   const plan = await h.state(iid, 'WAITING_PLAN');
   const tools = await h.planTools(plan);
   assert.ok(tools.some(t => t.name === 'Read' && String(t.input.file_path).endsWith('skills/env-topology/SKILL.md')),
     'Missing shared topology read before the plan');
   if (tagProject) assert.ok(tools.some(t => t.name === 'detent_list_tags' &&
     [String(tagProject.id), tagProject.path_with_namespace].includes(String(t.input.project))), 'Missing application tag lookup before release plan');
-  await h.approve(iid, await h.card(plan, 'PLAN'), 'dev');
+  if (promote) await h.shellEvidence(plan, /1\.36\.1/, 0, 0, new RegExp(releaseNamespace(h.ctx.hub, 'pre')));
+  await h.approve(iid, await h.card(plan, 'PLAN'), promote ? 'sre' : 'dev');
   return plan;
 }
 
@@ -739,22 +779,37 @@ async function sop10(h: Scenario) {
   await h.gl.upsertFile(web.id, 'release.txt', releaseTag + '\n', 'Prepare the next application version');
   const pinned = await h.gl.headSha(web.id);
   await h.gl.upsertFile(helm.id, 'values-pre.yaml', await h.gl.getFile(helm.id, 'values-prod.yaml'), 'Seed pre from the stable environment');
-  await h.gl.permitDeveloperMerge(helm.id);
   const iid = await h.open('发布 demo-api 并完成环境晋级',
     `请把 ${web.path_with_namespace} 的 main 提交 ${pinned} 发布为 ${releaseTag}。demo-api 的镜像已就绪，上一稳定版本是 ${stableTag}。请用 ${helm.path_with_namespace} 的 Chart 先上预发布环境，验收通过后再上生产。两个环境都是首次安装。`, 'delivery::release');
   const plan = await approveTopologyPlan(h, iid, web);
-  let previous = await h.state(iid, 'WAITING_TOOL', plan.last_message_seq);
+  const previous = await h.state(iid, 'WAITING_TOOL', plan.last_message_seq);
   const card = await h.card(previous, 'TOOL_USE', 'detent_create_release');
   assert.equal(await h.gl.getTag(web.id, releaseTag), null);
+  await namespaceAbsent(h, releaseNamespace(hub, 'pre'));
   await h.approve(iid, card, 'dev');
-  for (const env of ['pre', 'prod'] as const) {
-    previous = await deployEnvironment(h, iid, previous, env, releaseTag, async () => {
-      assert.equal((await h.gl.getTag(web.id, releaseTag))?.commit.id, pinned);
-      await namespaceAbsent(h, releaseNamespace(hub, env));
-    });
-    await deployedImage(h, env, releaseTag);
-  }
-  await h.done(iid, { afterSeq: previous.last_message_seq, requireWorktree: true });
+  await deployEnvironment(h, iid, previous, 'pre', releaseTag);
+  assert.equal((await h.gl.getTag(web.id, releaseTag))?.commit.id, pinned);
+  await deployedImage(h, 'pre', releaseTag);
+  const closed = await h.done(iid, { afterSeq: previous.last_message_seq, requireWorktree: true });
+  await h.shellEvidence(closed, /demo-api-[a-z0-9]+-[a-z0-9]{5}/, previous.last_message_seq, 0, /proxy\/etc\/hostname/);
+  const children = await h.rows(`SELECT s.hub_issue_iid, i.status FROM session_inbox i JOIN issue_sessions s ON s.id=i.session_id
+    WHERE i.event_id LIKE ?`, ['followup:' + closed.id + ':%']);
+  assert.equal(children.length, 1);
+  const child = children[0].hub_issue_iid;
+  const issue = await h.gl.getIssue(hub, child);
+  assert.equal(issue.author.username, 'detent-bot');
+  assert.ok(issue.labels.includes('delivery::env-change'));
+  for (const evidence of ['<!-- detent:followup-from=#' + iid + ' -->', '@e2e-sre', releaseTag, pinned]) assert.ok(issue.description.includes(evidence), 'Missing child evidence: ' + evidence);
+  assert.match(issue.description, /demo-api-[a-z0-9]+-[a-z0-9]{5}/);
+  const parentReport = await h.gl.getIssueNote(hub, iid, closed.active_note_id);
+  assert.ok(parentReport.body.split('<details')[0].includes(issue.web_url), 'Parent report lacks child Issue link');
+  console.log(`  Release Issue #${iid} handed off to env-change #${child} with pre HTTP evidence`);
+  const envPlan = await approveTopologyPlan(h, child, undefined, true);
+  assert.equal((await h.rows('SELECT status FROM session_inbox WHERE session_id=? AND event_id=?',
+    [envPlan.id, 'followup:' + closed.id + ':' + child]))[0]?.status, 'CONSUMED');
+  const prod = await deployEnvironment(h, child, envPlan, 'prod', releaseTag, () => namespaceAbsent(h, releaseNamespace(hub, 'prod')));
+  await deployedImage(h, 'prod', releaseTag);
+  await h.done(child, { afterSeq: prod.last_message_seq, requireWorktree: true });
 }
 
 async function sop11(h: Scenario) {
@@ -780,11 +835,62 @@ async function sop11(h: Scenario) {
   assert.deepEqual(await deployedImage(h, 'pre', releaseTag), pre, 'Rollback changed the pre Helm release or Deployment');
   const restored = await deployedImage(h, 'prod', stableTag);
   assert.ok(restored.revision > prod.revision, 'Expected a new Helm revision for the production rollback');
+  assert.notEqual(restored.imageID, prod.imageID, 'Rollback must restore a different running image digest');
   assert.equal(restored.chartVersion, prod.chartVersion);
   console.log(`  Rollback #${iid}: Chart.yaml (${restored.chartVersion}) and values-pre.yaml unchanged, pre revision ${pre.revision}, prod revision ${prod.revision} -> ${restored.revision}`);
 }
 
-const scenarios = { sop1, sop2, sop3, sop4, sop5, sop6, sop7, sop8, sop9, sop10, sop11 };
+async function sop12(h: Scenario) {
+  const { stack, hub, helm } = h.ctx;
+  const target = stack.targetContainerName;
+  const pre = releaseNamespace(hub, 'pre');
+  const fixture = fileURLToPath(new URL('./fixtures/helm-charts', import.meta.url));
+  const dir = await targetCommand(target, 'mktemp', '-d');
+  try {
+    await run('docker', ['cp', fixture + '/.', target + ':' + dir]);
+    await targetCommand(target, 'helm', 'upgrade', '--install', 'demo-api', dir, '-n', pre, '--create-namespace', '--wait');
+  } finally { await run('docker', ['exec', target, 'rm', '-rf', dir]); }
+  await h.gl.upsertFile(helm.id, 'values-pre.yaml', 'image:\n  tag: "' + stableTag + '"\n', 'Set pre to its running version');
+  await deployedImage(h, 'pre', stableTag);
+  const baselineMrs = (await h.gl.listMrs(helm.id)).map(mr => mr.iid);
+  const iid = await h.open('生产窗口发布 demo-api',
+    `请把 demo-api 的生产环境晋级至 ${releaseTag}，镜像已就绪，使用 ${helm.path_with_namespace} 的环境配置。请核对预发布配置和服务现状。`, 'delivery::env-change');
+  async function blocked(afterSeq = 0, checkOwner = false) {
+    const s = await h.state(iid, ['WAITING_PLAN', 'IDLE'], afterSeq);
+    const note = (await h.gl.getIssueNote(hub, iid, s.active_note_id)).body.split('<details')[0];
+    assert.match(note, /阻断|阻塞|未就绪|不一致|不符|不匹配|未达到|准入失败/);
+    assert.ok(note.includes(stableTag) && note.includes(releaseTag));
+    assert.match(note, /修复|修正|升级|补齐|继续/);
+    if (checkOwner) assert.ok(note.includes('@e2e-sre'), 'The denied override must name the configured owner');
+    assert.deepEqual((await h.gl.listMrs(helm.id)).map(mr => mr.iid), baselineMrs, 'A target MR was created while blocked');
+    assert.equal((await h.rows('SELECT id FROM session_merge_requests WHERE session_id=?', [s.id])).length, 0);
+    assert.equal((await h.gl.getIssue(hub, iid)).state, 'opened');
+    return s;
+  }
+  const first = await blocked();
+  await h.shellEvidence(first, /1\.36\.0\b/, 0, 0, new RegExp(pre));
+  let parked = first;
+  if (first.status === 'WAITING_PLAN') {
+    await h.approve(iid, await h.card(first, 'PLAN'), 'dev');
+    parked = await blocked(first.last_message_seq);
+  }
+  await h.gl.postNote(hub, iid, '发布窗口即将结束，我确认接受预发布版本不一致的风险，强制继续生产发布。', 'dev');
+  const denied = await blocked(parked.last_message_seq, true);
+  await h.gl.postNote(hub, iid, '生产存在紧急兼容性问题。我确认接受预发布版本不一致的风险，批准本次强行继续，请记录原因。', 'sre');
+  const next = await h.state(iid, ['WAITING_PLAN', 'IDLE'], denied.last_message_seq);
+  if (next.status === 'WAITING_PLAN') await h.approve(iid, await h.card(next, 'PLAN'), 'sre');
+  const reviewed = await h.state(iid, 'IDLE', next.status === 'WAITING_PLAN' ? next.last_message_seq : denied.last_message_seq);
+  const [mr] = await h.linkedMrs(reviewed, [helm]);
+  assert.deepEqual((await h.gl.mrDiffs(helm.id, mr.iid)).map(d => [d.old_path, d.new_path]), [['values-prod.yaml', 'values-prod.yaml']]);
+  const reports = (await h.gl.listIssueNotes(hub, iid)).filter(n => n.author.username === 'detent-bot' && !n.system)
+    .map(n => n.body.split('<details')[0]).join('\n');
+  assert.match(reports, /@e2e-sre/);
+  assert.match(reports, /兼容性/);
+  await namespaceAbsent(h, releaseNamespace(hub, 'prod'));
+  console.log(`  Issue #${iid}: pre ${stableTag} blocked ${releaseTag}; dev override denied, SRE override recorded; !${mr.iid} awaits human merge`);
+}
+
+const scenarios = { sop1, sop2, sop3, sop4, sop5, sop6, sop7, sop8, sop9, sop10, sop11, sop12 };
 export type SopName = keyof typeof scenarios;
 export const sopNames = Object.keys(scenarios) as SopName[];
 export async function runScenario(name: SopName, context: Context) {

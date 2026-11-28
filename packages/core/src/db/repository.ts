@@ -21,6 +21,13 @@ type MergeMetadata = Pick<SessionMergeRequestRow, 'mergeCommitSha' | 'mergedBy' 
 export type MR = Omit<NewRow<SessionMergeRequestRow>, keyof MergeMetadata> & Partial<MergeMetadata>;
 export type Decision = Exclude<ApprovalStatus, 'PENDING'>;
 
+export async function recordMergedMr(repo: DetentRepository, mr: SessionMergeRequestRow, sha: string | null, username: string, others: SessionMergeRequestRow[]) {
+  if (!await repo.markMergeRequestMerged(mr.id, sha, username)) return false;
+  if (mr.worktreeId && !others.some(row => row.id !== mr.id && row.mrState === 'opened' && row.worktreeId === mr.worktreeId))
+    await repo.archiveWorktree(mr.worktreeId);
+  return true;
+}
+
 export type InboxInput = Pick<SessionInboxRow, 'sessionId' | 'eventId' | 'sourceKind' | 'content'> &
   Partial<Pick<SessionInboxRow, 'senderUsername' | 'discussionId'>>;
 export interface WatchResolution {
@@ -39,6 +46,7 @@ export interface DetentRepository {
   claimPipelineFailure(id: string, pipeline: number, max: number, content: string): Promise<'skip' | 'escalate' | 'run'>;
   markMergeRequestClosed(id: string): Promise<boolean>;
   enqueueSessionInbox(input: InboxInput): Promise<boolean>;
+  getFollowupSession(parent: IssueSessionRow): Promise<IssueSessionRow | null>;
   drainSessionInbox(sessionId: string, owner?: string, sourceKind?: string): Promise<SessionInboxRow[]>;
   failRecovery(sessionId: string): Promise<void>;
   listExpiredActiveSessions(limit?: number): Promise<IssueSessionRow[]>;
@@ -191,6 +199,11 @@ export class MySqlDetentRepository implements DetentRepository {
   }
   enqueueSessionInbox(input: InboxInput) {
     return this.insertInbox(this.pool, input);
+  }
+  async getFollowupSession(parent: IssueSessionRow) {
+    return (await this.rows<IssueSessionRow>('issue_sessions s', `session_kind='issue' AND hub_project_id=? AND EXISTS
+      (SELECT 1 FROM session_inbox i WHERE i.session_id=s.id AND i.event_id=CONCAT('followup:', ?, ':', s.hub_issue_iid)) LIMIT 1`,
+      [parent.hubProjectId, parent.id]))[0] ?? null;
   }
   private async insertInbox(cx: Pool | PoolConnection, input: InboxInput) {
     // A watch UUID plus a large GitLab ID can exceed the existing 64-character deduplication key.

@@ -11,9 +11,11 @@ import { dispatchWebhook } from '../../core/src/gitlab/webhook.js';
 import { WebhookQueue } from '../../core/src/gitlab/webhook-queue.js';
 import { git } from '../../core/src/workspace/ephemeral-sandbox.js';
 import {
-  createDeliveryApp, HttpJumpServerClient, DeliveryJobPoller, createDeliveryTurnProfileResolver, createJumpServerTools, formatDeliveryExecutionsStatus, matchMergeRequestWebhook,
+  createDeliveryApp, HttpJumpServerClient, loadDeliveryConfig, DeliveryJobPoller, createDeliveryTurnProfileResolver, createJumpServerTools, formatDeliveryExecutionsStatus, matchMergeRequestWebhook,
   type DeliveryAuditRepository, type DeliveryExecutionRow,
 } from '../src/index.js';
+import { resolveJumpServerSettings } from '../src/hub-config.js';
+import { createJumpServerCapability } from '../src/jumpserver/tools.js';
 import { deliveryFixture, developer, hub, issue, maintainer, opened } from './delivery-fixture.js';
 
 vi.mock('@detent/core', async original => {
@@ -379,3 +381,107 @@ it.each(['success', 'failed'] as const)('delivers a two-owner release with a cro
   expect(closeIssue).toHaveBeenCalledTimes(outcome === 'success' ? 1 : 0);
   expect(await readdir(config.ephemeralRoot)).toEqual([]);
 }, 30000);
+
+it('normalizes owners and rejects the authenticated Bot on production names or tiers', async () => {
+  const deliveryConfig = loadDeliveryConfig({});
+  const parse = (name: string, tier: string, owner: string | string[]) => resolveJumpServerSettings({
+    type: 'jumpserver', base_url: 'https://jms.test', auth: { token: 'token' },
+    environments: { [name]: { match: ['web01'], approver_tier: tier, owner } },
+  }, {}, deliveryConfig, 'ci-user');
+  expect(parse('pre', 'standard', ['@Alice', 'alice', '@BoB'])).toMatchObject({ config: { environments: { pre: { owners: ['alice', 'bob'] } } } });
+  for (const [name, tier, owner] of [['PRODUCTION', 'standard', '@ci-user'], ['pre', 'prod', '@Bot'], ['prod', 'standard', '@detent-bot']])
+    expect(parse(name, tier, owner)).toEqual({ setupHint: '生产环境严禁将 Bot 配置为环境负责人' });
+});
+
+it('binds the Bot merge to the reviewed SHA and submits the approved job once from the original card', async () => {
+  const { gitlab, notes, repo, config, deliveryConfig, client } = await deliveryFixture(['delivery::env-change']);
+  const { tracker, rows } = auditFixture();
+  const bot = { id: 90, username: 'ci-user', name: 'CI' };
+  deliveryConfig.environments = { pre: { match: ['web01'], approverTier: 'standard', owners: [bot.username] } };
+  const sha = 'a'.repeat(40), merged = 'b'.repeat(40);
+  const mr = { iid: 5, title: 'release', state: 'opened' as const, source_branch: 'release', target_branch: 'main',
+    web_url: 'https://git.test/app/-/merge_requests/5', source_project_id: 2, target_project_id: 2, description: 'pre configuration', sha };
+  gitlab.createMergeRequest.mockResolvedValue(mr);
+  let oldPath = 'values-PRODUCTION.yaml';
+  const api = { ...gitlab, getBotIdentity: () => bot, isBotUser: (id?: number) => id === bot.id, getMergeRequest: async () => mr,
+    listMergeRequestDiffs: async () => [{ old_path: oldPath, new_path: 'values-pre.yaml', diff: '' }],
+    mergeMergeRequest: vi.fn(async () => ({ state: 'merged', merge_commit_sha: merged, sha })),
+    awardIssueNoteEmoji: vi.fn(), getIssueNote: async (_p: number, _i: number, id: number) => ({ id, body: notes[id - 1] }) };
+  client.getAsset = async id => ({ id, name: id, address: '192.0.2.1' });
+  const pack = createJumpServerCapability('jumpserver', { client, config: deliveryConfig, tracker });
+  const run = async ({ tools, gate, systemPrompt }: TurnInput) => {
+    expect(systemPrompt).toContain('pre=@ci-user');
+    await tools.invoke('detent_checkout_worktree', { project: 2, branch_name: 'release' });
+    await tools.invoke('detent_create_mr', { project: 2, ...mr });
+    const input = { project: 2, mr_iid: mr.iid, environment: 'pre' };
+    await expect(tools.invoke('detent_merge_mr', input)).rejects.toThrow('生产文件');
+    expect(api.mergeMergeRequest).not.toHaveBeenCalled();
+    oldPath = 'values-pre.yaml';
+    expect(await tools.invoke('detent_merge_mr', input)).toMatchObject({ mergeCommitSha: merged, mergedBy: bot.username });
+    await gate.invokeExtension('mcp__detent__jms_job', { target_project_id: 2, mr_iid: mr.iid, environment: 'pre',
+      playbook_path: 'deploy.yml', commit_sha: merged, asset_ids: ['web01'] });
+    return 'submitted';
+  };
+  const worker = new SessionOrchestrator(config, repo, api, { run }, {
+    capabilities: [pack], resolveTurnProfile: createDeliveryTurnProfileResolver(deliveryConfig),
+  });
+  const session = await repo.getOrCreateSession(1, issue.iid, issue.title);
+  await worker.resumeSession(session.id, 'apply', { permissionMode: 'default' });
+  const decision = (await repo.getLatestApproval(session.id))!;
+  expect(decision, notes.join('\n')).toMatchObject({ status: 'APPROVED', decidedBy: bot.username });
+  expect(api.mergeMergeRequest).toHaveBeenCalledExactlyOnceWith(2, mr.iid, sha);
+  expect(api.awardIssueNoteEmoji).toHaveBeenCalledWith(1, issue.iid, decision.gitlabNoteId, 'thumbsup');
+  expect(notes[decision.gitlabNoteId! - 1]).toContain('✅ **已批准** · 由 @ci-user 确认');
+  expect(rows).toMatchObject([{ approvalId: decision.id, commitSha: merged }]);
+  expect(await repo.getSession(session.id)).toMatchObject({ status: 'IDLE', lockedByPod: null });
+  expect(await repo.listActiveWorktrees(session.id)).toEqual([]);
+});
+
+it('keeps the named owner card pending for another Maintainer and for an owner with out-of-scope assets', async () => {
+  const { gitlab, repo, config, deliveryConfig, client, notes } = await deliveryFixture(['delivery::env-change']);
+  const session = await repo.getOrCreateSession(1, issue.iid, issue.title);
+  deliveryConfig.environments = { prod: { match: ['web01'], approverTier: 'prod', owners: ['dev'] } };
+  client.getAsset = async id => ({ id, name: id, address: 'host' });
+  const pack = createJumpServerCapability('jumpserver', { client, config: deliveryConfig });
+  const resolver = createDeliveryTurnProfileResolver(deliveryConfig);
+  const worker = new SessionOrchestrator(config, repo, gitlab, { run: vi.fn() }, { capabilities: [pack], resolveTurnProfile: resolver });
+  const toolInput = { asset_ids: ['web01'], environment: 'prod' };
+  const card = await repo.createApprovalRequest(session.id, 'TOOL_USE', 'jms_job', toolInput);
+  await worker.handleUserIntent(1, issue.iid, { type: 'APPROVE', userId: maintainer.id, username: maintainer.username });
+  expect(notes).toContain('> 🔒 该操作需要环境负责人（@dev）在审批卡上点 👍 放行。');
+  expect(await repo.getLatestPendingApproval(session.id)).toMatchObject({ id: card.id });
+  const profile = await resolver({ session, repo, gitlab, capabilities: [pack] });
+  const vote = { ...card, projectId: 1, userId: developer.id, username: 'Dev' };
+  expect(await profile.canApprove!(vote)).toBe(true);
+  expect(await profile.canApprove!({ ...vote, toolInput: { ...toolInput, asset_ids: ['other'] } })).toBe(false);
+});
+
+it('wakes exactly one follow-up Issue from its durable inbox and rejects derivation inside the child', async () => {
+  const { repo, gitlab, config, deliveryConfig } = await deliveryFixture(['delivery::env-change']);
+  const parent = await repo.getOrCreateSession(1, issue.iid, issue.title);
+  const args = { title: 'Promote', description: 'Pre verified', label: 'delivery::env-change' };
+  const created = { ...issue, iid: 89, labels: [args.label], title: args.title, description: '', web_url: 'https://git.test/hub/-/issues/89' };
+  const api = { ...gitlab, findFollowupIssue: vi.fn(), createIssue: vi.fn(async (_p: number, input: { description: string }) =>
+    Object.assign(created, { description: input.description })), getIssue: async (_p: number, iid: number) =>
+    iid === created.iid ? created : { ...issue, labels: [args.label] } };
+  const name = 'mcp__detent__detent_create_hub_issue';
+  const run = async ({ gate, session, prompt }: TurnInput) => {
+    if (session.id === parent.id && prompt === 'first') {
+      await expect(gate.invokeExtension(name, { ...args, label: 'claude::done' })).rejects.toThrow('有效 Agent 标签');
+      expect(await gate.invokeExtension(name, args)).toMatchObject({ issueIid: 89, webUrl: created.web_url });
+    } else if (session.id === parent.id) await expect(gate.invokeExtension(name, args)).rejects.toThrow('已派生');
+    else if (session.permissionMode === 'plan') expect(prompt).toContain('Pre verified\n\n来源工单：#88\n<!-- detent:followup-from=#88 -->');
+    else await expect(gate.invokeExtension(name, args)).rejects.toThrow('禁止再次派生');
+    return 'verified';
+  };
+  const worker = new SessionOrchestrator(config, repo, api, { run }, { resolveTurnProfile: createDeliveryTurnProfileResolver(deliveryConfig),
+    capabilities: [{ name: 'jumpserver', enabled: true, tools: [] }] });
+  await worker.resumeSession(parent.id, 'first', { permissionMode: 'default' });
+  const child = (await repo.getSessionByIssue(1, 89))!;
+  await vi.waitFor(async () => expect(await repo.getSession(child.id)).toMatchObject({ status: 'WAITING_PLAN', lockedByPod: null }));
+  await worker.handleUserIntent(1, 89, { type: 'APPROVE', userId: developer.id, username: developer.username });
+  await worker.resumeSession(parent.id, 'retry', { permissionMode: 'default' });
+  expect(await repo.getSession(child.id)).toMatchObject({ status: 'IDLE' });
+  expect(await repo.getSession(parent.id)).toMatchObject({ status: 'IDLE' });
+  expect(api.createIssue).toHaveBeenCalledTimes(1);
+});

@@ -46,11 +46,13 @@ Stage 3 的只读和自动工具在 `preflight` 执行守卫。生产任务在�
 
 `npm run bootstrap` 只补齐缺失的 Hub 规范、流程、Issue 模板和标签，复用同一输出文件内的凭证。
 
-`jms_job` 与 `detent_create_release` 的待审单仅能在当前流程非只读且显式启用该工具时获批。发布能力的 `approver_tier` 缺省为 `prod`，显式配置为 `standard` 后服务 Owner 可批准打 Tag。JumpServer 配置 `environments` 时，发卡与执行前都须验证环境已定义且全部目标资产命中该环境。投票时重读 Hub、实时核验资产归属与黑名单，仅在明确的 standard 环境通过全部检查时允许普通成员批准。缺少配置或无法核验均按 prod 审批。`approver_tier: prod` 流程对所有工具审批要求生产权限，建仓、自助接入与 prod 外部能力同样保持生产审批。方案审批沿用普通项目权限。生产审批要求 `DELIVERY_PROD_APPROVERS` 名单加项目成员门槛，或在名单为空时满足 `DELIVERY_PROD_MIN_ACCESS_LEVEL`（默认 40）。
+`jms_job` 与 `detent_create_release` 的待审单仅能在当前流程非只读且显式启用该工具时获批。发布能力的 `approver_tier` 缺省为 `prod`，显式配置为 `standard` 后服务 Owner 可批准打 Tag。JumpServer 配置 `environments` 时，发卡与执行前都须验证环境已定义且全部目标资产命中该环境。投票时重读 Hub、实时核验资产归属与黑名单。未指定 owner 时，仅在明确的 standard 非生产环境通过全部检查后允许普通成员批准。缺少配置或无法核验均按 prod 审批。`approver_tier: prod` 流程对所有工具审批要求生产权限，建仓、自助接入与 prod 外部能力同样保持生产审批。方案审批沿用普通项目权限。生产审批要求 `DELIVERY_PROD_APPROVERS` 名单加项目成员门槛，或在名单为空时满足 `DELIVERY_PROD_MIN_ACCESS_LEVEL`（默认 40）。
 
 `delivery_executions` 通过 `onInitSchema(pool)` 在 Core 表之后、调用方建表之前初始化。所有权、执行状态和审批单关联均以仓储为准，审批卡渲染也从仓储读取 MR。禁止 Delivery 另建池或在 Pod 内缓存业务状态。结果查询更新审计，`renderStatusExtra` 将当前会话的执行记录加入 `/status`。环境变量全集与 Hub 规范见 [.env.example](.env.example) 和 [工作区示例](examples/hub-workspace/CLAUDE.md)。
 
-共享环境契约位于 `skills/env-topology/SKILL.md`。发布、日常变更和失败回退均走同一环境 MR、人工合并、部署与健康核验流程。按 Hub 的 `promotion_gate` 交接下一环境，失败时仅将故障环境退回已记录的稳定 Tag，并保留工单。
+环境负责人以 Hub `jumpserver.environments.<env>.owner` 为准。人类负责人须同时具备项目审批权限，发卡、投票和执行均实时核对目标资产与黑名单。非生产环境由 Bot 负责时，可按 MR 当前 SHA 合并本会话的非生产文件改动，并在原卡点 👍 后复用批准直执。生产名称和生产审批等级均禁止 Bot 负责。
+
+共享契约位于 `skills/env-topology/SKILL.md`。服务单最多发布至 pre，完成晋级检查后关单。要求上生产时先派生唯一的 env-change 工单，附版本、验收证据及负责人。正向晋级逐服务实查前置环境，任一异常整单阻断，仅接受目标人类负责人具名说明原因的强批。独立回滚沿用目标环境的 MR 与执行审批。
 
 Delivery 在进程内按连接配置和凭证指纹复用最多 16 个 HTTP 客户端，并行查询多个资产的授权账号。
 
@@ -62,7 +64,7 @@ Hub SOP 的 `close_policy` 默认 `manual`。`auto` 和 `approve` 启用每轮�
 
 ### Stage 9 真实服务栈 SOP E2E
 
-依次使用 `npm run e2e:up` 启动测试环境、`npm run e2e` 构建并运行 SOP 场景、`npm run e2e:down` 拆除环境。脚本在宿主机启动 Delivery 时，Ansible 场景从 PATH 查找 yamllint，交付镜像已内置该工具。场景通过真实 GitLab API 操作 Issue、审批和 MR，由 GitLab 投递 Webhook。关单时核对 GitLab 状态和审批人身份，以及 MySQL 会话终态和 Worktree 归档记录。SOP10 从真实 Hub 读取在线环境矩阵，分别核验 Developer 和 Maintainer 在 pre、prod 的合并与执行审批，以及两个 K3s 命名空间实际部署的相同镜像版本。SOP11 接着开独立的 env-change 工单，只回退 prod，复核 pre 的 Helm revision 与 Deployment、生产审批、工单关闭及 Worktree 归档。两个场景各自计时。
+依次使用 `npm run e2e:up` 启动测试环境、`npm run e2e` 构建并运行 SOP 场景、`npm run e2e:down` 拆除环境。脚本在宿主机启动 Delivery 时，Ansible 场景从 PATH 查找 yamllint，交付镜像已内置该工具。场景通过真实 GitLab API 操作 Issue、审批和 MR，由 GitLab 投递 Webhook。关单时核对 GitLab 状态和审批人身份，以及 MySQL 会话终态和 Worktree 归档记录。SOP10 核验服务单中 Bot 合并及批准 pre、HTTP 冒烟，以及派生生产单的负责人拒绝提示、人工合并与部署。两张工单分别关单。SOP11 接着开独立的 env-change 工单，只回退 prod，复核 pre 的 Helm revision 与 Deployment、生产审批、工单关闭及 Worktree 归档。SOP12 验证前置版本落后时阻断、普通成员强批无效、目标负责人具名强批后开放生产 MR。
 
 ### Jev 命令风控
 

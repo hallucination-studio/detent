@@ -269,8 +269,7 @@ async function main() {
       hubInstructions, '',
       '目标机仅授权 ops 普通账号。/etc/detent-demo 和其中的 app.conf 归 ops:ops 管理。维护此目录及文件时沿用现有属主和权限，以 ops 直接执行，作业不使用 sudo 或 become。',
       '本栈的 JumpServer 作业会掩码名为 key 的模板字段。Playbook 请使用业务含义明确的变量名。',
-      '通过 `target-node-01` 访问的 E2E Kubernetes 验证集群仅有控制平面，没有可调度 Pod 的工作节点。',
-      '所有发布机共用这个验证集群。执行 helm upgrade --install 时省略 --atomic 和 --wait（--atomic 会隐式等待 Pod）。同一作业用 helm status 检查 release 状态，并核对集群中 Kubernetes 资源的 spec。', '',
+      '所有发布机共用 K3s 验证集群。部署后检查 Helm 状态、Deployment 可用副本与实际运行镜像。', '',
     ].join('\n'), 'Document the E2E host permissions and verification cluster');
     checkRunning();
 
@@ -307,7 +306,9 @@ async function main() {
       console.log('Starting ' + name);
       let result = 'FAILED';
       try {
-        await runScenario(name, { ...context, sopDeadline: start + sopTimeoutMs });
+        // SOP10 waits for two independently approved Issues and two live deployments.
+        const budget = name === 'sop10' && process.env.E2E_SOP_TIMEOUT_MS === undefined ? 600000 : sopTimeoutMs;
+        await runScenario(name, { ...context, sopDeadline: start + budget });
         checkRunning();
         result = 'passed';
       } catch (error) {
@@ -332,7 +333,8 @@ async function main() {
             else timings.push({ sop: 'sop11', result: 'skipped (sop10 failed)', seconds: '0' });
           }
         });
-      } else await runSop(name);
+      } else if (name === 'sop12') await withReleaseTopology(context, async () => { await runSop(name); });
+      else await runSop(name);
     }
   } catch (error) { errors.push(error); }
   finally {

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
+import { addAbortListener } from 'node:events';
 import { createIssueChannel } from './channel.js';
 import { TurnRuntime, SessionBusy, StopTurn, formatInboxMessages, type Active } from './turn-runtime.js';
 import type { AppConfig } from '../config.js';
@@ -17,7 +18,7 @@ import type { WebhookEvent } from '../gitlab/webhook.js';
 import { escapeTableCell, formatUserError, NoteStreamer, renderNote, renderPlanApprovalCard, renderStatus, renderSummary, waitingToolGuidance } from '../gitlab/note-streamer.js';
 import { logError, scrubJson } from '../gitlab/redact.js';
 import { EphemeralSandbox, type TurnSandbox, type WorkspaceGitLab } from '../workspace/ephemeral-sandbox.js';
-import { WorkspaceTools } from '../workspace/mcp-tools.js';
+import { schemas, WorkspaceTools, type ToolName } from '../workspace/mcp-tools.js';
 import { TranscriptHydrator } from '../claude/transcript-hydrator.js';
 import { ColdHold, PermissionGate } from '../claude/permission-gate.js';
 import { buildSystemPrompt } from '../claude/prompts.js';
@@ -28,7 +29,7 @@ import { connectMcpCapabilityPack } from '../extensions/mcp-bridge.js';
 import { loadHubCapabilities, resolveHubMcpCapabilities } from '../workflows/hub-capabilities.js';
 import { defineExtensionTool, type DetentCapabilityPack, type DetentExtensions } from '../extensions.js';
 import { checkIssueClosure, createCloseIssueTool } from './close-issue.js';
-import { notifyHook } from './lifecycle.js';
+import { notifyHook, resolveApproval } from './lifecycle.js';
 
 export { SessionBusy } from './turn-runtime.js';
 const helpHint = '> 💡 发送 `/help` 可随时查看当前工作区的能力与指令。';
@@ -41,7 +42,7 @@ type Client = WorkspaceGitLab &
   Pick<
     GitLabClient,
     'createIssueNote' | 'updateIssueNote' | 'syncIssueStatusLabel' | 'getIssue' | 'hasApprovalPermission'
-  > & Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile' | 'closeIssue' | 'getIssueNote'>>;
+  > & Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile' | 'closeIssue' | 'getIssueNote' | 'awardIssueNoteEmoji' | 'createIssue' | 'findFollowupIssue' | 'isBotUser'>>;
 export class SessionOrchestrator extends TurnRuntime {
   private readonly denialNotices = new Set<string>();
   constructor(
@@ -169,7 +170,23 @@ export class SessionOrchestrator extends TurnRuntime {
   ) {
     let next: string | undefined = prompt;
     for (;;) {
-      const pending: SessionInboxRow[] | undefined = next === undefined ? undefined : await this.runTurn(s, active, next, previousDecision, trigger);
+      const pending = next === undefined ? undefined : await this.runTurn(s, active, next, previousDecision, trigger);
+      if (pending instanceof ColdHold) {
+        const { approval } = pending;
+        const bot = this.gitlab.getBotIdentity?.();
+        if (!bot || approval.approvalType !== 'TOOL_USE') return;
+        const profile = await this.resolveTurnProfile(s, await this.getCapabilities(), { purpose: 'approval', approval });
+        if (!await profile?.shouldAutoApproveAsBot?.(approval)) return;
+        active.controller.signal.throwIfAborted();
+        if (approval.gitlabNoteId) {
+          try { await this.gitlab.awardIssueNoteEmoji?.(s.hubProjectId, s.hubIssueIid, approval.gitlabNoteId, 'thumbsup'); }
+          catch (error) { logError('approval-emoji', error, this.secrets); }
+        }
+        if (!await resolveApproval(this.repo, s, approval.id, 'APPROVED', bot.username, undefined, this.extensions.hooks?.onApprovalResolved, this.secrets)) return;
+        await this.writeApprovalDecision(this.channel(s), approval, 'APPROVED', bot.username);
+        return await this.executeApprovedTool(s, active, (await this.repo.getApproval(approval.id))!,
+          { type: 'APPROVE', userId: bot.id, username: bot.username, targetNoteId: approval.gitlabNoteId ?? undefined });
+      }
       next = pending && formatInboxMessages(pending, this.secrets);
       if (pending) trigger = inboxTrigger(pending);
       previousDecision = undefined;
@@ -191,12 +208,14 @@ export class SessionOrchestrator extends TurnRuntime {
       if (next === undefined) return;
     }
   }
-  private async runTurn(s: IssueSessionRow, active: Active, prompt: string, previousDecision?: ApprovalRequestRow, trigger: TurnTrigger = 'request'): Promise<SessionInboxRow[] | undefined> {
+  private async runTurn(s: IssueSessionRow, active: Active, prompt: string, previousDecision?: ApprovalRequestRow, trigger: TurnTrigger = 'request'): Promise<SessionInboxRow[] | ColdHold | undefined> {
     const channel = this.channel(s);
     const drainInbox = () => this.drainInbox(s.id, active);
     const host = new EphemeralSandbox(this.config, this.repo, this.gitlab);
     const transcripts = new TranscriptHydrator(this.repo, this.secrets);
-    const { controller } = active;
+    // A cold hold cancels the SDK turn. Stops and lease loss still cancel the whole operation.
+    const controller = new AbortController();
+    const stop = addAbortListener(active.controller.signal, () => controller.abort(active.controller.signal.reason));
     let sandbox: TurnSandbox | undefined;
     let streamer: NoteStreamer | undefined;
     let issueClosed = false;
@@ -235,6 +254,36 @@ export class SessionOrchestrator extends TurnRuntime {
       let submittedPlan: string | undefined;
       const turnTools = [];
       if (closeTool) turnTools.push(closeTool);
+      if (!effectivePlan && this.gitlab.createIssue && this.gitlab.findFollowupIssue) {
+        const { gitlab, repo } = this;
+        let issued = false;
+        turnTools.push(defineExtensionTool({
+          name: 'detent_create_hub_issue', policy: 'coding_auto', description: '为本工单派生一张后续 Hub 工单，返回链接。',
+          schema: { title: z.string().trim().min(1).max(200), description: z.string().trim().min(1).max(8000), label: z.string().trim().min(1).max(64).optional() },
+          execute: ({ title, description, label }) => host.serialize(async () => {
+            const { hubProjectId: hub, hubIssueIid: iid } = s;
+            const prefix = '<!-- detent:followup-from=';
+            const parent = await gitlab.getIssue(hub, iid);
+            if (parent.description?.includes(prefix) || gitlab.isBotUser?.(parent.author?.id)) throw Error('派生工单禁止再次派生');
+            if (issued) throw Error('本工单已派生后续工单');
+            const previous = await repo.getFollowupSession(s);
+            if (previous) throw Error('本工单已派生后续工单 #' + previous.hubIssueIid);
+            if (label && (/^claude::/i.test(label) || !(await loadHubAgents(gitlab, hub, this.config.gitlabHubDefaultBranch)).agents.some(a => a.label === label)))
+              throw Error('请选择当前 Hub 的有效 Agent 标签');
+            const marker = prefix + '#' + iid + ' -->';
+            description += '\n\n来源工单：#' + iid + '\n' + marker;
+            const existing = await gitlab.findFollowupIssue!(hub, marker);
+            controller.signal.throwIfAborted();
+            const created = existing ?? await gitlab.createIssue!(hub, { title, description, labels: label ? [label] : [] });
+            const child = await repo.getOrCreateSession(hub, created.iid, created.title);
+            if (child.status !== 'DONE' && await repo.enqueueSessionInbox({ sessionId: child.id, eventId: 'followup:' + s.id + ':' + created.iid,
+              sourceKind: 'system', senderUsername: gitlab.getBotIdentity?.()?.username, content: redactGitUrl(created.title + '\n' + created.description, this.secrets) }))
+              void this.wakeQueuedIssue(child).catch(error => logError('followup-wake', error, this.secrets));
+            issued = true;
+            return { issueIid: created.iid, webUrl: created.web_url, label: created.labels.find(l => l === label) ?? null };
+          }),
+        }));
+      }
       if (plan && !profile?.readonly) turnTools.push(defineExtensionTool({
         name: 'detent_submit_plan', policy: 'readonly', description: '提交本轮实施方案供 GitLab 用户审批。',
         schema: { plan: z.string().trim().min(1).max(16000) },
@@ -286,7 +335,12 @@ export class SessionOrchestrator extends TurnRuntime {
             systemPrompt, profile?.extraSystemPrompt,
             closeTool && '全部验收条件满足后调用 detent_close_issue 完结工单（含只读巡检模式，该工具已获授权）；汇报正文无需提及该工具名。',
           ].filter(Boolean).join('\n'),
-          tools: new WorkspaceTools(host, sandbox, s.id, effectivePlan),
+          allowedWorkspaceTools: effectivePlan ? (Object.keys(schemas) as ToolName[]).filter(name => name !== 'detent_merge_mr') : undefined,
+          tools: new WorkspaceTools(host, sandbox, s.id, effectivePlan, undefined, undefined, profile?.canBotMergeMr && (async params => {
+            const current = await this.resolveTurnProfile(s, await this.getCapabilities(), { purpose: 'turn' });
+            if (!current?.canBotMergeMr || current.readonly || current.blockedMessage) return { ok: false, reason: '当前流程已撤销 Bot 合并授权' };
+            return current.canBotMergeMr(params);
+          })),
           drainInbox,
           progress: (step) => streamer!.push(step),
           appendText: (delta) => streamer!.appendText(delta),
@@ -336,7 +390,7 @@ export class SessionOrchestrator extends TurnRuntime {
       if (sandbox) await host.checkpoint(sandbox, s.id);
       if (cause instanceof ColdHold) {
         await streamer?.flush(cause.message);
-        return;
+        return cause;
       }
       await this.expire(s);
       if (cause instanceof StopTurn) {
@@ -349,6 +403,7 @@ export class SessionOrchestrator extends TurnRuntime {
       if (streamer) await streamer.flush(message);
       else await this.gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, message);
     } finally {
+      stop[Symbol.dispose]();
       if (sandbox) await host.destroy(sandbox);
     }
   }
@@ -418,8 +473,7 @@ export class SessionOrchestrator extends TurnRuntime {
         if (!pending.length) return;
         await this.expire(session);
         if (session.status === 'WAITING_PLAN') session.permissionMode = 'plan';
-        const prompt = pending.length === 1 ? redactGitUrl(pending[0].content, this.secrets)
-          : formatInboxMessages(pending, this.secrets);
+        const prompt = formatInboxMessages(pending, this.secrets);
         await this.run(session, active, prompt);
       });
     } catch (error) {
@@ -463,11 +517,9 @@ export class SessionOrchestrator extends TurnRuntime {
     const profile = await this.resolveTurnProfile(s, capabilities, { purpose: 'approval', approval: { approvalType, toolName, toolInput } });
     if (profile?.blockedMessage?.trim()) return;
     const { approvalProjectId } = this.channel(s);
+    const params = { projectId: approvalProjectId, userId: intent.userId, username: intent.username, approvalType, toolName, toolInput };
     const permitted = profile?.canApprove
-      ? await profile.canApprove({
-          projectId: approvalProjectId, userId: intent.userId, username: intent.username,
-          approvalType, toolName, toolInput,
-        })
+      ? await profile.canApprove(params)
       : await this.gitlab.hasApprovalPermission(approvalProjectId, intent.userId);
     if (!permitted) {
       if (intent.type !== 'APPROVE' || !profile?.canApprove ||
@@ -477,7 +529,8 @@ export class SessionOrchestrator extends TurnRuntime {
       this.denialNotices.add(key);
       if (this.denialNotices.size > 1024) this.denialNotices.delete(this.denialNotices.values().next().value!);
       try {
-        await this.channel(s).createNote('> 🔒 该操作需要生产审批权限（Maintainer 或指定生产审批人），请邀请负责人在审批卡上点 👍 放行。');
+        const hint = await profile.formatApprovalDenial?.(params) ?? '> 🔒 该操作需要生产审批权限（Maintainer 或指定生产审批人），请邀请负责人在审批卡上点 👍 放行。';
+        await this.channel(s).createNote(renderNote(hint, this.secrets));
       } catch (error) {
         this.denialNotices.delete(key);
         throw error;

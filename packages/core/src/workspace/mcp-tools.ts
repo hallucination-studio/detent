@@ -1,6 +1,9 @@
 import * as fs from 'node:fs/promises';
 import { z } from 'zod';
 import type { LiveMr } from '../gitlab/client.js';
+import { configuredSecrets, logError } from '../gitlab/redact.js';
+import { recordMergedMr } from '../db/repository.js';
+import type { TurnProfile } from '../extensions.js';
 import type { SessionWorktreeRow } from '../types.js';
 import { EphemeralSandbox, git, type TurnSandbox } from './ephemeral-sandbox.js';
 
@@ -18,6 +21,7 @@ export const schemas = {
     title: name,
     description: z.string().default(''),
   },
+  detent_merge_mr: { project, mr_iid: z.number().int().positive(), environment: z.string().trim().min(1).max(64).optional() },
   detent_get_pipeline_status: { project, ref_or_mr_iid: project },
   detent_get_pipeline_job_log: { project, job_id: z.number().int().positive() },
 };
@@ -28,6 +32,7 @@ export const toolDescriptions: Record<ToolName, string> = {
   detent_close_worktree: '保存工作区改动并归档指定工作树。',
   detent_commit_and_push: '在指定工作树提交修改并推送到当前特性分支。',
   detent_create_mr: '从已推送的源分支向目标分支创建 MR，并关联当前工单。',
+  detent_merge_mr: '按当前流程授权合并本工单的 MR，返回部署所需的完整合并 SHA。',
   detent_get_pipeline_status: '查询最新流水线与任务状态。MR 会话中的 ref_or_mr_iid 仅允许传当前 MR 的 IID 或源分支名。',
   detent_get_pipeline_job_log: '读取指定项目中流水线任务的日志以定位失败原因。',
 };
@@ -52,6 +57,7 @@ export class WorkspaceTools {
     private plan = false,
     private lockedWorktree?: Pick<SessionWorktreeRow, 'directoryName' | 'branchName'>,
     private mr?: LiveMr,
+    private canBotMergeMr?: TurnProfile['canBotMergeMr'],
   ) {}
   private async tree(name: string) {
     const row = (await this.host.repo.listActiveWorktrees(this.sessionId)).find(
@@ -132,6 +138,33 @@ export class WorkspaceTools {
           latestPipelineId: null,
           latestPipelineStatus: null,
         });
+      }
+      case 'detent_merge_mr': {
+        const { project, mr_iid, environment } = z.object(schemas[tool]).parse(raw);
+        const p = await gitlab.getProject(project);
+        const rows = await repo.listSessionMergeRequests(this.sessionId);
+        const mr = rows.find(row => row.targetProjectId === p.id && row.mrIid === mr_iid && row.mrState === 'opened');
+        if (!mr) throw Error('只能合并当前会话已登记且打开的 MR');
+        const bot = gitlab.getBotIdentity?.();
+        if (!this.canBotMergeMr || !bot || !gitlab.getMergeRequest || !gitlab.listMergeRequestDiffs || !gitlab.mergeMergeRequest || !gitlab.createIssueNote)
+          throw Error('当前流程未授权 Bot 自动合并 MR，请等待负责人人工合并');
+        const live = await gitlab.getMergeRequest(p.id, mr_iid);
+        if (live.state !== 'opened' || live.draft || live.has_conflicts || !live.sha) throw Error('MR 未打开、为草稿、有冲突或缺少提交 SHA');
+        if (live.head_pipeline?.status === 'failed') throw Error('MR 流水线失败，禁止合并');
+        if (['running', 'pending', 'created'].includes(live.head_pipeline?.status ?? '')) throw Error('请等待 MR 流水线完成');
+        const diffs = await gitlab.listMergeRequestDiffs(p.id, mr_iid);
+        if (live.changes_count && Number(live.changes_count) !== diffs.length) throw Error('无法核验完整的 MR 文件清单');
+        const checked = await this.canBotMergeMr({ mr, diffs, environment });
+        if (!checked.ok) throw Error(checked.reason);
+        const merged = await gitlab.mergeMergeRequest(p.id, mr_iid, live.sha);
+        const mergeCommitSha = merged.merge_commit_sha || merged.sha;
+        if (merged.state !== 'merged' || !mergeCommitSha) throw Error('GitLab 尚未确认合并结果');
+        await recordMergedMr(repo, mr, mergeCommitSha, bot.username, rows);
+        const s = (await repo.getSession(this.sessionId))!;
+        try {
+          await gitlab.createIssueNote(s.hubProjectId, s.hubIssueIid, `✅ @${bot.username} 已合并 [${mr.targetProjectPath}!${mr_iid}](<${mr.mrWebUrl}>) · \`${mergeCommitSha}\``);
+        } catch (error) { logError('merged-mr-note', error, configuredSecrets(this.host.config)); }
+        return { merged: true, mrIid: mr_iid, targetProjectPath: mr.targetProjectPath, mergeCommitSha, mergedBy: bot.username };
       }
       case 'detent_get_pipeline_status': {
         const i = z.object(schemas[tool]).parse(raw);

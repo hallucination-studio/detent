@@ -28,9 +28,24 @@ const schema = z.object({
 });
 
 export type DeliveryConfig = z.infer<typeof schema> & {
-  environments?: Record<string, { match: string[]; approverTier: WorkflowApproverTier }>;
+  environments?: Record<string, { match: string[]; approverTier: WorkflowApproverTier; owners?: string[] }>;
 };
 
+export function environmentConfig(environments: DeliveryConfig['environments'], name: unknown) {
+  return typeof name === 'string' && environments && Object.hasOwn(environments, name) ? environments[name] : undefined;
+}
+export function isProdEnv(name: unknown, tier?: WorkflowApproverTier) {
+  return tier !== 'standard' || (typeof name === 'string' && /^(prod|production)$/i.test(name.trim()));
+}
+export function isBotName(owner: string, botUsername?: string) {
+  const name = owner.trim().replace(/^@/, '').toLowerCase();
+  return name === botUsername?.toLowerCase() || name === 'detent-bot' || name === 'bot';
+}
+export const mentionOwners = (owners: readonly string[]) => owners.map(name => '@' + name).join('、');
+export function ownerSetupHint(environments: DeliveryConfig['environments'], botUsername?: string) {
+  if (Object.entries(environments ?? {}).some(([name, env]) => isProdEnv(name, env.approverTier) && env.owners?.some(o => isBotName(o, botUsername))))
+    return '生产环境严禁将 Bot 配置为环境负责人';
+}
 function credential(env: NodeJS.ProcessEnv, role: 'READONLY' | 'JOB'): JumpServerAuth | undefined {
   const prefix = 'JUMPSERVER_' + role;
   const accessKeyId = env[prefix + '_ACCESS_KEY_ID'];

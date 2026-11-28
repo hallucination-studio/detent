@@ -132,7 +132,7 @@ export async function checkChart(gl: E2EGitLabDriver, mr: MR, scenario: HelmCase
 }
 
 export async function targetCommand(container: string, ...args: string[]) {
-  const { stdout } = await run('docker', ['exec', '-u', 'ops', '-e', 'HOME=/home/ops', container, ...args], { timeout: 30000 });
+  const { stdout } = await run('docker', ['exec', '-u', 'ops', '-e', 'HOME=/home/ops', container, ...args], { timeout: 90000 });
   return stdout.trim();
 }
 

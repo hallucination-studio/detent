@@ -1,4 +1,4 @@
-import { redactGitUrl, type WebhookExtension } from '@detent/core';
+import { recordMergedMr, redactGitUrl, type WebhookExtension } from '@detent/core';
 import { z } from 'zod';
 
 const id = z.number().int().positive();
@@ -41,8 +41,7 @@ export const matchMergeRequestWebhook: WebhookExtension = (event) => {
             const waiting = session.status === 'WAITING_PLAN' || session.status === 'WAITING_TOOL';
             const defer = session.status !== 'DONE' && !waiting && opened.length > 0 &&
               !await orchestrator.isExtensionToolEnabled(session, 'jms_job');
-            if (!(await repo.markMergeRequestMerged(mr.id, sha, user.username))) return false;
-            if (mr.worktreeId && !opened.some(other => other.worktreeId === mr.worktreeId)) await repo.archiveWorktree(mr.worktreeId);
+            if (!await recordMergedMr(repo, mr, sha, user.username, opened)) return false;
             if (session.status === 'DONE') return false;
             const status = waiting ? '会话正在等待审批，审批后将继续。' : defer ?
               `当前还有 ${opened.length} 个关联 MR 待合并，全部合并后将自动核验收尾。` : '正在自动恢复变更会话…';

@@ -241,6 +241,10 @@ export class InMemoryDetentRepository implements DetentRepository {
       id: this.inbox.length + 1, status: 'PENDING', createdAt: new Date(), consumedAt: null });
     return true;
   }
+  async getFollowupSession(parent: IssueSessionRow) {
+    const event = this.inbox.find(row => row.eventId.startsWith('followup:' + parent.id + ':'));
+    return event ? this.getSession(event.sessionId) : null;
+  }
   async drainSessionInbox(sessionId: string, owner?: string, sourceKind?: string) {
     const session = this.sessions.get(sessionId);
     if (owner && (session?.lockedByPod !== owner || Number(session.lockExpiresAt) <= Date.now())) return [];

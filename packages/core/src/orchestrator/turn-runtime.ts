@@ -84,6 +84,19 @@ export class TurnRuntime {
     await this.repo.updateSessionState(s.id, { recoveryAttempts: s.recoveryAttempts });
     return true;
   }
+  protected async writeApprovalDecision(channel: SessionChannel, pending: ApprovalRequestRow, status: 'APPROVED' | 'REJECTED', username: string, comment?: string) {
+    if (pending.approvalType !== 'ASK_USER' && pending.gitlabNoteId && channel.getNote) {
+      try {
+        const note = await channel.getNote(pending.gitlabNoteId);
+        const user = '@' + escapeTableCell(username);
+        const badge = status === 'APPROVED' ? '✅ **已批准** · 由 ' + user + ' 确认' :
+          '❌ **已拒绝** · 由 ' + user + ' 拒绝' + (comment ? '（' + escapeTableCell(comment) + '）' : '');
+        await channel.updateNote(pending.gitlabNoteId, renderNote(note.body + '\n\n> ' + badge, this.secrets));
+      } catch (error) {
+        logError('approval-note', error, this.secrets);
+      }
+    }
+  }
   protected async applyApproval(s: IssueSessionRow, pending: ApprovalRequestRow, intent: ParsedUserIntent, channel: SessionChannel,
     run: (session: IssueSessionRow, active: Active, prompt: string, previous?: ApprovalRequestRow) => Promise<void>,
     direct?: (session: IssueSessionRow, active: Active, decision: ApprovalRequestRow) => Promise<void>) {
@@ -96,17 +109,7 @@ export class TurnRuntime {
     const currentCard = async () => (await this.repo.getLatestApproval(s.id))?.id === pending.id;
     await this.withLease(s, async (session, active) => {
       if (session.status !== expected || !await currentCard()) return;
-      if (pending.approvalType !== 'ASK_USER' && pending.gitlabNoteId && channel.getNote) {
-        try {
-          const note = await channel.getNote(pending.gitlabNoteId);
-          const user = '@' + escapeTableCell(intent.username);
-          const badge = status === 'APPROVED' ? '✅ **已批准** · 由 ' + user + ' 确认' :
-            '❌ **已拒绝** · 由 ' + user + ' 拒绝' + (comment ? '（' + escapeTableCell(comment) + '）' : '');
-          await channel.updateNote(pending.gitlabNoteId, renderNote(note.body + '\n\n> ' + badge, this.secrets));
-        } catch (error) {
-          logError('approval-note', error, this.secrets);
-        }
-      }
+      await this.writeApprovalDecision(channel, pending, status, intent.username, comment);
       if (pending.approvalType === 'PLAN') {
         const approved = status === 'APPROVED';
         session.permissionMode = approved ? 'default' : 'plan';

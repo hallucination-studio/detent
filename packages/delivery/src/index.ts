@@ -49,6 +49,7 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
   const client = jumpserverClient ?? (deliveryConfig.jumpserverBaseUrl ? httpClient(deliveryConfig) : undefined);
   const auditRepo = new MySqlDeliveryAuditRepository();
   const tracker = executionTracker ?? auditRepo;
+  let botUsername: string | undefined;
   let poller: DeliveryJobPoller | undefined;
   async function onTerminalResult(sessionId: string, jobId: string, result: JobResultResponse) {
     if (poller && tracker.listSessionExecutions) {
@@ -72,7 +73,7 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
       }
     : { name: 'gitlab-release', enabled: false, setupHint: '服务端已禁用 gitlab-release（DELIVERY_ENABLE_RELEASE_TOOLS=false）', tools: [] };
   const jumpserver: DetentCapabilityPack = {
-    ...(client ? createJumpServerCapability('jumpserver', { client, config: deliveryConfig, tracker, decision, onTerminalResult })
+    ...(client ? createJumpServerCapability('jumpserver', { client, config: deliveryConfig, tracker, decision, onTerminalResult, get botUsername() { return botUsername; } })
       : { name: 'jumpserver', enabled: false, tools: [] }),
     setupHint: '请在 Hub capabilities.json 配置 jumpserver.base_url 和 auth，并在服务端提供 DETENT_SECRET_JMS_AK_ID 与 DETENT_SECRET_JMS_AK_SECRET',
   };
@@ -85,10 +86,10 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
       const dynamic: DetentCapabilityPack[] = [];
       for (const [name, entry] of Object.entries(ctx.document.entries)) {
         if (entry.type === 'jumpserver') {
-          const resolved = resolveJumpServerSettings(entry, ctx.config.secrets, deliveryConfig);
+          const resolved = resolveJumpServerSettings(entry, ctx.config.secrets, deliveryConfig, botUsername);
           dynamic.push('setupHint' in resolved ? { name, enabled: false, tools: [], setupHint: resolved.setupHint }
             : createJumpServerCapability(name, { config: resolved.config, tracker, decision, onTerminalResult, defaultAccount: resolved.defaultAccount,
-              client: httpClient(resolved.config) }));
+              botUsername, client: httpClient(resolved.config) }));
         } else if (entry.type === 'gitlab-release') {
           const parsed = releaseSettings.safeParse(entry);
           dynamic.push(entry.enabled === false || !parsed.success
@@ -110,6 +111,7 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
       hubDefaultBranch: config.gitlabHubDefaultBranch, resolveTurnProfile: extensions.resolveTurnProfile,
     }),
     async onReady(ctx) {
+      botUsername = ctx.gitlab.getBotIdentity?.()?.username;
       const cleanup = await extensions.onReady?.(ctx);
       if (!tracker.listPendingExecutions || !tracker.completeExecution || !tracker.acknowledgeCallback) return cleanup;
       // All concurrent lookups in one scan share the live Hub revision.
@@ -129,7 +131,7 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
           for (const entry of Object.values(hub.entries)) {
             if (entry.type !== 'jumpserver' || typeof entry.base_url !== 'string' ||
                 !row.jumpserverJobUrl.startsWith(entry.base_url.trim().replace(/\/$/, '') + '/')) continue;
-            const resolved = resolveJumpServerSettings(entry, config.secrets, deliveryConfig);
+            const resolved = resolveJumpServerSettings(entry, config.secrets, deliveryConfig, botUsername);
             if ('setupHint' in resolved) throw Error(resolved.setupHint);
             return httpClient(resolved.config);
           }

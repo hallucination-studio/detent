@@ -22,6 +22,7 @@ interface ProjectHook {
 }
 interface Issue {
   id: number;
+  author?: GitLabUser;
   iid: number;
   title: string;
   description: string | null;
@@ -178,6 +179,9 @@ export class GitLabClient {
   getIssueNote(p: number, i: number, noteId: number) {
     return this.json<IssueNote>(this.notes(p, i) + '/' + noteId);
   }
+  async awardIssueNoteEmoji(project: number, iid: number, noteId: number, name: string) {
+    await this.request(this.notes(project, iid) + '/' + noteId + '/award_emoji', 'POST', { name });
+  }
   async updateIssueNote(p: number, i: number, n: number, body: string) {
     await this.updateNote(this.notes(p, i), n, body);
   }
@@ -296,8 +300,17 @@ export class GitLabClient {
     return this.json<MergeRequest & {
       description: string | null; draft?: boolean; source_project_id: number; target_project_id: number;
       sha?: string; author?: GitLabUser; assignees?: GitLabUser[]; has_conflicts?: boolean;
-      detailed_merge_status?: string; head_pipeline?: Pipeline | null;
+      detailed_merge_status?: string; head_pipeline?: Pipeline | null; changes_count?: string;
     }>(this.mrPath(project, mrIid));
+  }
+  async mergeMergeRequest(project: number, mrIid: number, sha?: string) {
+    try {
+      return await this.json<{ state: string; merge_commit_sha: string | null; sha: string }>(this.mrPath(project, mrIid) + '/merge', 'PUT', { sha });
+    } catch (error) {
+      if (error instanceof GitLabError && [403, 405].includes(error.status))
+        throw Error('GitLab 未允许本次合并，请检查合并条件和 Bot 的合并权限，或由负责人人工合并。');
+      throw error;
+    }
   }
   listOpenMergeRequestsByBranch(project: number, sourceBranch: string) {
     return this.pages<MergeRequest>(this.project(project) + '/merge_requests', {
@@ -339,10 +352,14 @@ export class GitLabClient {
       'POST', { note: renderNote(note, this.secrets) });
   }
   createIssue(project: number, input: { title: string; description: string; labels?: readonly string[] }) {
-    return this.json<Issue>(this.project(project) + '/issues', 'POST', {
+    return this.json<Issue & { web_url: string }>(this.project(project) + '/issues', 'POST', {
       title: renderNote(input.title, this.secrets), description: renderNote(input.description, this.secrets),
       labels: input.labels?.join(','),
     });
+  }
+  async findFollowupIssue(project: number, marker: string) {
+    const matches = await this.pages<Issue & { web_url: string }>(this.project(project) + '/issues', { scope: 'all', in: 'description', search: marker });
+    return matches.find(issue => issue.description?.includes(marker) && this.isBotUser(issue.author?.id));
   }
   async createMergeRequest(
     p: number,

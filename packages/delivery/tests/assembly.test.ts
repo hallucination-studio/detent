@@ -75,7 +75,7 @@ it.each(['injected', 'http', 'disabled'] as const)('assembles %s tools alongside
     expect(deploy).toBe(customPack);
     expect(onboarding).toMatchObject({ name: 'gitlab-onboarding', enabled: true, approverTier: 'prod' });
     expect(release).toMatchObject({ name: 'gitlab-release', enabled: true });
-    expect(release.tools.map(tool => tool.name)).toEqual(['detent_list_tags', 'detent_create_release']);
+    expect(release.tools.map(tool => tool.name)).toEqual(['detent_list_tags', 'detent_create_release', 'detent_trigger_pipeline', 'detent_await_pipeline']);
     expect(jumpserver).toMatchObject({ name: 'jumpserver', enabled: mode !== 'disabled', setupHint: expect.stringContaining('jumpserver.base_url') });
     expect(jumpserver.tools.map(tool => tool.name)).toEqual(mode === 'disabled' ? [] :
       ['jms_list_nodes', 'jms_list_assets', 'jms_shell', 'jms_job', 'jms_job_status']);
@@ -140,6 +140,7 @@ it.each(['default', 'audit tracker', 'tracker only'] as const)('composes /status
 it('uses the injected release client and enforces production permissions on caller-selected profiles', async () => {
   const gitlabClient = {
     getProject: vi.fn().mockResolvedValue({ id: 7 }), listTags: vi.fn().mockResolvedValue([]), getCommit: vi.fn(),
+    createPipeline: vi.fn(), getPipeline: vi.fn(), listPipelines: vi.fn(), getPipelineJobs: vi.fn(),
     getTag: vi.fn(), listPipelinesBySha: vi.fn(), createTag: vi.fn(), createRelease: vi.fn(),
   };
   const name = 'detent_create_release';
@@ -295,10 +296,14 @@ it('rebuilds single-key capability packs from successive Hub revisions', async (
     entry.base_url = 'https://jms.test';
     expect((await resolve({ jumpserver: entry }))[0]).toMatchObject({ enabled: true, tools: expect.arrayContaining([expect.objectContaining({ name: 'jms_shell' })]) });
     expect((await resolve({ jumpserver: { ...entry, auth: { token: '$secret:MISSING' } } }))[0].setupHint).toBe('服务端缺少密钥 DETENT_SECRET_MISSING');
-    for (const override of [{ enabled: false }, { base_url: 'https://user:pass@jms.test' }, { block_failed_pipeline: 'false' }])
+    for (const override of [{ enabled: false }, { base_url: 'https://user:pass@jms.test' }, { block_failed_pipeline: 'false' },
+      { environments: { pre: { match: [] } } }, { environments: { pre: { match: [' '] } } },
+      { environments: { pre: { match: ['/DEFAULT/pre'], approver_tier: 'owner' } } }])
       expect((await resolve({ jumpserver: { ...entry, ...override } }))[0]).toMatchObject({ enabled: false, tools: [] });
     const release = { type: 'gitlab-release' };
-    expect((await resolve({ release }))[0]).toMatchObject({ name: 'release', enabled: true });
+    expect((await resolve({ release }))[0]).toMatchObject({ name: 'release', enabled: true, approverTier: 'prod' });
+    expect((await resolve({ release: { ...release, approver_tier: 'standard' } }))[0]).toMatchObject({ enabled: true, approverTier: 'standard' });
+    expect((await resolve({ release: { ...release, approver_tier: 'owner' } }))[0]).toMatchObject({ enabled: false, tools: [], setupHint: expect.stringContaining('approver_tier') });
     expect((await resolve({ release: { ...release, enabled: false } }))[0]).toMatchObject({ enabled: false, tools: [] });
   } finally { await app.close(); }
 });

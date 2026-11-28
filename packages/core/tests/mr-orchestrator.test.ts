@@ -64,10 +64,12 @@ async function setup() {
     syncIssueStatusLabel: vi.fn(), createMergeRequestNote: vi.fn(create), updateMergeRequestNote: vi.fn(),
     createMergeRequestDiscussionNote: vi.fn(create), updateMergeRequestDiscussionNote: vi.fn() };
   const run = vi.fn<(turn: TurnInput) => Promise<string>>().mockResolvedValue('fixed');
-  const issueWorker = new SessionOrchestrator(config, repo, gitlab, { run: vi.fn().mockResolvedValue('branch plan') });
+  const runIssue = vi.fn<(turn: TurnInput) => Promise<string>>().mockResolvedValue('branch plan');
+  const issueWorker = new SessionOrchestrator(config, repo, gitlab, { run: runIssue });
   const decide = vi.fn().mockResolvedValue({ action: { type: 'choice', choice: 'run' } });
   const onNotify = vi.fn();
   const worker = new MergeRequestOrchestrator(config, repo, gitlab, { run }, { decision: { provider: 'custom', threshold: 0.9, decide }, onNotify,
+    wakeQueuedIssue: issueWorker.wakeQueuedIssue.bind(issueWorker),
     runHubEvent: (event, body, label) => runHubEvent(gitlab, config, event, body, issueWorker, label) });
   const report = vi.fn();
   const queue = new WebhookQueue((event, id) => dispatchWebhook(issueWorker, event, id, worker), report);
@@ -88,8 +90,40 @@ async function setup() {
       latestPipelineId: null, latestPipelineStatus: null });
     return hub;
   }
-  return { root, config, repo, mr, gitlab, run, issueWorker, worker, decide, onNotify, post, drain, send, session, link };
+  return { root, config, repo, mr, gitlab, run, runIssue, issueWorker, worker, decide, onNotify, post, drain, send, session, link };
 }
+
+it('resumes matching open Issues once on a skipped pipeline, preserving parked and closed sessions across redelivery', async () => {
+  const { repo, send, issueWorker, runIssue } = await setup();
+  const [first, second, closed] = await Promise.all([20, 21, 22].map(i => repo.getOrCreateSession(1, i, 'release')));
+  await repo.updateSessionState(first.id, { status: 'IDLE', permissionMode: 'default' });
+  await repo.updateSessionState(second.id, { status: 'WAITING_TOOL' });
+  await repo.createPipelineWatch(closed.id, 2, 50, 'feature');
+  await repo.updateSessionState(closed.id, { status: 'DONE' });
+  const wake = vi.spyOn(issueWorker, 'wakeSession');
+  await repo.createPipelineWatch(first.id, 2, 50, 'other-ref');
+  const byRef = await repo.createPipelineWatch(second.id, 2, null, 'feature');
+  await repo.createPipelineWatch(first.id, 2, 49, 'feature');
+  await repo.createPipelineWatch(second.id, 3, null, 'feature');
+  await send(pipeline(50, 'running'));
+  expect(await repo.drainSessionInbox(first.id)).toEqual([]);
+  const skipped = pipeline(50, 'skipped');
+  const hook = { ...skipped, merge_request: { iid: 2, target_project_id: 3 },
+    object_attributes: { ...skipped.object_attributes, url: 'https://git/org/app/-/pipelines/50?token=test-secret' } };
+  await Promise.all([send(hook), send(hook)]);
+  expect(wake.mock.calls.map(([s]) => s.id).sort()).toEqual([first.id, second.id].sort());
+  const message = /org\/app.*feature.*#50.*skipped\nhttps:.*token=\*\*\*/;
+  expect(runIssue).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    session: expect.objectContaining({ id: first.id }), prompt: expect.stringMatching(message),
+  }));
+  expect(await repo.drainSessionInbox(first.id)).toEqual([]);
+  expect(await repo.drainSessionInbox(closed.id)).toEqual([]);
+  for (const session of [first, second])
+    expect((await repo.listSessionPipelineWatches(session.id)).map(w => w.status)).toEqual(['RESOLVED', 'PENDING']);
+  const rows = await repo.drainSessionInbox(second.id);
+  expect(rows).toMatchObject([{ eventId: 'pipeline-watch:' + byRef + ':50', senderUsername: 'gitlab-ci', sourceKind: 'system' }]);
+  expect(rows[0].content).toMatch(message);
+});
 
 it('checks out the assigned source, registers only MR tools, resolves a real shallow merge conflict, and pushes only the source', async () => {
   const { root, config, repo, mr, gitlab, run, send, session, decide } = await setup();
@@ -311,17 +345,16 @@ it('checks fork write permission and uses read-only suggestions while retaining 
 });
 
 it.each([true, false])('binds MR emoji decisions to the note and replays approval (approved=%s)', async approved => {
-  const { run, gitlab, repo, post, send, drain, session } = await setup();
+  const { run, gitlab, repo, post, send, session } = await setup();
   const input = { questions: [{ question: 'Which file?' }] };
   let outcome;
   run.mockImplementation(async t => {
     outcome = await t.gate.canUseTool('AskUserQuestion', input);
     return 'Answered';
   });
-  await post(opened);
-  await vi.waitFor(async () => expect(await session()).toMatchObject({ status: 'WAITING_TOOL' }));
-  await drain();
+  await send(opened);
   const s = await session();
+  expect(s.status).toBe('WAITING_TOOL');
   const card = (await repo.getLatestPendingApproval(s.id))!;
   expect(gitlab.createMergeRequestNote).toHaveBeenCalledWith(2, 1, expect.stringContaining('Which file?'));
   // A guessed card, a removal, and a reporter's vote cannot resolve this request.

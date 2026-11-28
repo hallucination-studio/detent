@@ -7,7 +7,7 @@ import { PermissionGate, ColdHold } from '../claude/permission-gate.js';
 import { buildMrSystemPrompt, inlinePosition } from '../claude/prompts.js';
 import type { ClaudeRunner } from '../claude/runner.js';
 import { TranscriptHydrator } from '../claude/transcript-hydrator.js';
-import { redactGitUrl, type GitLabClient } from '../gitlab/client.js';
+import { isTerminalPipeline, redactGitUrl, type GitLabClient } from '../gitlab/client.js';
 import { hasBotMention, parseNoteIntent, parseEmojiIntent } from '../gitlab/command-parser.js';
 import { NoteStreamer, recoveryHint, renderPlanApprovalCard, renderStatus, renderSummary, waitingToolGuidance } from '../gitlab/note-streamer.js';
 import { actionableMr, normalizeGitLabEvent, type EventOf } from '../gitlab/webhook.js';
@@ -17,6 +17,7 @@ import type { ApprovalRequestRow, IssueSessionRow, NormalizedGitLabEvent, Parsed
 import { EphemeralSandbox, type TurnSandbox, type WorkspaceGitLab } from '../workspace/ephemeral-sandbox.js';
 import { mrWorkspaceTools, WorkspaceTools } from '../workspace/mcp-tools.js';
 import { createMrTools } from '../workspace/mr-tools.js';
+import type { SessionOrchestrator } from './session-orchestrator.js';
 import { createMrChannel } from './channel.js';
 import { formatInboxMessages, SessionBusy, StopTurn, TurnRuntime, type Active } from './turn-runtime.js';
 
@@ -28,6 +29,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
   private turns = new Set<Promise<void>>();
   constructor(config: AppConfig, repo: DetentRepository, private gitlab: Client, private runner: ClaudeRunner,
     private options: { decision?: DecisionClient; onNotify?: DetentExtensions['onNotify'];
+      wakeQueuedIssue: SessionOrchestrator['wakeQueuedIssue'];
       runHubEvent: (event: NormalizedGitLabEvent, body: string, label?: string) => Promise<void> }) {
     super(config, repo);
   }
@@ -304,6 +306,20 @@ export class MergeRequestOrchestrator extends TurnRuntime {
     const updated = new Set<string>();
     for (const row of rows)
       if (await this.repo.updateMergeRequestPipeline(row.id, p.id, p.status)) updated.add(row.id);
+    if (isTerminalPipeline(p.status)) {
+      const projectPath = event.project.path_with_namespace ?? event.project.id;
+      const base = this.config.gitlabBaseUrl.replace(/\/$/, '');
+      const url = p.url ?? (event.project.path_with_namespace ? `${base}/${projectPath}/-/pipelines/${p.id}` :
+        `${base}/api/v4/projects/${event.project.id}/pipelines/${p.id}`);
+      const message = redactGitUrl(`项目 ${projectPath} · ${p.ref} · Pipeline #${p.id} · ${p.status}\n${url}`, this.secrets);
+      const watches = await this.repo.resolveMatchingPipelineWatches(event.project.id, p.id, p.ref, {
+        inbox: w => ({ sessionId: w.sessionId, eventId: `pipeline-watch:${w.id}:${p.id}`, content: message, sourceKind: 'system', senderUsername: 'gitlab-ci' }),
+      });
+      await Promise.all([...new Set(watches.map(w => w.sessionId))].map(async id => {
+        const session = await this.repo.getSession(id);
+        if (session) await this.options.wakeQueuedIssue(session);
+      }));
+    }
     if (p.status !== 'success' && p.status !== 'failed') return;
     const matches = event.merge_request ? [event.merge_request] : await this.gitlab.listOpenMergeRequestsByBranch(project, p.ref);
     if (p.status === 'success') {

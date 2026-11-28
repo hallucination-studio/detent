@@ -17,6 +17,7 @@ async function setup(blockFailedPipeline = true) {
     getTag: vi.fn().mockResolvedValue(null),
     getCommit: vi.fn().mockResolvedValue({ id: sha, title: 'Ready' }),
     listPipelinesBySha: vi.fn().mockResolvedValue([]),
+    createPipeline: vi.fn(), getPipeline: vi.fn(), listPipelines: vi.fn(), getPipelineJobs: vi.fn(),
     createTag: vi.fn().mockResolvedValue(tag),
     createRelease: vi.fn().mockResolvedValue({ tag_name: tag.name, _links: { self: url } }),
   } satisfies ReleaseGitLab;
@@ -24,8 +25,8 @@ async function setup(blockFailedPipeline = true) {
   const session = await repo.getOrCreateSession(1, 42, 'test');
   session.permissionMode = 'default';
   const ctx = { session, repo, permissionMode: session.permissionMode, workspaceRoot: '/workspace' };
-  const [list, release] = createGitLabReleaseTools({ gitlab, blockFailedPipeline });
-  return { gitlab, ctx, list, release };
+  const [list, release, trigger, wait] = createGitLabReleaseTools({ gitlab, blockFailedPipeline });
+  return { gitlab, ctx, list, release, trigger, wait };
 }
 
 it('registers the optional pack and lists bounded, searchable tags', async () => {
@@ -33,6 +34,7 @@ it('registers the optional pack and lists bounded, searchable tags', async () =>
   const pack = createGitLabReleaseCapability({ gitlab });
   expect(pack).toMatchObject({ name: 'gitlab-release', enabled: true, tools: [
     { name: 'detent_list_tags', policy: 'readonly' }, { name: 'detent_create_release', policy: 'always_approve' },
+    { name: 'detent_trigger_pipeline', policy: 'coding_auto' }, { name: 'detent_await_pipeline', policy: 'readonly' },
   ] });
   const schema = z.object(list.schema);
   expect(schema.safeParse({ project: 0 }).success).toBe(false);
@@ -141,4 +143,42 @@ it('reports a concurrent tag change when GitLab returns a release on another com
   gitlab.createRelease.mockResolvedValueOnce({ tag_name: tag.name, commit: { id: 'f'.repeat(40) } });
   await expect(release.execute(input, { ...ctx, approvalId: 'approved' })).rejects.toThrow('提交与审批 SHA 不一致');
   expect(gitlab.createRelease).toHaveBeenCalledOnce();
+});
+
+it('subscribes to an explicit ref or pipeline ID, returns terminal jobs, and closes the registration race', async () => {
+  const { gitlab, ctx, trigger, wait } = await setup();
+  const pipeline = { id: 91, ref: 'main', status: 'pending', web_url: 'https://git.example/pipelines/91' };
+  const jobs = [{ id: 3, name: 'test', status: 'success' }];
+  const args = { project: 7, ref: 'main', variables: { RELEASE_TAG: 'v2' } };
+  const triggerSchema = z.object(trigger.schema);
+  for (const key of ['', '9INVALID', 'BAD-KEY', 'A B']) expect(triggerSchema.safeParse({ ...args, variables: { [key]: 'v' } }).success).toBe(false);
+  const full = Object.fromEntries(Array.from({ length: 20 }, (_, i) => ['VAR_' + i, 'x'.repeat(1000)]));
+  expect(triggerSchema.safeParse({ ...args, variables: full }).success).toBe(true);
+  for (const variables of [{ ...full, EXTRA: '' }, { LONG: 'x'.repeat(1001) }, { ['X'.repeat(256)]: '' }])
+    expect(triggerSchema.safeParse({ ...args, variables }).success).toBe(false);
+  gitlab.createPipeline.mockResolvedValue(pipeline);
+  gitlab.getPipeline.mockResolvedValue(pipeline);
+  gitlab.listPipelines.mockResolvedValue([]);
+  gitlab.getPipelineJobs.mockResolvedValue(jobs);
+  const awaitTarget = (target: string | number) => wait.execute({ project: 7, ref_or_pipeline_id: target }, ctx);
+  expect(await trigger.execute(triggerSchema.parse(args), ctx)).toMatchObject({ pipelineId: 91, status: 'pending', webUrl: pipeline.web_url, asyncCallback: true });
+  expect(gitlab.createPipeline).toHaveBeenCalledExactlyOnceWith(7, { ref: 'main', variables: args.variables });
+  expect(await awaitTarget('v2')).toMatchObject({ watching: true, pipelineId: null });
+  expect(await awaitTarget(91)).toMatchObject({ watching: true, pipelineId: 91 });
+  expect(await ctx.repo.listSessionPipelineWatches(ctx.session.id)).toMatchObject([
+    { targetProjectId: 7, pipelineId: 91, refName: 'main' }, { pipelineId: null, refName: 'v2' }, { pipelineId: 91 },
+  ]);
+  for (const status of ['success', 'failed', 'skipped', 'canceled']) {
+    gitlab.listPipelines.mockResolvedValueOnce([{ ...pipeline, status }]);
+    expect(await awaitTarget('main')).toMatchObject({ status, jobs, pipelineId: 91 });
+  }
+  gitlab.getPipeline.mockRejectedValueOnce(Error('GitLab HTTP 404'));
+  await expect(awaitTarget(92)).rejects.toThrow('404');
+  expect(await ctx.repo.listSessionPipelineWatches(ctx.session.id)).toHaveLength(3);
+  gitlab.getPipeline.mockResolvedValueOnce({ ...pipeline, status: 'success' });
+  expect(await trigger.execute(args, ctx)).toMatchObject({ status: 'success', pipelineId: 91 });
+  expect((await ctx.repo.listSessionPipelineWatches(ctx.session.id)).map(w => w.status)).toEqual(['PENDING', 'PENDING', 'PENDING', 'RESOLVED']);
+  gitlab.getPipeline.mockRejectedValueOnce(Error('GitLab HTTP 503'));
+  expect(await trigger.execute(args, ctx)).toMatchObject({ pipelineId: 91, asyncCallback: true, verificationError: 'GitLab HTTP 503' });
+  expect((await ctx.repo.listSessionPipelineWatches(ctx.session.id)).at(-1)?.status).toBe('PENDING');
 });

@@ -15,21 +15,27 @@ description: 约定 Ansible 仓库布局、存量代码修改范围、语法检�
 
 ## 新建仓库默认布局（可改）
 
-根目录放 `ansible.cfg`，用 `inventories/<env>/hosts.yml` 划分环境，在 `group_vars/` 维护组变量。顶层业务入口放在 `playbooks/<action>.yml`，可复用逻辑下沉到 `roles/<role_name>/`。默认目录约定为 `roles/<role_name>/{defaults,tasks,handlers,templates,files}/main.yml`。前三个目录的 `main.yml` 是 Ansible 自动加载的入口；后两个目录按任务引用的实际名称存放模板和静态文件。
+新建仓库时，每个可复用职责放在 `roles/<role>/tasks/main.yml`，同一次作业用 `playbooks/` 下的一个入口组合所需角色。其他团队可以直接引用其中一个角色。按实际角色路径配置 `ansible.cfg`，有可覆盖的默认参数时再加 `defaults/main.yml`。使用 JumpServer 时沿用其动态 inventory，团队维护自己的主机清单时再创建 `inventories/<env>/`。
 
-## 存量仓库演进（最小触达 + 触达即重构）
+## 存量仓库最小修改
 
-保留既有 Playbook 入口，仅按上述规范重构本次新增或直接修改的逻辑。将涉及的内联任务提取到 `roles/<role_name>/`，从原入口调用该 Role，内置模块使用完整名称 `ansible.builtin.*`。与任务无关的文件保持原样。
+尊重既有结构，只修改本次涉及的任务、变量或清单。变更与发版 MR 禁止夹带目录重构。已有内联任务可以原位修改。
 
 ## 代码与安全
 
 - 通过 `jms_job` 执行时，JumpServer 注入的动态 inventory 仅包含本次获批的目标资产，统一归入内置 `all` 组。Playbook 应设置 `hosts: all`，避免因自定义组名无法匹配而跳过所选资产。
 - 为每个 Play 和 Task 写明 `name`。内置模块使用完整名称 `ansible.builtin.*`。
 - 优先使用声明式模块，如 `ansible.builtin.template`、`lineinfile`、`copy`、`file` 和 `service`。配置变化通过 `notify` 触发对应 handler。只读探测设置 `changed_when: false`。
-- 仅对需要提权的任务设置 `become: true`。严禁提交明文凭据，敏感参数通过外部密钥注入或受保护的 `extra_vars` 提供。
+- 按目标路径的实际属主和授权账号编写任务。仅在任务确需提权且该账号已有相应授权时设置 `become: true`。严禁提交明文凭据，敏感参数通过外部密钥注入或受保护的 `extra_vars` 提供。
 
 ## 校验与执行（按已开通能力自适应，可改）
 
-提交 MR 前，仅使用本轮临时沙箱中已安装的工具。若已安装 `yamllint`，用它检查涉及的 YAML。若已安装 `ansible-playbook`，用 `ansible-playbook --syntax-check` 配合对应 inventory 检查入口。严禁在沙箱内安装软件包或创建虚拟环境（如使用 `pip` 安装依赖或用 `venv` 创建环境）。缺少某项工具时，注明该工具未安装，跳过对应检查并继续。记录实际执行的检查及结果。
+YAML 采用两空格缩进，以 `---` 开头，以 LF 结束。在工作树根目录运行 `yamllint playbooks roles` 检查变更。遇到 `new-line-at-end-of-file` 时，直接用 `printf '\n' >> 文件路径` 给报告中的文件各补一个 LF。同一批修复和复查可以在一次 Bash 调用内完成。
 
-若已启用 `jumpserver` 且任务要求落地变更，待 MR 合并后，核对合并 SHA、授权资产和参数，调用 `jms_job` 并传入仓库相对路径 `playbook_path`。获批提交后贴回任务链接并结束本轮。终态回调唤醒后，用 `jms_shell` 只读复验验收条件。其余情况仅交付 MR。
+```sh
+cd projects/example-ansible && printf '\n' >> playbooks/site.yml && printf '\n' >> roles/example/tasks/main.yml && yamllint playbooks roles
+```
+
+用实际工作树和报错路径替换示例，检查通过后提交 MR。
+
+合并后按 `env-topology` 执行，调用 `jms_job` 时传入已合并 SHA、环境、资产 ID 和仓库相对路径 `playbook_path`。终态回调后核对作业结果，用只读巡检补足目标配置或服务的生效证据。

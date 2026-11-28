@@ -8,7 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { Pool, RowDataPacket } from 'mysql2/promise';
 import type { E2EGitLabDriver } from './gitlab-driver.js';
 import { resetTargetNode, type RealE2EStackState } from './stack.js';
-import { ansibleEntryPoints, checkChart, checkRelease, targetCommand } from './scenario-checks.js';
+import { ansibleEntryPoints, checkChart, checkImageValues, checkRelease, targetCommand } from './scenario-checks.js';
 
 const run = promisify(execFile);
 type Project = Awaited<ReturnType<E2EGitLabDriver['project']>>;
@@ -103,10 +103,11 @@ class Scenario {
           throw new UnexpectedParkedState('Unexpected parked state ' + row.status + ' (' + detail + ') while waiting for ' + expected.join('|'));
         }
         if (released && row.status === 'IDLE') {
-          const [job] = await this.rows(
-            "SELECT id FROM delivery_executions WHERE session_id=? AND (status IN ('PENDING', 'RUNNING') OR callback_pending=1) LIMIT 1",
-            [row.id]);
-          if (!job) throw new UnexpectedParkedState(ref + ' is IDLE with no pending execution while waiting for ' + expected.join('|'));
+          const [pending] = await this.rows(
+            `SELECT EXISTS(SELECT 1 FROM delivery_executions WHERE session_id=? AND (status IN ('PENDING','RUNNING') OR callback_pending=1))
+              OR EXISTS(SELECT 1 FROM session_pipeline_watches WHERE session_id=? AND status='PENDING')
+              OR EXISTS(SELECT 1 FROM session_inbox WHERE session_id=? AND status='PENDING') AS waiting`, [row.id, row.id, row.id]);
+          if (!pending.waiting) throw new UnexpectedParkedState(ref + ' is IDLE with no pending callback while waiting for ' + expected.join('|'));
         }
         return;
       }
@@ -124,14 +125,16 @@ class Scenario {
     });
   }
 
-  async done(iid: number, { failOnIdle = false, afterSeq = 0 } = {}) {
+  async done(iid: number, { failOnIdle = false, afterSeq = 0, requireWorktree = false } = {}) {
     const session = await this.state(iid, failOnIdle ? ['DONE', 'IDLE'] : 'DONE', afterSeq);
     assert.equal(session.status, 'DONE', 'Issue ' + iid + ' settled in IDLE before closing');
     const issue = await this.gl.getIssue(this.ctx.hub, iid);
     assert.equal(issue.state, 'closed');
     assert.ok(issue.labels.includes('claude::done'), 'Closed Issue lacks claude::done');
-    const active = await this.rows("SELECT id FROM session_worktrees WHERE session_id=? AND status <> 'ARCHIVED'", [session.id]);
-    assert.equal(active.length, 0, 'Completed Issue retained an active worktree');
+    const trees = await this.rows('SELECT status FROM session_worktrees WHERE session_id=?', [session.id]);
+    if (requireWorktree) assert.ok(trees.length > 0, 'Expected at least one archived worktree');
+    assert.ok(trees.every(tree => tree.status === 'ARCHIVED'), 'Completed Issue retained an active worktree');
+    console.log(`  Issue #${iid} closed, claude::done, MySQL DONE, ${trees.length} worktree(s) archived`);
     return session;
   }
 
@@ -177,6 +180,7 @@ class Scenario {
     assert.equal(stillPending.id, card.id);
     await beforeApproval(stillPending);
     await this.approve(iid, card, 'sre');
+    console.log(`  Issue #${iid} ${tool}: e2e-dev vote left the card PENDING, approved by e2e-sre`);
     return { card, session };
   }
 
@@ -206,20 +210,20 @@ class Scenario {
     }
   }
 
-  async assertDiscoveryBeforePlan(session: Session) {
-    const pending = new Set<string>();
-    let discovered = false;
+  async planTools(session: Session) {
+    type Call = { name: string; input: Record<string, unknown> };
+    const pending = new Map<string, Call>();
+    const successful: Call[] = [];
     for await (const { role, block } of this.transcriptBlocks(session)) {
       if (role === 'assistant' && block.type === 'tool_use') {
         const tool = block.name.replace(/^mcp__detent__/, '');
-        if (tool === 'detent_submit_plan') {
-          assert.ok(discovered, 'Plan was submitted before a successful JumpServer node or asset lookup');
-          return;
-        }
-        if ((tool === 'jms_list_nodes' || tool === 'jms_list_assets') && typeof block.id === 'string') pending.add(block.id);
+        if (tool === 'detent_submit_plan') return successful;
+        pending.set(block.id, { name: tool, input: block.input });
       }
-      if (role === 'user' && block.type === 'tool_result' && pending.delete(block.tool_use_id) && !block.is_error) {
-        discovered = true;
+      if (role === 'user' && block.type === 'tool_result') {
+        const call = pending.get(block.tool_use_id);
+        if (call && !block.is_error) successful.push(call);
+        pending.delete(block.tool_use_id);
       }
     }
     throw Error('Missing detent_submit_plan tool call in session ' + session.id);
@@ -264,9 +268,10 @@ class Scenario {
     await this.targetConfig(128);
   }
 
-  async configPlan(iid: number, { requireAssetDiscovery = false } = {}) {
+  async configPlan(iid: number) {
     const plan = await this.state(iid, 'WAITING_PLAN');
-    if (requireAssetDiscovery) await this.assertDiscoveryBeforePlan(plan);
+    assert.ok((await this.planTools(plan)).some(call => ['jms_list_nodes', 'jms_list_assets'].includes(call.name)),
+      'Plan was submitted before a successful JumpServer node or asset lookup');
     await this.shellEvidence(plan, /max_connections\s*=\s*128\b/);
     await this.approve(iid, await this.card(plan, 'PLAN'), 'dev');
     return plan;
@@ -345,6 +350,22 @@ class Scenario {
     assert.match(targets, /\benv:prod\b(?!-)/);
   }
 
+  successfulExecution(approvalId: string) {
+    return this.until('acknowledged successful JumpServer execution', async () => {
+      const [row] = await this.rows(`SELECT e.*, s.status AS session_status, s.locked_by_pod
+        FROM approval_requests a JOIN issue_sessions s ON s.id=a.session_id
+        LEFT JOIN delivery_executions e ON e.approval_id=a.id WHERE a.id=?`, [approvalId]);
+      assert.ok(row, 'Missing JumpServer approval ' + approvalId);
+      if (!row.id) {
+        assert.ok(row.locked_by_pod || !['IDLE', 'DONE', 'FAILED'].includes(row.session_status),
+          'Approved turn ended without submitting a JumpServer job for ' + approvalId);
+        return;
+      }
+      assert.notEqual(row.status, 'FAILED', this.ctx.redact(row.output_summary ?? 'JumpServer job failed'));
+      return row.status === 'SUCCESS' && row.callback_pending === 0 && row;
+    });
+  }
+
   async executeMerged(iid: number, issue: Session, mr: MR, beforeApproval: () => Promise<void>, evidence: RegExp[], entries?: string[]) {
     this.trackNotes(iid);
     const sha = await this.gl.mergeMergeRequest(mr.target_project_id, mr.iid, mr.sha);
@@ -353,14 +374,9 @@ class Scenario {
       assert.equal((await this.rows('SELECT id FROM delivery_executions WHERE session_id=?', [issue.id])).length, 0);
       await beforeApproval();
     });
+    const execution = await this.successfulExecution(card.id);
     const closed = await this.done(iid, { afterSeq: session.last_message_seq });
-    const execution = await this.until('acknowledged successful JumpServer execution', async () => {
-      const rows = await this.rows('SELECT * FROM delivery_executions WHERE session_id=?', [closed.id]);
-      assert.equal(rows.length, 1);
-      assert.equal(rows[0].status, 'SUCCESS');
-      return rows[0].callback_pending === 0 && rows[0];
-    });
-    assert.equal(execution.approval_id, card.id);
+    assert.equal((await this.rows('SELECT id FROM delivery_executions WHERE session_id=?', [closed.id])).length, 1);
     assert.equal(execution.commit_sha, sha);
     if (entries) assert.ok(entries.includes(execution.playbook_path), 'Job did not execute the role playbook');
     else {
@@ -373,7 +389,10 @@ class Scenario {
     assert.equal(callback?.source_kind, 'system');
     assert.equal(callback.status, 'CONSUMED');
     assert.ok(Number(callback.consumed_ms) > 0);
-    for (const pattern of evidence) await this.shellEvidence(closed, pattern, session.last_message_seq, Number(callback.consumed_ms));
+    for (const pattern of evidence) {
+      if (!entries && pattern.test(execution.output_summary ?? '')) continue;
+      await this.shellEvidence(closed, pattern, session.last_message_seq, Number(callback.consumed_ms));
+    }
   }
 }
 
@@ -446,7 +465,7 @@ async function sop3(h: Scenario) {
   assert.equal((await h.gl.getIssue(hub, iid)).state, 'opened');
   assert.equal((await h.gl.getMr(api.id, apiMr.iid)).state, 'opened');
   await h.gl.mergeMergeRequest(api.id, apiMr.iid);
-  assert.ok((await h.done(iid)).last_message_seq > firstMerge.last_message_seq);
+  await h.done(iid, { afterSeq: firstMerge.last_message_seq });
   for (const [project, path] of versionPaths) assert.equal((await h.gl.getFile(project, path)).trim(), '1.0.0');
   assert.ok((await h.gl.getFile(api.id, changelog)).includes('1.0.0'));
 }
@@ -458,7 +477,7 @@ async function sop4(h: Scenario) {
   const original = await h.gl.fileBytes(ansible.id, legacy, 'main');
   const iid = await h.open('调整生产环境 demo-kafka 的连接数和请求超时',
     `请通过 ${ansible.path_with_namespace} 更新生产环境（prod）demo-kafka 主机的 /etc/detent-demo/app.conf，把 max_connections 从 128 提高到 512，并增加 request_timeout=30。请不要影响 staging 环境主机，执行变更并确认两项设置都已生效。`, 'delivery::env-change');
-  const plan = await h.configPlan(iid, { requireAssetDiscovery: true });
+  const plan = await h.configPlan(iid);
   const { issue, mr } = await h.openedMr(iid, plan, ansible);
   assert.deepEqual(await h.gl.fileBytes(ansible.id, legacy, mr.sha), original);
   const entries = await ansibleEntryPoints(h.gl, mr, false);
@@ -474,18 +493,19 @@ async function sop5(h: Scenario) {
   const { web } = h.ctx;
   const sha = await h.gl.headSha(web.id);
   const tag = 'v1.0.0';
-  const iid = await h.open('发布 Web 正式版', `请为 ${web.path_with_namespace} 仓库当前 main 分支最新提交发布 v1.0.0 正式版本和 Release。`, 'delivery::release');
+  const iid = await h.open('发布 Web 正式版', `请把 ${web.path_with_namespace} 当前 main 的最新提交发布为 v1.0.0 正式版，打上 Tag 并发布 GitLab Release。这次不涉及环境部署。`, 'delivery::release');
   const plan = await h.approvePlan(iid);
-  const { session } = await h.approveProduction(iid, plan.last_message_seq, 'detent_create_release', async () => {
-    assert.equal(await h.gl.getTag(web.id, tag), null);
-    assert.equal(await h.gl.getRelease(web.id, tag), null);
-  });
+  const session = await h.state(iid, 'WAITING_TOOL', plan.last_message_seq);
+  assert.equal(await h.gl.getTag(web.id, tag), null);
+  assert.equal(await h.gl.getRelease(web.id, tag), null);
+  await h.approve(iid, await h.card(session, 'TOOL_USE', 'detent_create_release'), 'dev');
   await h.done(iid, { afterSeq: session.last_message_seq });
   assert.equal(await h.gl.headSha(web.id), sha);
   assert.equal((await h.gl.getTag(web.id, tag))?.commit.id, sha);
   const release = await h.gl.getRelease(web.id, tag);
   assert.equal(release?.tag_name, tag);
   assert.equal(release.commit.id, sha);
+  console.log(`  GitLab Tag and Release ${tag} both point to main at ${sha}`);
 }
 
 async function sop6(h: Scenario) {
@@ -529,7 +549,7 @@ async function sop7(h: Scenario) {
   const legacy = 'templates/legacy-extra-cm.yaml';
   const original = await h.gl.fileBytes(helm.id, legacy, 'main');
   const iid = await h.open('给 demo-api 挂载生产配置并部署',
-    `请更新 ${helm.path_with_namespace}，让 demo-api 挂载新的应用配置 ConfigMap。生产环境需要 APP_ENV=prod 和 LOG_LEVEL=info，请保留单独调整生产配置的能力。通过 target-node-01 部署到集群的 demo-e2e 命名空间，然后核实部署状态。`, 'delivery::code');
+    `请更新 ${helm.path_with_namespace}，让 demo-api 挂载新的应用配置 ConfigMap。生产环境需要 APP_ENV=prod 和 LOG_LEVEL=info，请保留单独调整生产配置的能力。通过 target-node-01 部署到集群的 demo-e2e 命名空间，然后核实部署状态。`, 'delivery::env-change');
   const plan = await h.approvePlan(iid);
   const { issue, mr } = await h.openedMr(iid, plan, helm);
   assert.deepEqual(await h.gl.fileBytes(helm.id, legacy, mr.sha), original);
@@ -553,12 +573,13 @@ async function sop8(h: Scenario) {
   assert.equal(await h.gl.lookupProject(path), null);
   await h.resetConfig();
   const iid = await h.open('新建主机初始化仓库并调整连接上限',
-    `请从零创建 ${path} 作为主机初始化的 Ansible 仓库。我们需要用它把 target-node-01 上 /etc/detent-demo/app.conf 的 max_connections 调整到 256。请执行这次变更并核实结果。`, 'delivery::env-change');
+    `请新建 ${path} 作为主机初始化 Ansible 仓库。平台团队需要单独复用配置目录管理角色，服务团队希望通过另一个角色按整数设置连接上限。请用它把生产主机 target-node-01 的 /etc/detent-demo/app.conf 中的 max_connections 调到 256，保留原有属主和其他配置。`, 'delivery::env-change');
   const plan = await h.configPlan(iid);
   const { issue, mr } = await h.createApprovedProject(iid, plan, path);
   const entries = await ansibleEntryPoints(h.gl, mr, true);
   await h.executeMerged(iid, issue, mr, () => h.targetConfig(128), [/max_connections\s*=\s*256\b/], entries);
   await h.targetConfig(256);
+  console.log(`  MR !${mr.iid} applied through JumpServer, verified max_connections=256 on target-node-01`);
 }
 
 async function sop9(h: Scenario) {
@@ -568,7 +589,7 @@ async function sop9(h: Scenario) {
   assert.equal(await h.gl.lookupProject(path), null);
   await prepareNamespace(h, namespace);
   const iid = await h.open('为 order-service 创建部署仓库并上线',
-    `请从零创建 ${path}，用 Helm 管理 order-service。服务使用 busybox:1.36 镜像，在 8080 端口提供 HTTP，生产环境先部署两个副本。请通过 target-node-01 发布到集群的 order-e2e 命名空间并核实部署结果。`, 'delivery::code');
+    `请从零创建 ${path}，用 Helm 管理 order-service。服务使用 busybox:1.36 镜像，在 8080 端口提供 HTTP，生产环境先部署两个副本。请通过 target-node-01 发布到集群的 order-e2e 命名空间并核实部署结果。`, 'delivery::env-change');
   const plan = await h.approvePlan(iid);
   const { issue, mr, project } = await h.createApprovedProject(iid, plan, path);
   await checkChart(h.gl, mr, { namespace, replicas: 2 }, helmPath, stack.targetContainerName);
@@ -582,7 +603,178 @@ async function sop9(h: Scenario) {
   await checkRelease(stack.targetContainerName, { namespace, replicas: 3 });
 }
 
-const scenarios = { sop1, sop2, sop3, sop4, sop5, sop6, sop7, sop8, sop9 };
+const stableTag = '1.36';
+const releaseTag = '1.36.1';
+const releaseNamespace = (hub: number, env: 'pre' | 'prod') => env + '-' + hub;
+
+export async function withReleaseTopology({ hub, web, helm, stack, gitlab }: Pick<Context, 'hub' | 'web' | 'helm' | 'stack' | 'gitlab'>, run: () => Promise<void>) {
+  const topology = 'skills/env-topology/SKILL.md';
+  const [original, config] = await Promise.all([gitlab.getFile(hub, topology), gitlab.getFile(hub, 'capabilities.json')]);
+  const caps = JSON.parse(config);
+  caps.jumpserver.environments = {
+    pre: { match: ['label:env:pre'], approver_tier: 'standard' },
+    prod: { match: ['/DEFAULT/prod/app'] },
+  };
+  const pre = releaseNamespace(hub, 'pre');
+  const prod = releaseNamespace(hub, 'prod');
+  try {
+    await gitlab.upsertFile(hub, 'capabilities.json', JSON.stringify(caps), 'Enable scoped environment approvals');
+    await gitlab.upsertFile(hub, topology, original + [
+      '', '## 本次在线生效的环境矩阵',
+      `demo-api 的应用仓为 ${web.path_with_namespace}，Helm 配置仓为 ${helm.path_with_namespace}。发布顺序为 pre → prod。`,
+      `两套部署共用集群，pre 的命名空间为 ${pre}，prod 为 ${prod}，release 名均为 demo-api。`,
+      'pre 选择 pre-node-01，由 @e2e-dev 合并、放行。prod 选择 target-node-01，在工单 @e2e-sre 交接并由其合并、放行。',
+      '两个发布机都通过 JumpServer 访问集群，集群的 Helm 参数见 CLAUDE.md。',
+    ].join('\n'), 'Set live release topology and handoff');
+    await run();
+  } finally {
+    // Use the untimed fixture client even when a scenario has reached its deadline.
+    try {
+      await targetCommand(stack.targetContainerName, 'kubectl', 'delete', 'namespace', pre, prod, '--ignore-not-found', '--timeout=25s');
+    } finally {
+      for (const [path, contents] of [[topology, original], ['capabilities.json', config]]) {
+        if (await gitlab.getFile(hub, path) !== contents) await gitlab.upsertFile(hub, path, contents, 'Restore ' + path);
+      }
+    }
+  }
+}
+
+async function deployedImage(h: Scenario, env: 'pre' | 'prod', tag: string) {
+  const namespace = releaseNamespace(h.ctx.hub, env);
+  const target = h.ctx.stack.targetContainerName;
+  const [status, metadata, values, deployment] = (await Promise.all([
+    targetCommand(target, 'helm', 'status', 'demo-api', '-n', namespace, '-o', 'json'),
+    targetCommand(target, 'helm', 'get', 'metadata', 'demo-api', '-n', namespace, '-o', 'json'),
+    targetCommand(target, 'helm', 'get', 'values', 'demo-api', '-n', namespace, '--all', '-o', 'json'),
+    targetCommand(target, 'kubectl', 'get', 'deployment', 'demo-api', '-n', namespace, '-o', 'json'),
+  ])).map(json => JSON.parse(json));
+  assert.equal(status.namespace, namespace);
+  assert.equal(status.info.status, 'deployed');
+  assert.equal(String(values.image.tag), tag);
+  const image = deployment.spec.template.spec.containers[0].image;
+  assert.equal(image, 'busybox:' + tag);
+  console.log(`  K3s ${namespace}: Helm deployed revision ${status.version}, Deployment demo-api ${image}`);
+  return { revision: status.version, chartVersion: metadata.version, uid: deployment.metadata.uid, generation: deployment.metadata.generation };
+}
+
+async function deployEnvironment(h: Scenario, iid: number, previous: Session, env: 'pre' | 'prod', tag: string, beforeDeploy: () => Promise<void>) {
+  const { hub, helm, stack } = h.ctx;
+  const pre = env === 'pre';
+  const namespace = releaseNamespace(hub, env);
+  const actor = pre ? 'dev' : 'sre';
+  const asset = pre ? stack.preAssetId : stack.targetAssetId;
+  const link = await h.until(env + ' configuration MR', async () => {
+    const rows = await h.rows("SELECT * FROM session_merge_requests WHERE session_id=? AND mr_state='opened'", [previous.id]);
+    if (!rows.length) return;
+    assert.equal(rows.length, 1, 'Expected only the current environment MR');
+    return rows[0];
+  });
+  const waiting = await h.state(iid, 'IDLE', previous.last_message_seq);
+  assert.equal(link.target_project_id, helm.id);
+  const mr = await h.gl.getMr(helm.id, link.mr_iid);
+  assert.equal(mr.state, 'opened');
+  const file = 'values-' + env + '.yaml';
+  const diffs = await h.gl.mrDiffs(helm.id, mr.iid);
+  assert.deepEqual(diffs.map(d => [d.old_path, d.new_path, d.new_file, d.deleted_file]), [[file, file, false, false]]);
+  const [base, override] = await Promise.all(['values.yaml', file].map(path => h.gl.getFile(helm.id, path, mr.sha)));
+  await checkImageValues(stack.targetContainerName, base, override, tag);
+  assert.equal((await h.gl.getIssue(hub, iid)).state, 'opened');
+  if (!pre) assert.ok((await h.gl.listIssueNotes(hub, iid)).some(n => n.author.username === 'detent-bot' &&
+    n.body.replace(/<details\b[^>]*>[\s\S]*?<\/details>/gi, '').includes('@e2e-sre')), 'Missing production handoff');
+  await beforeDeploy();
+  const merged = await h.gl.mergeMergeRequest(helm.id, mr.iid, mr.sha, actor);
+  console.log(`  e2e-${actor} merged !${mr.iid} at ${merged}, only ${file} changed, image.tag=${tag}`);
+  async function checkCard(job: RowDataPacket) {
+    const input = typeof job.tool_input === 'string' ? JSON.parse(job.tool_input) : job.tool_input;
+    assert.equal(input.environment, env);
+    assert.deepEqual(input.asset_ids, [asset]);
+    assert.equal(input.commit_sha, merged);
+    assert.equal(input.mr_iid, mr.iid);
+    assert.equal(input.target_project_id, helm.id);
+    assert.ok(input.command.includes(namespace), 'Deployment ignored the live topology');
+    assert.equal((await h.rows('SELECT id FROM delivery_executions WHERE mr_id=?', [link.id])).length, 0);
+    await beforeDeploy();
+  }
+  let session: Session;
+  let card: RowDataPacket;
+  if (pre) {
+    session = await h.state(iid, 'WAITING_TOOL', waiting.last_message_seq);
+    card = await h.card(session, 'TOOL_USE', 'jms_job');
+    await checkCard(card);
+    await h.approve(iid, card, 'dev');
+  } else {
+    ({ session, card } = await h.approveProduction(iid, waiting.last_message_seq, 'jms_job', checkCard));
+  }
+  const execution = await h.successfulExecution(card.id);
+  assert.equal(execution.commit_sha, merged);
+  assert.equal(execution.mr_id, link.id);
+  console.log(`  ${env} execution ${execution.jumpserver_job_id} SUCCESS at approved merge SHA ${merged}`);
+  return session;
+}
+
+async function approveTopologyPlan(h: Scenario, iid: number, tagProject?: Project) {
+  const plan = await h.state(iid, 'WAITING_PLAN');
+  const tools = await h.planTools(plan);
+  assert.ok(tools.some(t => t.name === 'Read' && String(t.input.file_path).endsWith('skills/env-topology/SKILL.md')),
+    'Missing shared topology read before the plan');
+  if (tagProject) assert.ok(tools.some(t => t.name === 'detent_list_tags' &&
+    [String(tagProject.id), tagProject.path_with_namespace].includes(String(t.input.project))), 'Missing application tag lookup before release plan');
+  await h.approve(iid, await h.card(plan, 'PLAN'), 'dev');
+  return plan;
+}
+
+async function sop10(h: Scenario) {
+  const { web, helm, hub } = h.ctx;
+  await h.gl.seedTag(web.id, stableTag, await h.gl.headSha(web.id));
+  await h.gl.upsertFile(web.id, 'release.txt', releaseTag + '\n', 'Prepare the next application version');
+  const pinned = await h.gl.headSha(web.id);
+  await h.gl.upsertFile(helm.id, 'values-pre.yaml', await h.gl.getFile(helm.id, 'values-prod.yaml'), 'Seed pre from the stable environment');
+  await h.gl.permitDeveloperMerge(helm.id);
+  const iid = await h.open('发布 demo-api 并完成环境晋级',
+    `请把 ${web.path_with_namespace} 的 main 提交 ${pinned} 发布为 ${releaseTag}。demo-api 的镜像已就绪，上一稳定版本是 ${stableTag}。请用 ${helm.path_with_namespace} 的 Chart 先上预发布环境，验收通过后再上生产。两个环境都是首次安装。`, 'delivery::release');
+  const plan = await approveTopologyPlan(h, iid, web);
+  let previous = await h.state(iid, 'WAITING_TOOL', plan.last_message_seq);
+  const card = await h.card(previous, 'TOOL_USE', 'detent_create_release');
+  assert.equal(await h.gl.getTag(web.id, releaseTag), null);
+  await h.approve(iid, card, 'dev');
+  for (const env of ['pre', 'prod'] as const) {
+    previous = await deployEnvironment(h, iid, previous, env, releaseTag, async () => {
+      assert.equal((await h.gl.getTag(web.id, releaseTag))?.commit.id, pinned);
+      await namespaceAbsent(h, releaseNamespace(hub, env));
+    });
+    await deployedImage(h, env, releaseTag);
+  }
+  await h.done(iid, { afterSeq: previous.last_message_seq, requireWorktree: true });
+}
+
+async function sop11(h: Scenario) {
+  const { helm, hub } = h.ctx;
+  const [pre, chart, preValues] = await Promise.all([
+    deployedImage(h, 'pre', releaseTag), h.gl.getFile(helm.id, 'Chart.yaml'), h.gl.getFile(helm.id, 'values-pre.yaml'),
+  ]);
+  const prod = await deployedImage(h, 'prod', releaseTag);
+  const iid = await h.open('回退生产环境的 demo-api',
+    `demo-api 升到 ${releaseTag} 后出现兼容性问题，请把生产环境恢复到上一稳定版本 ${stableTag}。预发布环境保留 ${releaseTag} 供排查。`, 'delivery::env-change');
+  const plan = await approveTopologyPlan(h, iid);
+  const session = await deployEnvironment(h, iid, plan, 'prod', stableTag, async () => {
+    assert.deepEqual(await deployedImage(h, 'prod', releaseTag), prod, 'Production changed before SRE approval');
+    assert.deepEqual(await deployedImage(h, 'pre', releaseTag), pre, 'Pre changed during rollback');
+  });
+  const closed = await h.done(iid, { afterSeq: session.last_message_seq, requireWorktree: true });
+  const executions = await h.rows('SELECT agent_profile, status FROM delivery_executions WHERE session_id=?', [closed.id]);
+  assert.deepEqual(executions.map(row => [row.agent_profile, row.status]), [['env-change', 'SUCCESS']]);
+  assert.deepEqual((await h.rows('SELECT merged_by FROM session_merge_requests WHERE session_id=?', [closed.id])).map(row => row.merged_by), ['e2e-sre']);
+  assert.ok((await h.gl.getIssue(hub, iid)).labels.includes('delivery::env-change'));
+  assert.equal(await h.gl.getFile(helm.id, 'Chart.yaml'), chart);
+  assert.equal(await h.gl.getFile(helm.id, 'values-pre.yaml'), preValues);
+  assert.deepEqual(await deployedImage(h, 'pre', releaseTag), pre, 'Rollback changed the pre Helm release or Deployment');
+  const restored = await deployedImage(h, 'prod', stableTag);
+  assert.ok(restored.revision > prod.revision, 'Expected a new Helm revision for the production rollback');
+  assert.equal(restored.chartVersion, prod.chartVersion);
+  console.log(`  Rollback #${iid}: Chart.yaml (${restored.chartVersion}) and values-pre.yaml unchanged, pre revision ${pre.revision}, prod revision ${prod.revision} -> ${restored.revision}`);
+}
+
+const scenarios = { sop1, sop2, sop3, sop4, sop5, sop6, sop7, sop8, sop9, sop10, sop11 };
 export type SopName = keyof typeof scenarios;
 export const sopNames = Object.keys(scenarios) as SopName[];
 export async function runScenario(name: SopName, context: Context) {

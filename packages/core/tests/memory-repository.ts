@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   validateSequence,
   type InboxInput,
+  type WatchResolution,
   type Decision,
   type Message,
   type MR,
@@ -18,6 +19,7 @@ import type {
   SessionInboxRow,
   SessionMergeRequestRow,
   SessionMessageRow,
+  SessionPipelineWatchRow,
   SessionWorktreeRow,
 } from '../src/types.js';
 
@@ -39,6 +41,25 @@ export class InMemoryDetentRepository implements DetentRepository {
   private mrs = new Map<string, SessionMergeRequestRow>();
   private approvals = new Map<string, ApprovalRequestRow>();
   private inbox: SessionInboxRow[] = [];
+  private watches: SessionPipelineWatchRow[] = [];
+  async createPipelineWatch(sessionId: string, targetProjectId: number, pipelineId: number | null, refName: string | null) {
+    const id = randomUUID();
+    this.watches.push({ id, sessionId, targetProjectId, pipelineId, refName, status: 'PENDING', createdAt: new Date() });
+    return id;
+  }
+  async listSessionPipelineWatches(sessionId: string) {
+    return structuredClone(this.watches.filter(w => w.sessionId === sessionId));
+  }
+  async resolveMatchingPipelineWatches(projectId: number, pipelineId: number, refName: string, { onlyWatchId, inbox }: WatchResolution = {}) {
+    const matches = this.watches.filter(w => w.targetProjectId === projectId && w.status === 'PENDING' &&
+      (!onlyWatchId || w.id === onlyWatchId) && (w.pipelineId === null ? w.refName === refName : w.pipelineId === pipelineId));
+    for (const w of matches) w.status = 'RESOLVED';
+    if (inbox) for (const w of matches) await this.enqueueSessionInbox(inbox(w));
+    return structuredClone(matches);
+  }
+  async expireSessionPipelineWatches(sessionId: string) {
+    for (const w of this.watches) if (w.sessionId === sessionId && w.status === 'PENDING') w.status = 'EXPIRED';
+  }
   getOrCreateSession(project: number, iid: number, title: string) {
     return this.createSession('issue', project, iid, title);
   }
@@ -87,6 +108,9 @@ export class InMemoryDetentRepository implements DetentRepository {
   }
   async updateSessionState(id: string, state: State) {
     Object.assign(this.sessions.get(id)!, state, { updatedAt: new Date() });
+    if (state.status === 'DONE') {
+      for (const row of this.inbox) if (row.sessionId === id && row.status === 'PENDING') row.status = 'EXPIRED';
+    }
   }
   async acquireSessionLease(id: string, pod: string, ttl: number, expiredAt?: Date) {
     const s = this.sessions.get(id)!;
@@ -211,7 +235,8 @@ export class InMemoryDetentRepository implements DetentRepository {
   }
   async enqueueSessionInbox(input: InboxInput) {
     if (this.inbox.some(row => row.sessionId === input.sessionId && row.eventId === input.eventId)) return false;
-    if (!this.sessions.has(input.sessionId)) return false;
+    const session = this.sessions.get(input.sessionId);
+    if (!session || session.status === 'DONE') return false;
     this.inbox.push({ ...input, senderUsername: input.senderUsername ?? null, discussionId: input.discussionId ?? null,
       id: this.inbox.length + 1, status: 'PENDING', createdAt: new Date(), consumedAt: null });
     return true;

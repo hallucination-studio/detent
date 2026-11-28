@@ -1,10 +1,12 @@
 import { z } from 'zod';
-import { defineExtensionTool, type AnyDetentExtensionTool, type DetentCapabilityPack } from '../extensions.js';
+import { defineExtensionTool, type AnyDetentExtensionTool, type DetentCapabilityPack, type ExtensionToolContext } from '../extensions.js';
 import { escapeTableCell, renderNote } from '../gitlab/note-streamer.js';
-import { redactGitUrl, type GitLabClient } from '../gitlab/client.js';
+import { isTerminalPipeline, redactGitUrl, type GitLabClient } from '../gitlab/client.js';
+import { logError } from '../gitlab/redact.js';
 
 export type ReleaseGitLab = Pick<GitLabClient,
-  'getProject' | 'listTags' | 'getCommit' | 'getTag' | 'listPipelinesBySha' | 'createTag' | 'createRelease'
+  'getProject' | 'listTags' | 'getCommit' | 'getTag' | 'listPipelinesBySha' | 'createTag' | 'createRelease' |
+  'createPipeline' | 'getPipeline' | 'listPipelines' | 'getPipelineJobs'
 >;
 interface ReleaseOptions {
   gitlab: ReleaseGitLab;
@@ -12,6 +14,9 @@ interface ReleaseOptions {
 }
 
 const project = z.union([z.number().int().positive(), z.string().trim().min(1).max(255)]);
+const pipelineRef = z.string().trim().min(1).max(255);
+const pipelineVariables = z.record(z.string().max(255).regex(/^[A-Za-z_][A-Za-z0-9_]*$/), z.string().max(1000))
+  .refine(vars => Object.keys(vars).length <= 20, '每次最多传入 20 个流水线变量');
 const tagName = z.string().min(1).max(128).refine(name =>
   !/[\s\p{Cc}~^:?*\[\\]/u.test(name) && !name.includes('..') && !name.includes('@{') &&
   !name.endsWith('.') && name.split('/').every(part => part && !part.startsWith('.') && !part.endsWith('.lock')),
@@ -25,6 +30,28 @@ const releaseSchema = {
 };
 
 export function createGitLabReleaseTools({ gitlab, blockFailedPipeline }: ReleaseOptions): AnyDetentExtensionTool[] {
+  type Pipeline = Awaited<ReturnType<ReleaseGitLab['getPipeline']>>;
+  async function watch(ctx: ExtensionToolContext, projectId: number, ref: string, pipeline: Pipeline | undefined, triggered: boolean) {
+    const result = (p?: Pipeline) => ({ pipelineId: p?.id ?? null, status: p?.status ?? null, webUrl: p?.web_url ?? null, ref });
+    const terminal = async (p: Pipeline) => ({
+      ...result(p), ...(!triggered && { jobs: await gitlab.getPipelineJobs(projectId, p.id) }),
+    });
+    if (pipeline && isTerminalPipeline(pipeline.status)) return terminal(pipeline);
+    const id = await ctx.repo.createPipelineWatch(ctx.session.id, projectId, pipeline?.id ?? null, ref);
+    // A short pipeline may finish between the GitLab read and the committed subscription.
+    let latest: Pipeline | undefined;
+    let verificationError: string | undefined;
+    try {
+      latest = pipeline ? await gitlab.getPipeline(projectId, pipeline.id) : (await gitlab.listPipelines(projectId, ref))[0];
+    } catch (error) {
+      // The trigger and its watch are already committed. Report the read error without inviting another POST.
+      verificationError = logError('pipeline-watch', error);
+    }
+    if (latest && isTerminalPipeline(latest.status) &&
+        (await ctx.repo.resolveMatchingPipelineWatches(projectId, latest.id, ref, { onlyWatchId: id })).length) return terminal(latest);
+    return { ...result(latest ?? pipeline), asyncCallback: true, ...(!triggered && { watching: true }), ...(verificationError && { verificationError }),
+      nextAction: triggered ? '流水线已触发并登记终态回调，请结束本轮等待自动唤醒。' : '已登记流水线终态回调，请结束本轮等待自动唤醒。' };
+  }
   return [
     defineExtensionTool({
       name: 'detent_list_tags', description: 'List Git tags and their commit SHAs', policy: 'readonly',
@@ -92,6 +119,26 @@ export function createGitLabReleaseTools({ gitlab, blockFailedPipeline }: Releas
           project: p.path_with_namespace, tagName: tag.tag_name, commitSha: sha,
           mode: input.tag_only ? 'tag' : 'release', releaseUrl,
         };
+      },
+    }),
+    defineExtensionTool({
+      name: 'detent_trigger_pipeline', description: '触发目标仓库流水线。未结束时自动登记终态回调。', policy: 'coding_auto',
+      schema: { project, ref: pipelineRef, variables: pipelineVariables.optional() },
+      async execute({ project, ref, variables }, ctx) {
+        const p = await gitlab.getProject(project);
+        return watch(ctx, p.id, ref, await gitlab.createPipeline(p.id, { ref, variables }), true);
+      },
+    }),
+    defineExtensionTool({
+      name: 'detent_await_pipeline', description: '等待指定流水线 ID 或分支/Tag 的最新流水线。仅在用户或 SOP 明确要求等待时订阅尚未出现的 ref。',
+      policy: 'readonly', schema: { project, ref_or_pipeline_id: z.union([z.number().int().positive(), pipelineRef]) },
+      async execute({ project, ref_or_pipeline_id: target }, ctx) {
+        const p = await gitlab.getProject(project);
+        if (typeof target === 'number') {
+          const pipeline = await gitlab.getPipeline(p.id, target);
+          return watch(ctx, p.id, pipeline.ref, pipeline, false);
+        }
+        return watch(ctx, p.id, target, (await gitlab.listPipelines(p.id, target))[0], false);
       },
     }),
   ];

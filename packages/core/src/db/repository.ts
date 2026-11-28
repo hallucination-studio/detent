@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Pool, PoolConnection, RowDataPacket, ResultSetHeader } from 'mysql2/promise';
 import type {
   ApprovalRequestRow,
@@ -9,6 +9,7 @@ import type {
   SessionInboxRow,
   SessionMergeRequestRow,
   SessionMessageRow,
+  SessionPipelineWatchRow,
   SessionWorktreeRow,
 } from '../types.js';
 
@@ -22,8 +23,16 @@ export type Decision = Exclude<ApprovalStatus, 'PENDING'>;
 
 export type InboxInput = Pick<SessionInboxRow, 'sessionId' | 'eventId' | 'sourceKind' | 'content'> &
   Partial<Pick<SessionInboxRow, 'senderUsername' | 'discussionId'>>;
+export interface WatchResolution {
+  onlyWatchId?: string;
+  inbox?: (watch: SessionPipelineWatchRow) => InboxInput;
+}
 
 export interface DetentRepository {
+  createPipelineWatch(sessionId: string, projectId: number, pipelineId: number | null, refName: string | null): Promise<string>;
+  listSessionPipelineWatches(sessionId: string): Promise<SessionPipelineWatchRow[]>;
+  resolveMatchingPipelineWatches(projectId: number, pipelineId: number, refName: string, options?: WatchResolution): Promise<SessionPipelineWatchRow[]>;
+  expireSessionPipelineWatches(sessionId: string): Promise<void>;
   getOrCreateMrSession(project: number, iid: number, title: string): Promise<IssueSessionRow>;
   getSessionByMr(project: number, iid: number): Promise<IssueSessionRow | null>;
   getMrSessionByApprovalNote(project: number, note: number): Promise<IssueSessionRow | null>;
@@ -157,8 +166,40 @@ export class MySqlDetentRepository implements DetentRepository {
   markMergeRequestClosed(id: string) {
     return this.change("UPDATE session_merge_requests SET mr_state='closed' WHERE id=? AND mr_state='opened'", [id]);
   }
+  async createPipelineWatch(sessionId: string, projectId: number, pipelineId: number | null, refName: string | null) {
+    const id = randomUUID();
+    await this.change('INSERT INTO session_pipeline_watches(id,session_id,target_project_id,pipeline_id,ref_name) VALUES(?,?,?,?,?)',
+      [id, sessionId, projectId, pipelineId, refName]);
+    return id;
+  }
+  listSessionPipelineWatches(sessionId: string) {
+    return this.rows<SessionPipelineWatchRow>('session_pipeline_watches', 'session_id=? ORDER BY created_at,id', [sessionId]);
+  }
+  resolveMatchingPipelineWatches(projectId: number, pipelineId: number, refName: string, { onlyWatchId, inbox }: WatchResolution = {}) {
+    return this.transaction(async cx => {
+      const watches = await this.rows<SessionPipelineWatchRow>('session_pipeline_watches',
+        "target_project_id=? AND status='PENDING' AND (pipeline_id=? OR (pipeline_id IS NULL AND ref_name=?))" +
+        (onlyWatchId ? ' AND id=?' : '') + ' FOR UPDATE', [projectId, pipelineId, refName, ...(onlyWatchId ? [onlyWatchId] : [])], cx);
+      if (watches.length) await cx.query("UPDATE session_pipeline_watches SET status='RESOLVED' WHERE id IN (?)", [watches.map(w => w.id)]);
+      // A pod can stop before it wakes the Issue. The watchdog must already have its event.
+      if (inbox) for (const w of watches) await this.insertInbox(cx, inbox(w));
+      return watches.map(w => ({ ...w, status: 'RESOLVED' as const }));
+    });
+  }
+  async expireSessionPipelineWatches(sessionId: string) {
+    await this.change("UPDATE session_pipeline_watches SET status='EXPIRED' WHERE session_id=? AND status='PENDING'", [sessionId]);
+  }
   enqueueSessionInbox(input: InboxInput) {
-    return this.change('INSERT IGNORE INTO session_inbox SET ?', [columns(input)]);
+    return this.insertInbox(this.pool, input);
+  }
+  private async insertInbox(cx: Pool | PoolConnection, input: InboxInput) {
+    // A watch UUID plus a large GitLab ID can exceed the existing 64-character deduplication key.
+    const eventId = input.eventId.length > 64 ? createHash('sha256').update(input.eventId).digest('hex') : input.eventId;
+    const [result] = await cx.query<ResultSetHeader>(
+      `INSERT IGNORE INTO session_inbox (session_id, event_id, source_kind, sender_username, discussion_id, content)
+       SELECT id, ?, ?, ?, ?, ? FROM issue_sessions WHERE id=? AND status <> 'DONE' FOR SHARE`,
+      [eventId, input.sourceKind, input.senderUsername ?? null, input.discussionId ?? null, input.content, input.sessionId]);
+    return result.affectedRows > 0;
   }
   drainSessionInbox(sessionId: string, owner?: string, sourceKind?: string) {
     return this.transaction(async cx => {
@@ -190,6 +231,14 @@ export class MySqlDetentRepository implements DetentRepository {
     return (await this.rows<IssueSessionRow>('issue_sessions', 'id=?', [id]))[0] ?? null;
   }
   async updateSessionState(id: string, state: State) {
+    if (state.status === 'DONE') {
+      // An event committed just before closure can still be waiting for the session lease.
+      await this.transaction(async cx => {
+        await cx.query('UPDATE issue_sessions SET ? WHERE id=?', [columns(state), id]);
+        await cx.query("UPDATE session_inbox SET status='EXPIRED' WHERE session_id=? AND status='PENDING'", [id]);
+      });
+      return;
+    }
     await this.change('UPDATE issue_sessions SET ? WHERE id=?', [columns(state), id]);
   }
   acquireSessionLease(id: string, pod: string, ttl: number, expiredAt?: Date) {

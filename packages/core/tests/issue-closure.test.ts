@@ -98,12 +98,30 @@ it('requires an approved plan, resolved approvals and merged MRs before scheduli
     });
     await expect(gate.invokeExtension(tool, input)).rejects.toThrow('尚有未合并的 MR');
     await repo.markMergeRequestMerged(mr.id, 'abc', 'dev');
+    await repo.createPipelineWatch(session.id, 2, 42, 'main');
+    await expect(gate.invokeExtension(tool, input)).rejects.toThrow('等待终态的流水线');
+    await repo.resolveMatchingPipelineWatches(2, 42, 'main');
     await gate.invokeExtension(tool, input);
     return 'verified';
   });
   await pod.handleUserIntent(1, 42, { type: 'APPROVE', userId: 4, username: 'dev' });
   expect(await status()).toBe('DONE');
   expect(gitlab.closeIssue).toHaveBeenCalledExactlyOnceWith(1, 42);
+});
+
+it('shows pending watches and expires them when the Issue is aborted, reset or closed', async () => {
+  const { pod, repo, session, gitlab, run } = await setup({ closePolicy: 'manual' });
+  run.mockResolvedValue('重新规划');
+  const actor = { userId: 4, username: 'owner' };
+  for (const action of ['ABORT', 'RESET', 'close'] as const) {
+    await repo.createPipelineWatch(session.id, 5, null, 'stable');
+    await pod.handleUserIntent(1, 42, { ...actor, type: 'STATUS' });
+    expect(gitlab.createIssueNote).toHaveBeenLastCalledWith(1, 42, expect.stringContaining('项目 5 · stable'));
+    if (action === 'close') await pod.handleIssueClosed(1, 42);
+    else await pod.handleUserIntent(1, 42, { ...actor, type: action });
+    expect((await repo.listSessionPipelineWatches(session.id)).every(w => w.status === 'EXPIRED')).toBe(true);
+    expect(await repo.resolveMatchingPipelineWatches(5, 1, 'stable')).toEqual([]);
+  }
 });
 
 it.each(['error', 'abort during flush', 'cold hold', 'new blocker'])('discards a scheduled close on %s', async failure => {

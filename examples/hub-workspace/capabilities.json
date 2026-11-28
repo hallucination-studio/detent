@@ -13,6 +13,7 @@
   },
   "gitlab-release": {
     "type": "gitlab-release",
+    "approver_tier": "standard",
     "enabled": true,
     "block_failed_pipeline": true
   }

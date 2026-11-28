@@ -147,12 +147,21 @@ ALTER TABLE session_merge_requests
 
 Core 加载 Hub SOP、检查所需能力并提供受审批的 GitLab 发版工具。Delivery 装配 JumpServer 等可选能力。bootstrap 补齐 Hub 规范和 Issue 模板。SOP 验收目标包括缺能力时的配置指引、运行中更新发布规范和跨 Pod 环境变更。
 
+### V3 发布闭环验收
+
+- Core 在 `gitlab-release` 内按项目、ID 或 ref 持久化流水线等待，触发时自动订阅。用含 skipped 的终态、未创建、并发及重放事件验证等待登记、状态更新、一次唤醒、关单拦截和过期清理。断言重复系统事件跳过抢租约，晚到回调跳过已关闭会话。
+- Delivery 以审批单的原始工具参数和当前 Hub 配置计算审批级别。验证 Owner 可批准显式 standard 的 Tag 和 pre 作业，跨环境资产被拒，等待审批时资产移出、黑名单变化、能力撤销或 prod SOP 均不能降低门槛。
+- 集成 E2E 串起 Tag 构建回调、pre 配置 MR、跨仓晋级流水线和 prod 交接。失败场景验证阻断、保持工单打开及通过独立 MR 恢复上一稳定 Tag。
+- 真实 SOP10 在运行时改写测试 Hub 的环境矩阵。Developer 合并和放行 pre，Maintainer 接棒 prod，并核验 Developer 的生产审批被拒、两个命名空间的 Helm 状态和实际镜像版本、工单关闭及 Worktree 归档。
+- 真实 SOP11 在 SOP10 验收后的同一集群开独立 env-change 工单。验证仅改生产 values，Developer 的执行审批被拒，SRE 合并并批准后 prod 恢复上一稳定镜像，pre 的镜像、Deployment 和 Helm revision 保持一致，回滚工单自动关闭并归档。单独选择 SOP11 时自动先跑 SOP10，各自使用完整的场景时限。
+- SOP4、SOP7 验证存量仓库按原结构最小修改，SOP8、SOP9 校验新仓的 Ansible 和 Helm 基线。
+
 ## V4 演进实施计划：Issue 自动闭环终止条件与真实服务栈 SOP E2E
 
 | 阶段 | 阶段目标 | 核心交付物 | 核心验收标准 |
 | :--- | :--- | :--- | :--- |
-| **Stage 8** | **Issue 自动闭环机制（`DONE` / `claude::done` + `detent_close_issue` + `close_policy` + 硬守卫）** | • `SessionStatus` 新增 `'DONE'` 与 `claude::done` 标签；`GitLabClient` 新增 `closeIssue`<br/>• `HubWorkflow` 支持 `close_policy: manual \| auto \| approve`（默认 `manual`）<br/>• `SessionOrchestrator` 集成 `detent_close_issue` 延迟原子关闭与 4 重硬守卫；`DetentExtensions.resolveTurnProfile` 返回的 `TurnProfile` 支持 `closePolicy` 与 `canCloseIssue`<br/>• `@detent/delivery` 注入执行记录终态守卫、MR 合并跳过 `DONE` 会话；标准模板更新 `close_policy: auto` 与终止条件；`scripts/bootstrap.ts` 补齐 `claude::done` 标签 | 1. 单测覆盖：`manual`/`auto`/`approve`、Plan 阶段禁关、未合并 MR 禁关、待审项禁关、未成功执行记录禁关、轮次报错不关单、只读巡检使用 SDK `default` 模式且工作区保持只读，关单前先归档 Worktree 再刷新最终评论，关闭后置 `DONE`<br/>2. `packages/core` 零业务污染<br/>3. `npm run check && npm run build` 全绿 |
-| **Stage 9** | **真实服务栈 SOP 验收** | 第 2 步实现 `scripts/e2e/stack.ts` 和 `scripts/e2e/run-e2e.ts`，复用 `gitlab-driver.ts` 与 `live-gitlab.ts` 操作真实 GitLab | 先用 `npm run e2e:up` 启动环境，再用 `npm run e2e` 构建并验证巡检、代码交付、发版、环境变更、热修复和关单审批，最后用 `npm run e2e:down` 拆除环境。完成的 Issue 在 GitLab 为 `closed` 且带有 `claude::done`，对应 MySQL 会话为 `DONE`。 |
+| **Stage 8** | **Issue 自动闭环机制（`DONE` / `claude::done` + `detent_close_issue` + `close_policy` + 硬守卫）** | • `SessionStatus` 新增 `'DONE'` 与 `claude::done` 标签；`GitLabClient` 新增 `closeIssue`<br/>• `HubWorkflow` 支持 `close_policy: manual \| auto \| approve`（默认 `manual`）<br/>• `SessionOrchestrator` 集成 `detent_close_issue` 延迟关闭与关单硬守卫；`DetentExtensions.resolveTurnProfile` 返回的 `TurnProfile` 支持 `closePolicy` 与 `canCloseIssue`<br/>• `@detent/delivery` 注入执行记录终态守卫、MR 合并跳过 `DONE` 会话；标准模板更新 `close_policy: auto` 与终止条件；`scripts/bootstrap.ts` 补齐 `claude::done` 标签 | 1. 单测覆盖：`manual`/`auto`/`approve`、Plan 阶段禁关、未合并 MR 禁关、未决流水线订阅禁关、待审项禁关、未成功执行记录禁关、轮次报错不关单、只读巡检使用 SDK `default` 模式且工作区保持只读，关单前先归档 Worktree 再刷新最终评论，关闭后置 `DONE`<br/>2. `packages/core` 零业务污染<br/>3. `npm run check && npm run build` 全绿 |
+| **Stage 9** | **真实服务栈 SOP 验收** | 通过 `scripts/e2e/stack.ts` 和 `scripts/e2e/run-e2e.ts`，复用 `gitlab-driver.ts` 与 `live-gitlab.ts` 操作真实 GitLab | 先用 `npm run e2e:up` 启动环境，再用 `npm run e2e` 构建并验证巡检、代码交付、发版、环境变更、热修复和关单审批，最后用 `npm run e2e:down` 拆除环境。完成的 Issue 在 GitLab 为 `closed` 且带有 `claude::done`，对应 MySQL 会话为 `DONE`。 |
 
 ### Jev 风控验收
 

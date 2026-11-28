@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { redactGitUrl, type AppConfig } from '@detent/core';
+import { redactGitUrl, type AppConfig, type WorkflowApproverTier } from '@detent/core';
 import type { JumpServerAuth } from './jumpserver/client.js';
 
 const list = (value: string) => value.split(',').map(item => item.trim()).filter(Boolean);
@@ -27,7 +27,9 @@ const schema = z.object({
   enableReleaseTools: enabledByDefault,
 });
 
-export type DeliveryConfig = z.infer<typeof schema>;
+export type DeliveryConfig = z.infer<typeof schema> & {
+  environments?: Record<string, { match: string[]; approverTier: WorkflowApproverTier }>;
+};
 
 function credential(env: NodeJS.ProcessEnv, role: 'READONLY' | 'JOB'): JumpServerAuth | undefined {
   const prefix = 'JUMPSERVER_' + role;

@@ -48,7 +48,7 @@ async function setup() {
   const orchestrator = new SessionOrchestrator(config, repo, gitlab, { run });
   const report = vi.fn();
   const clientForMr = Object.assign(new GitLabClient(config, async () => { throw Error('Unexpected GitLab API call'); }), gitlab);
-  const mrs = new MergeRequestOrchestrator(config, repo, clientForMr, { run }, { runHubEvent: vi.fn() });
+  const mrs = new MergeRequestOrchestrator(config, repo, clientForMr, { run }, { runHubEvent: vi.fn(), wakeQueuedIssue: orchestrator.wakeQueuedIssue.bind(orchestrator) });
   const queue = new WebhookQueue((event, id) => dispatchWebhook(orchestrator, event, id, mrs), report);
   const app = createWebhookApp(config, gitlab, (id, event) => queue.submit(id, event), matchMergeRequestWebhook);
   onTestFinished(async () => {

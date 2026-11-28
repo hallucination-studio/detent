@@ -99,6 +99,7 @@ it('recovers an expired turn once across pods, reports exhaustion and wakes stra
     const [recover, exhaust, inbox, waiting] = await Promise.all([1, 2, 3, 4].map(i => repo.getOrCreateSession(1, i, 'session')));
     for (const s of [recover, exhaust]) await repo.acquireSessionLease(s.id, 'old', -1);
     await repo.updateSessionState(exhaust.id, { recoveryAttempts: 1 });
+    await repo.createPipelineWatch(exhaust.id, 5, 42, 'main');
     await repo.updateSessionState(inbox.id, { status: 'IDLE', permissionMode: 'default' });
     await repo.updateSessionState(waiting.id, { status: 'WAITING_TOOL' });
     for (const s of [inbox, waiting, exhaust]) await repo.enqueueSessionInbox({ sessionId: s.id, eventId: 'e', sourceKind: 'note', content: 'follow up' });
@@ -117,6 +118,7 @@ it('recovers an expired turn once across pods, reports exhaustion and wakes stra
     expect(await repo.getSession(exhaust.id)).toMatchObject({ status: 'FAILED', recoveryAttempts: 1 });
     expect(gitlab.createIssueNote.mock.calls).toContainEqual([1, 2, expect.stringContaining('恢复')]);
     expect(await repo.drainSessionInbox(exhaust.id)).toHaveLength(0);
+    expect(await repo.listSessionPipelineWatches(exhaust.id)).toMatchObject([{ status: 'EXPIRED' }]);
     expect(await repo.drainSessionInbox(waiting.id)).toHaveLength(1);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -239,7 +241,9 @@ it('deduplicates system callbacks and preserves the stored mode for system-only 
     });
     await repo.updateSessionState(s.id, { status: 'IDLE', permissionMode: 'default' });
     expect(await pod.deliverSystemEvent(s.id, 'job/1', 'completed private-key')).toBe(true);
+    const acquire = vi.spyOn(repo, 'acquireSessionLease');
     expect(await other.deliverSystemEvent(s.id, 'job/1', 'duplicate')).toBe(false);
+    expect(acquire).not.toHaveBeenCalled();
     expect(turns).toEqual([['@detent: completed ***', 'default'], ['@worker: ***', 'default']]);
 
     await repo.updateSessionState(s.id, { status: 'WAITING_TOOL', permissionMode: 'default' });

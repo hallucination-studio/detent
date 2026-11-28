@@ -72,7 +72,7 @@ flowchart TD
     subgraph Infra["外部受控执行面与唯一持久化存储"]
         JMS_RO["JumpServer 堡垒机<br/>环境现状巡检 & 变更后核验"]
         JMS_Job["JumpServer 任务中心<br/>受控运行已合入的 Ansible Playbook + 录像审计"]
-        MySQL[("MySQL 8.0<br/>Core 6 张表 (会话 / 纯增量消息 / Worktree / MR / 审批 / 收件箱)<br/>+ delivery_executions (交付执行审计表)")]
+        MySQL[("MySQL 8.0<br/>Core 7 张表 (会话 / 纯增量消息 / Worktree / MR / 审批 / 收件箱 / 流水线订阅)<br/>+ delivery_executions (交付执行审计表)")]
     end
 
     Hub_Repo --> GL_Webhook
@@ -168,7 +168,7 @@ export interface DetentExtensionTool<TSchema extends z.ZodRawShape = z.ZodRawSha
   - 取得租约并重读会话后先执行 `beforeRun`。返回 `false` 时直接释放租约。返回 `true` 或省略回调时继续检查待审状态，再设置权限模式并启动轮次。
   - 租约占用时抛出 `SessionBusy`，等待方案或工具审批时保留待审状态并拒绝续跑。
   - 受分布式租约锁保护的公开入口，供业务模块在收到外部事件（如目标仓库 **MR 被人工合并**、告警触发）后唤醒对应的 Hub Issue Session。
-- 异步任务完成后，扩展通过 `deliverSystemEvent(sessionId, eventId, content)` 将结果写入收件箱。事件按会话与 ID 去重，忙碌或待审会话保留消息。
+- 异步任务完成后，扩展通过 `deliverSystemEvent(sessionId, eventId, content)` 将结果写入收件箱。事件按会话与 ID 去重，仅新入箱的事件尝试取得租约。忙碌或待审会话保留消息。
 - 通过验签和 Bot 过滤的非内置事件交给同步匹配器 `matchWebhookEvent(event)` 校验。返回 `null` 时，网关将事件提交到队列评估 Hub 策略并响应 202；未配置策略匹配器时响应 200 和 `{ ignored: true }`。返回 `{ key, handle(orchestrator) }` 时，网关提交到与内置事件共用的 WebhookQueue 后即响应 202。队列按 eventId 去重，同一 key 串行，遇到 `SessionBusy` 退避重试。停服时中断退避并等待在途处理结束。
 
 #### 扩展点 3：SOP 与审批人策略解析（`TurnProfileResolver`）
@@ -185,7 +185,7 @@ export interface TurnProfile {
   /** 是否禁用 Claude 内置 Bash 工具（例如高敏感交付 Agent 禁止直接执行任意 Shell） */
   disableBash?: boolean;
   /** 自定义审批人权限校验（例如生产变更要求 Maintainer 或指定 SRE 用户名单） */
-  canApprove?: (params: { projectId: number; userId: number; username: string; approvalType: ApprovalType; toolName: string }) => Promise<boolean>;
+  canApprove?: (params: { projectId: number; userId: number; username: string; approvalType: ApprovalType; toolName: string; toolInput?: Record<string, unknown> }) => Promise<boolean>;
 }
 ```
 
@@ -285,16 +285,27 @@ Stage 3 通过 `createDeliveryApp(config, options)` 装配。Hub 配置服务地
 
 ## 四、 MySQL 8.0 数据模型增量演进
 
-V6 使用六张 Core 表和一张 Delivery 审计表。交付审计关联会话、MR 与批准的工具执行。
+会话使用七张 Core 表和一张 Delivery 审计表。交付审计关联会话、MR 与批准的工具执行。
 
 ```mermaid
 erDiagram
     ISSUE_SESSIONS ||--o{ SESSION_MESSAGES : "1:N 纯增量消息 (@detent/core)"
     ISSUE_SESSIONS ||--o{ SESSION_INBOX : "1:N 轮中指示 (@detent/core)"
+    ISSUE_SESSIONS ||--o{ SESSION_PIPELINE_WATCHES : "1:N 流水线等待 (@detent/core)"
     ISSUE_SESSIONS ||--o{ SESSION_WORKTREES : "1:N 跨项目分支 (@detent/core)"
     ISSUE_SESSIONS ||--o{ SESSION_MERGE_REQUESTS : "1:N 跨项目 MR (@detent/core)"
     ISSUE_SESSIONS ||--o{ APPROVAL_REQUESTS : "1:N 方案/工具/执行审批 (@detent/core)"
     ISSUE_SESSIONS ||--o{ DELIVERY_EXECUTIONS : "1:N 变更执行审计 (@detent/delivery)"
+
+    SESSION_PIPELINE_WATCHES {
+        char(36) id PK
+        char(36) session_id FK
+        bigint target_project_id
+        bigint pipeline_id "可空"
+        varchar(255) ref_name "可空"
+        varchar(16) status "PENDING | RESOLVED | EXPIRED"
+        datetime created_at
+    }
 
     SESSION_MERGE_REQUESTS {
         char(36) id PK
@@ -325,6 +336,8 @@ erDiagram
     }
 ```
 
+`session_pipeline_watches` 在 `(target_project_id, status)` 与 `(session_id, status)` 上建索引。匹配仅扫描目标项目的 PENDING 行，优先按已知流水线 ID 匹配，仅对无 ID 订阅匹配 ref。success、failed、canceled、skipped 回调在一个事务中将订阅置为 RESOLVED，对未关闭会话以 `pipeline-watch:<watchId>:<pipelineId>` 去重入箱。事务提交后每个关联 Issue 唤醒一次。关单事务将尚未消费的消息置为 EXPIRED。人工关单、中止、重置和恢复耗尽将未决订阅置为 EXPIRED。`/status` 列出未决订阅。
+
 `delivery_executions` 使用 InnoDB，与 Core 外键使用相同的 `utf8mb4_bin` 排序规则。共享池初始化完成后登记提交时的角色、目标资产、Playbook 和合并 SHA。`(session_id, jumpserver_job_id)` 唯一标识会话中的任务，`(session_id, created_at)` 支持按时间列出审计记录。结果查询保存状态与摘要，首次进入 SUCCESS 或 FAILED 时保存毫秒级完成时间。`/status` 在状态和 MR 摘要下显示已有执行记录、关联审批单与任务链接。
 
 ---
@@ -353,6 +366,10 @@ erDiagram
 - `coding_auto` 在方案批准后开放。
 - `always_approve` 要求单次工具审批，生产工具额外校验生产审批人。
 
+`gitlab-release` 的 `detent_trigger_pipeline` 在编码阶段触发目标仓库流水线并自动登记回调。每次最多传 20 个变量，变量名最多 255 字符，单值最多 1000 字符。`detent_await_pipeline` 可按 ID 或 ref 等待，已结束的流水线（含 skipped）直接返回状态及 jobs。等待 GitLab 异步创建某个 ref 的流水线须由用户或 SOP 明确要求。登记后复查一次，覆盖首次读取与订阅提交之间的终态竞态。两种工具在异步等待时结束本轮、释放租约。
+
+`skills/env-topology/SKILL.md` 定义每个环境的配置文件、资产、审批交接及 `promotion_gate`。发布先记录稳定 Tag，再按环境分别修改配置、离线验证、提 MR、人工合并、部署和核验。需要跨仓验收时由该文件指定 gate；失败后停止晋级，沿同一套动作回退故障环境并保留工单。独立的日常运维也复用此流程。
+
 模型代理在父进程脱敏并认证请求，向上游发送 Messages 和 token 计数请求前，将模型名统一为配置的 `CLAUDE_MODEL`。
 
 ## 六、 V4 架构演进：Issue 自动闭环终止条件与真实服务栈 SOP 验收
@@ -374,13 +391,14 @@ V4 通过 **3 层组合机制** 实现安全可控的 Issue 闭环：
      1. 非 `readonly` 流程在 `permissionMode === 'plan'` 阶段（方案尚未批准）严禁关单；
      2. 存在其他 `PENDING` 审批请求时严禁关单；
      3. 当前会话在 `session_merge_requests` 中只要还有任意一条 `mr_state === 'opened'` 的未合并 MR，严禁关单（防止刚提 MR 就误关）；
-     4. 支持扩展钩子 `canCloseIssue({ session, repo })`：`@detent/delivery` 校验若本会话存在 `delivery_executions` 记录且最新一条状态非 `SUCCESS`，严禁关单。
+     4. 存在 PENDING 流水线订阅时须等回调，复核通过才能关单。
+     5. 支持扩展钩子 `canCloseIssue({ session, repo })`：`@detent/delivery` 校验若本会话存在 `delivery_executions` 记录且最新一条状态非 `SUCCESS`，严禁关单。
    - **延迟原子收口**：`detent_close_issue` 在轮次中仅记录待关闭请求；只有本轮 Claude 正常结束且未抛错时，编排器按序完成 **增量落库 transcript → 保存工作区检查点 → 复核关单守卫 → 归档全部活跃 Worktree → 刷新最终评论 → 调用 GitLab `closeIssue`（`state_event: 'close'`）→ 状态置为 `DONE` 并打上 `claude::done`**。Bot 自身关闭触发的 `issue (close)` Webhook 被 `isBotUser` 自动忽略，零自环；人工后续在 GitLab 点 Reopen 并发表评论可无缝恢复会话。
    - **已闭环会话防误唤醒**：`@detent/delivery` 的 MR 合并处理器对已处于 `DONE` 的会话记录合并信息但不再自动拉起新轮次。
 
 ### 6.2 真实服务栈 SOP 验收
 
-第 2 步将实现 `npm run e2e:up`（启动环境）、`npm run e2e`（构建并运行 SOP 场景）和 `npm run e2e:down`（拆除环境）。测试通过真实 GitLab API 创建 Issue、审批与合并 MR，由项目 Webhook 驱动 Delivery 和 Claude Code。关单后核对 GitLab 的 `closed`、`claude::done` 与 MySQL 的 `DONE`、Worktree 归档记录。涉及生产执行时，再对照已审批的 MR SHA、JumpServer 任务结果和交付审计记录。
+真实栈提供 `npm run e2e:up`（启动环境）、`npm run e2e`（构建并运行 SOP 场景）和 `npm run e2e:down`（拆除环境）。测试通过真实 GitLab API 创建 Issue、审批与合并 MR，由项目 Webhook 驱动 Delivery 和 Claude Code。关单后核对 GitLab 的 `closed`、`claude::done` 与 MySQL 的 `DONE`、Worktree 归档记录。涉及生产执行时，再对照已审批的 MR SHA、JumpServer 任务结果和交付审计记录。
 
 ---
 
@@ -498,14 +516,16 @@ Hub Issue 的 `/help` 在成员检查后从默认分支加载 Agent，按当前�
 `agents/onboarding/AGENT.md` 请求 `gitlab-onboarding`。只读工具按项目或群组查询 Bot 有效权限，在有管理权限时核验目标事件。写工具先验证全部目标均达到 Maintainer，再由生产审批人审核范围、回调地址及事件。执行时重读目标和权限，以同一 URL 更新或创建 Webhook。服务端从 `DETENT_PUBLIC_URL` 生成回调地址，只在 GitLab API 请求中使用 Webhook 密钥。Claude 通过单轮回环连接调用 Messages API，由父进程添加上游认证头。
 
 
-Issue 的 `/help` 按当前 Hub 定义列出场景、标签和就绪状态。Issue 与 MR 的 `/status` 显示中文状态和下一步操作。`WAITING_TOOL` 下的普通回复绑定当前 `ASK_USER` 审批记录，校验身份后在新进程中恢复。其他工具仍需审批卡决定。审批解析器接收待审类型与工具名；已移出流程的操作无法通过更高权限放行。生产审批拒绝提示先核验普通成员权限，进程内按审批单和用户去重，最多保留 1024 条记录。
+Issue 的 `/help` 按当前 Hub 定义列出场景、标签和就绪状态。Issue 与 MR 的 `/status` 显示中文状态和下一步操作。`WAITING_TOOL` 下的普通回复绑定当前 `ASK_USER` 审批记录，校验身份后在新进程中恢复。其他工具仍需审批卡决定。审批解析器与 canApprove 接收待审类型、工具名及存储的 toolInput；已移出流程的操作无法通过更高权限放行。生产审批拒绝提示先核验普通成员权限，进程内按审批单和用户去重，最多保留 1024 条记录。
 
 ### Stage 15 · Hub 配置与认证边界
 
 `loadConfig` 从进程环境读取形如 `DETENT_SECRET_NAME` 的非空值。全值引用使用 `$secret:NAME`，请求头模板使用 `${secret:NAME}`。模板展开一次，Hub 作者只能引用 vault。原有文件式 MCP 配置保留服务端变量解析规则。
 
-Issue 编排器在帮助、运行和审批时分别加载 Hub 默认分支的 `capabilities.json`。不存在时使用启动配置，文档损坏时关闭能力包。Core 解析通用 MCP，Delivery 通过 `resolveCapabilities` 解释业务配置；运行中的门禁与角色解析共享当前快照。代理发现和执行分别管理连接，SSE 消息端点须与握手地址同源。认证头和密钥只保留在服务端。Hub 的流程扩展字段随选中的 profile 进入工具上下文。
+Issue 编排器在帮助、运行和审批时分别加载 Hub 默认分支的 `capabilities.json`。不存在时使用启动配置，文档损坏时关闭能力包。Core 解析通用 MCP，Delivery 通过 `resolveCapabilities` 解释业务配置；运行中的门禁与角色解析共享当前快照。代理发现和执行分别管理连接，SSE 消息端点须与握手地址同源。认证头和密钥只保留在服务端。工具上下文的 `WorkflowToolConfig` 携带所选流程的 `account`、`allowPrefixes` 和 `approverTier`，审批卡与权限校验读取同一等级。
 
 Hub 的 `auth` 引用 `$secret:JMS_AK_ID` 和 `$secret:JMS_AK_SECRET`，供巡检与任务中心共用。先使用流程 `account`，其次使用 Hub `default_account`。两者均未设置时，逐资产按 JumpServer 返回顺序选择首个有效授权账号，跳过停用账号和以 `@` 开头的虚拟账号。巡检按账号分组并汇总结果。单个 Ansible 任务要求所有目标使用同一账号，否则须指定共同的 `account` 或分组执行。缺少有效账号时，错误指出对应资产。执行工具继续核对 MR 合并 SHA、最新流水线及审批记录。
+
+`gitlab-release.approver_tier` 缺省为 prod，非法值会禁用能力并给出 setupHint。非只读流程显式启用发布工具且声明 standard 能力时，可由服务 Owner 批准 Tag。配置 `jumpserver.environments` 后，`jms_job` 发卡与执行前对全部实时资产核验环境的 match 和 blocked_assets。投票时再读当前 SOP、能力及审批单的 environment 和 asset_ids，仅当环境明确为 standard 且每台资产均通过复核时允许普通成员批准；其余一律要求 prod。prod 流程、建仓、自助接入和 prod 外部能力均要求生产审批。
 
 JumpServer 的即时作业与带变量的 Playbook 定义均显式提交 `is_periodic: false`。兼容接口的 HTML 404 分别回退到资产详情的 `permed_accounts` 与 Ansible 执行日志，后者去除 NUL 填充。其他 HTTP 错误在父进程记录状态和脱敏原文，工具轨迹保留短摘要。失败执行写入 `delivery_executions`，最新执行成功后才可自动关单。

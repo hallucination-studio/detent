@@ -132,6 +132,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
       model = await openModelTransport(this.config.anthropicBaseUrl ?? 'https://api.anthropic.com', this.config.anthropicApiKey, secrets, this.config.claudeModel);
       env.ANTHROPIC_BASE_URL = model.url;
       env.ANTHROPIC_AUTH_TOKEN = 'detent-local';
+      const appendSystemPrompt = redact(t.systemPrompt);
       const messages = query({
         prompt: redact(t.prompt),
         options: {
@@ -154,7 +155,12 @@ export class SdkClaudeRunner implements ClaudeRunner {
             }] }],
           },
           stderr: (chunk) => {
-            diagnostic = (diagnostic + chunk).slice(-2000);
+            // The SDK joins argv verbatim. Its multiline prompt belongs to the launch
+            // record, while a child error can follow that record in the same chunk.
+            const record = chunk.replaceAll('--append-system-prompt ' + appendSystemPrompt, (arg, index: number) =>
+              /Spawning Claude Code (?:process|native binary):[^\r\n]*$/.test(chunk.slice(0, index)) ? '' : arg);
+            const lines = record.replace(/^.*Spawning Claude Code (?:process|native binary):[^\r\n]*(?:\r\n?|\n|$)/gm, '');
+            diagnostic = redact(diagnostic + lines).slice(-2000);
           },
           // Claude Code 1.x probes the retired SlowBuffer prototype at startup.
           // Supply the alias only inside its child process on newer Node runtimes.
@@ -186,7 +192,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
           allowedTools: ['mcp__detent'],
           model: this.config.claudeModel,
           maxTurns: this.config.claudeMaxTurns,
-          appendSystemPrompt: redact(t.systemPrompt),
+          appendSystemPrompt,
           mcpServers: { detent: { type: 'http', url: mcp.url, headers: { Authorization: 'Bearer ' + mcp.token } } },
           strictMcpConfig: true,
           includePartialMessages: true,

@@ -73,7 +73,7 @@ export class SessionOrchestrator extends TurnRuntime {
     return [...packs.values()];
   }
   private resolveTurnProfile(session: IssueSessionRow, capabilities: readonly DetentCapabilityPack[],
-    context: { purpose: 'turn' } | { purpose: 'approval'; approval: Pick<ApprovalRequestRow, 'approvalType' | 'toolName'> }) {
+    context: { purpose: 'turn' } | { purpose: 'approval'; approval: Pick<ApprovalRequestRow, 'approvalType' | 'toolName' | 'toolInput'> }) {
     return this.extensions.resolveTurnProfile?.({
       session, repo: this.repo, gitlab: this.gitlab, capabilities, ...context,
     });
@@ -101,12 +101,16 @@ export class SessionOrchestrator extends TurnRuntime {
       content: redactGitUrl(content, this.secrets),
     });
     if (!queued) return false;
+    await this.wakeQueuedIssue(session);
+    return true;
+  }
+  async wakeQueuedIssue(session: IssueSessionRow) {
+    if (session.status === 'DONE' || session.sessionKind !== 'issue') return;
     try {
       await this.wakeSession(session, 'inbox');
     } catch (error) {
       if (!(error instanceof SessionBusy)) throw error;
     }
-    return true;
   }
   async wakeSession(candidate: IssueSessionRow, reason: 'expired' | 'inbox') {
     // The Issue runner publishes Issue approvals and may close the Issue.
@@ -340,6 +344,7 @@ export class SessionOrchestrator extends TurnRuntime {
     if (!s) return;
     await this.stop(s);
     await this.withLease(s, async (session) => {
+      await this.repo.expireSessionPipelineWatches(session.id);
       await this.expire(session);
       await this.archiveWorktrees(session.id);
       await this.state(session, 'DONE');
@@ -409,11 +414,14 @@ export class SessionOrchestrator extends TurnRuntime {
   }
   private async replyStatus(s: IssueSessionRow) {
     const pending = await this.repo.getLatestPendingApproval(s.id);
+    const watches = (await this.repo.listSessionPipelineWatches(s.id)).filter(w => w.status === 'PENDING');
     await this.gitlab.createIssueNote(
       s.hubProjectId,
       s.hubIssueIid,
       [
         renderStatus(s.status, pending),
+        watches.length && '等待流水线终态\n' + watches.map(w =>
+          `- 项目 ${w.targetProjectId} · ${w.pipelineId === null ? '' : '#' + w.pipelineId + ' '}${escapeTableCell(w.refName ?? '')}`).join('\n'),
         await this.summary(s.id),
         (await this.extensions.renderStatusExtra?.(s))?.trim(),
       ].filter(Boolean).join('\n\n'),
@@ -425,14 +433,14 @@ export class SessionOrchestrator extends TurnRuntime {
         ? await this.repo.getApprovalByNoteId(s.id, intent.targetNoteId)
         : await this.repo.getLatestPendingApproval(s.id));
     if (pending?.status !== 'PENDING') return;
-    const { approvalType, toolName } = pending;
-    const profile = await this.resolveTurnProfile(s, await this.getCapabilities(), { purpose: 'approval', approval: { approvalType, toolName } });
+    const { approvalType, toolName, toolInput } = pending;
+    const profile = await this.resolveTurnProfile(s, await this.getCapabilities(), { purpose: 'approval', approval: { approvalType, toolName, toolInput } });
     if (profile?.blockedMessage?.trim()) return;
     const { approvalProjectId } = this.channel(s);
     const permitted = profile?.canApprove
       ? await profile.canApprove({
           projectId: approvalProjectId, userId: intent.userId, username: intent.username,
-          approvalType, toolName,
+          approvalType, toolName, toolInput,
         })
       : await this.gitlab.hasApprovalPermission(approvalProjectId, intent.userId);
     if (!permitted) {
@@ -456,6 +464,7 @@ export class SessionOrchestrator extends TurnRuntime {
   private async handleSessionCommand(s: IssueSessionRow, intent: ParsedUserIntent) {
     if (intent.type === 'ABORT' || intent.type === 'RESET') await this.stop(s);
     await this.withLease(s, async (session, active) => {
+      if (intent.type === 'ABORT' || intent.type === 'RESET') await this.repo.expireSessionPipelineWatches(session.id);
       if (intent.type === 'RESET') {
         await this.expire(session);
         await this.repo.resetTranscript(s.id);

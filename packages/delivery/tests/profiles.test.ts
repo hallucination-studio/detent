@@ -8,6 +8,7 @@ import { dispatchWebhook } from '../../core/src/gitlab/webhook.js';
 import { InMemoryDetentRepository } from '../../core/tests/memory-repository.js';
 import { createDeliveryTurnProfileResolver, createJumpServerTools, loadDeliveryConfig } from '../src/index.js';
 import { deliveryFixture, developer, hub, issue, opened } from './delivery-fixture.js';
+import { createJumpServerCapability } from '../src/jumpserver/tools.js';
 
 type ProfileContext = Parameters<TurnProfileResolver>[0];
 
@@ -91,6 +92,39 @@ const jumpserver = { name: 'jumpserver', enabled: true,
 const disabled = { ...jumpserver, enabled: false, setupHint: '请配置 JUMPSERVER_BASE_URL' };
 const approve = { projectId: 1, userId: 30, username: 'dev', approvalType: 'TOOL_USE' as const, toolName: 'Bash' };
 
+it('rechecks current asset membership, exclusions and the SOP tier before accepting a standard vote', async () => {
+  const { client } = await deliveryFixture([]);
+  const config = loadDeliveryConfig({});
+  config.environments = { pre: { match: ['/DEFAULT/pre'], approverTier: 'standard' }, prod: { match: ['label:env:prod'], approverTier: 'prod' } };
+  const preHost = { id: 'pre1', name: 'service', address: 'host', nodes: ['/DEFAULT/pre/app'] };
+  const getAsset = vi.fn().mockResolvedValue(preHost);
+  const pack = createJumpServerCapability('jumpserver', { config, client: { ...client, getAsset } });
+  const releasePack = { ...release, approverTier: 'standard' as const };
+  const args = { ...approve, toolName: 'jms_job', toolInput: { environment: 'pre', asset_ids: ['pre1'] } };
+  const tag = { ...approve, toolName: 'detent_create_release' };
+  const profileFor = async (files = agentTemplates) => (await resolve(['delivery::release'], {}, [pack, releasePack], files)).profile;
+  const profile = await profileFor();
+  expect(await profile.canApprove!(tag)).toBe(true);
+  expect(await profile.canApprove!(args)).toBe(true);
+  for (const toolInput of [{ asset_ids: ['pre1'] }, { environment: 'old', asset_ids: ['pre1'] },
+    { environment: 'prod', asset_ids: ['pre1'] }, { environment: 'pre', asset_ids: [] }]) {
+    expect(await profile.canApprove!({ ...args, toolInput })).toBe(false);
+  }
+  config.blockedAssets.push('service');
+  expect(await profile.canApprove!(args)).toBe(false);
+  config.blockedAssets.length = 0;
+  getAsset.mockResolvedValue({ ...preHost, nodes: ['/DEFAULT/prod/app'] });
+  expect(await profile.canApprove!(args)).toBe(false);
+  expect(await profile.canApprove!({ ...args, userId: 40 })).toBe(true);
+  getAsset.mockRejectedValueOnce(Error('asset unavailable'));
+  expect(await profile.canApprove!(args)).toBe(false);
+  getAsset.mockResolvedValue(preHost);
+  const file = 'agents/release/AGENT.md';
+  const prod = await profileFor({ ...agentTemplates, [file]: agentTemplates[file].replace('approver_tier: standard', 'approver_tier: prod') });
+  expect(prod.workflow?.approverTier).toBe('prod');
+  for (const request of [args, tag]) expect(await prod.canApprove!(request)).toBe(false);
+});
+
 it('prioritizes explicit packs and requires tool selection when a caller supplies the profile', async () => {
   const repo = new InMemoryDetentRepository();
   const session = await repo.getOrCreateSession(1, 42, 'Sync image');
@@ -140,7 +174,9 @@ it('reads a custom SOP from the configured branch on every resolution and applie
 });
 
 it('reports optional capability availability and attaches only enabled tools', async () => {
-  const { profile } = await resolve(['delivery::code'], {}, [release, disabled], agentTemplates);
+  const { profile: code } = await resolve(['delivery::code'], {}, [release, disabled], agentTemplates);
+  expect(code.enabledExtensionTools).toEqual([]);
+  const { profile } = await resolve(['delivery::release'], {}, [release, disabled], agentTemplates);
   expect(profile.enabledExtensionTools).toEqual(release.tools.map(tool => tool.name));
   expect(profile.extraSystemPrompt?.split('\n').at(-1)).toBe('当前已启用扩展能力：gitlab-release；未启用：jumpserver');
 
@@ -243,7 +279,7 @@ it('fits workflow display names into the execution audit column and retains the 
 });
 
 it.each([
-  ['agent::onboarding', 'detent_onboard_project'], ['delivery::code', 'detent_create_project'],
+  ['agent::onboarding', 'detent_onboard_project'], ['delivery::env-change', 'detent_create_project'],
   ['delivery::release', 'detent_create_release'], ['delivery::env-change', 'jms_job'],
 ])('enforces the production gate and rechecks pending cards after a label switch for %s', async (label, toolName) => {
   const labels = [label];

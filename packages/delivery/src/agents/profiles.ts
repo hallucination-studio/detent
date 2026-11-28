@@ -3,10 +3,10 @@ import {
   type DetentCapabilityPack, type TurnProfile, type TurnProfileResolver, type WorkflowApproverTier,
 } from '@detent/core';
 import type { DeliveryConfig } from '../config.js';
+import type { JumpServerCapability } from '../jumpserver/tools.js';
 
-const prodTools = new Set(['jms_job', 'detent_create_release', 'detent_onboard_project', 'detent_create_project']);
+const governedTools = new Set(['jms_job', 'detent_create_release', 'detent_onboard_project', 'detent_create_project']);
 
-type WorkflowProfile = TurnProfile & { approverTier?: WorkflowApproverTier };
 type ResolverContext = Parameters<TurnProfileResolver>[0];
 interface ProfileOptions {
   hubDefaultBranch?: string;
@@ -15,11 +15,11 @@ interface ProfileOptions {
   canCloseIssue?: TurnProfile['canCloseIssue'];
 }
 
-function blocked(name: string, blockedMessage: string): WorkflowProfile {
+function blocked(name: string, blockedMessage: string): TurnProfile {
   return { name, blockedMessage, readonly: true, disableBash: true, enabledExtensionTools: [] };
 }
 
-function agentProfile(result: NonNullable<ReturnType<typeof matchHubAgent>>, capabilities: readonly DetentCapabilityPack[]): WorkflowProfile {
+function agentProfile(result: NonNullable<ReturnType<typeof matchHubAgent>>, capabilities: readonly DetentCapabilityPack[]): TurnProfile {
   if (result.kind === 'blocked')
     return blocked(result.agent?.id ?? 'unmatched', result.message);
   const { agent, enabledToolNames } = result;
@@ -36,15 +36,14 @@ function agentProfile(result: NonNullable<ReturnType<typeof matchHubAgent>>, cap
   }
   return {
     name, readonly, closePolicy: agent.closePolicy,
-    workflow: { account: agent.account, allowPrefixes: agent.allowPrefixes },
+    workflow: { account: agent.account, allowPrefixes: agent.allowPrefixes, approverTier: agent.approverTier },
     disableBash: readonly || !(agent.allowBash ?? (agent.approverTier === 'standard')),
     enabledExtensionTools: enabledToolNames, extraSystemPrompt,
     sandboxScope: { agentDir: agent.agentDir, sharedSkills: agent.sharedSkills },
-    approverTier: agent.approverTier,
   };
 }
 
-async function hubProfile({ session, gitlab }: ResolverContext, options: ProfileOptions, capabilities: readonly DetentCapabilityPack[]): Promise<WorkflowProfile> {
+async function hubProfile({ session, gitlab }: ResolverContext, options: ProfileOptions, capabilities: readonly DetentCapabilityPack[]): Promise<TurnProfile> {
   const [issue, { agents, invalidFiles }] = await Promise.all([
     gitlab.getIssue(session.hubProjectId, session.hubIssueIid),
     loadHubAgents(gitlab, session.hubProjectId, options.hubDefaultBranch ?? 'main'),
@@ -88,26 +87,29 @@ export function createDeliveryTurnProfileResolver(config: DeliveryConfig, option
       if (!packs.has(name)) packs.set(name, pack);
     }
     const capabilities = [...packs.values()];
-    const selected: WorkflowProfile = options.resolveTurnProfile
+    const selected = options.resolveTurnProfile
       ? await options.resolveTurnProfile({ ...ctx, capabilities })
       : await hubProfile(ctx, options, capabilities);
-    const packProdTools = new Set(capabilities.filter(pack => pack.enabled && pack.approverTier === 'prod')
-      .flatMap(pack => pack.tools.map(tool => tool.name)));
-    function approvalTier({ approvalType, toolName }: NonNullable<ResolverContext['approval']>): WorkflowApproverTier | null {
+    const owners = new Map(capabilities.filter(pack => pack.enabled).flatMap(pack => pack.tools.map(tool => [tool.name, pack] as const)));
+    type Approval = NonNullable<ResolverContext['approval']>;
+    function authorized({ approvalType, toolName }: Approval) {
+      if (approvalType !== 'TOOL_USE') return true;
+      if (toolName === 'detent_close_issue') return selected.closePolicy === 'approve';
+      if (toolName === 'Bash') return !selected.readonly && !selected.disableBash;
+      const enabled = selected.enabledExtensionTools?.includes(toolName);
+      if (governedTools.has(toolName) || owners.get(toolName)?.approverTier === 'prod') return !selected.readonly && enabled === true;
+      return enabled !== false;
+    }
+    async function approvalTier({ approvalType, toolName, toolInput }: Approval): Promise<WorkflowApproverTier> {
       if (approvalType !== 'TOOL_USE') return 'standard';
-      if (toolName === 'detent_close_issue' && selected.closePolicy !== 'approve') return null;
-      if (toolName === 'Bash' && (selected.readonly || selected.disableBash)) return null;
-      if (toolName !== 'Bash' && toolName !== 'detent_close_issue' &&
-          selected.enabledExtensionTools && !selected.enabledExtensionTools.includes(toolName)) return null;
-      const packProdTool = packProdTools.has(toolName);
-      if (packProdTool || prodTools.has(toolName)) {
-        const enabled = selected.enabledExtensionTools?.includes(toolName) ?? false;
-        return selected.readonly || !enabled ? null : 'prod';
-      }
-      return selected.approverTier ?? 'standard';
+      const pack = owners.get(toolName);
+      if (selected.workflow?.approverTier === 'prod' || pack?.approverTier === 'prod') return 'prod';
+      if (toolName === 'detent_create_release') return pack?.approverTier ?? 'prod';
+      if (toolName === 'jms_job') return (pack as Partial<JumpServerCapability> | undefined)?.jobApprovalTier?.(toolInput) ?? 'prod';
+      return governedTools.has(toolName) ? 'prod' : 'standard';
     }
     // A removed tool cannot be approved by any member. Keep stale cards silent.
-    if (ctx.purpose === 'approval' && ctx.approval && !approvalTier(ctx.approval))
+    if (ctx.purpose === 'approval' && ctx.approval && !authorized(ctx.approval))
       return blocked(selected.name ?? 'unavailable', '该操作已不在当前流程的授权范围内。');
     return {
       ...selected,
@@ -119,10 +121,9 @@ export function createDeliveryTurnProfileResolver(config: DeliveryConfig, option
         },
       }),
       async canApprove(params) {
-        if (selected.blockedMessage) return false;
-        const { projectId, userId, username, approvalType, toolName } = params;
-        const tier = approvalTier({ approvalType, toolName });
-        if (!tier) return false;
+        if (selected.blockedMessage || !authorized(params)) return false;
+        const { projectId, userId, username } = params;
+        const tier = await approvalTier(params);
         const permitted = tier === 'prod'
           ? await canApproveProd(ctx.gitlab, projectId, userId, username)
           : await ctx.gitlab.hasApprovalPermission(projectId, userId);

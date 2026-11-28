@@ -52,17 +52,19 @@ it('encodes tag, commit and pipeline lookups and sends release writes through th
   const release = { tag_name: 'rc/v1', ref: 'abc', name: 'RC', description: 'Notes' };
   await client.createTag(4, tag);
   await client.createRelease(4, release);
+  await client.createPipeline(4, { ref: 'rc/v1', variables: { VERSION: 'v1' } });
+  await client.getPipeline(4, 71);
   const calls = http.mock.calls.map(([url, init]) => ({ url: new URL(String(url)), init }));
   expect(calls.map(c => c.url.pathname.split('/projects/4/')[1])).toEqual([
-    'repository/tags', 'repository/tags/rc%2Fv1', 'repository/commits/abc', 'pipelines', 'repository/tags', 'releases',
+    'repository/tags', 'repository/tags/rc%2Fv1', 'repository/commits/abc', 'pipelines', 'repository/tags', 'releases', 'pipeline', 'pipelines/71',
   ]);
   expect(Object.fromEntries(calls[0].url.searchParams)).toEqual({ per_page: '100', search: '^v &' });
   expect(calls[3].url.searchParams.get('sha')).toBe('a+b');
   for (const { init } of calls) expect(init).toMatchObject({
     redirect: 'error', signal: expect.any(AbortSignal), headers: expect.objectContaining({ 'PRIVATE-TOKEN': 'test' }),
   });
-  expect(calls.slice(4).map(({ init }) => [init?.method, JSON.parse(String(init?.body))])).toEqual([
-    ['POST', tag], ['POST', release],
+  expect(calls.slice(4, 7).map(({ init }) => [init?.method, JSON.parse(String(init?.body))])).toEqual([
+    ['POST', tag], ['POST', release], ['POST', { ref: 'rc/v1', variables: [{ key: 'VERSION', value: 'v1' }] }],
   ]);
 });
 

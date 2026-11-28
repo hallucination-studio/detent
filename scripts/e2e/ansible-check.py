@@ -8,6 +8,7 @@ import yaml
 from ansible.parsing.mod_args import ModuleArgsParser
 
 files = json.load(sys.stdin)
+greenfield = sys.argv[1] == 'new'
 role_tasks = set()
 playbooks = {}
 
@@ -19,7 +20,8 @@ def actions(path, tasks):
                 yield from actions(path, task.get(section))
         else:
             action, args, _ = ModuleArgsParser(task).parse(skip_action_validation=True)
-            assert action.count('.') >= 2 and not action.startswith('ansible.legacy.'), f'{path}: unqualified or legacy module {action}'
+            if greenfield:
+                assert action.count('.') >= 2 and not action.startswith('ansible.legacy.'), f'{path}: unqualified or legacy module {action}'
             yield action, args
 
 
@@ -45,11 +47,13 @@ for path, content in files.items():
                             roles.add(args['name'])
             for action in ('import_playbook', 'ansible.builtin.import_playbook'):
                 if action in play:
-                    assert action.startswith('ansible.builtin.'), f'{path}: short {action}'
+                    if greenfield:
+                        assert action.startswith('ansible.builtin.'), f'{path}: short {action}'
                     imports.append(play[action])
-        playbooks[path] = (roles, imports)
+        if any(isinstance(play, dict) and 'hosts' in play for play in data) or imports:
+            playbooks[path] = (roles, imports)
 
-# Return only entry points that actually invoke a changed role, including imports.
+# For a new role-based repository, follow imports to the roles used by each entry point.
 
 
 def uses_role(path, seen):
@@ -62,4 +66,4 @@ def uses_role(path, seen):
     )
 
 
-print(json.dumps([path for path in playbooks if uses_role(path, set())]))
+print(json.dumps([path for path in playbooks if not greenfield or uses_role(path, set())]))

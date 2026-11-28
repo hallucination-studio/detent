@@ -13,6 +13,7 @@ import type { ApprovalRequestRow, ApprovalType, IssueSessionRow, PermissionMode 
 export type ToolGovernancePolicy = 'readonly' | 'coding_auto' | 'always_approve';
 
 export interface WorkflowToolConfig {
+  approverTier?: WorkflowApproverTier;
   account?: string;
   allowPrefixes?: readonly string[];
 }
@@ -77,6 +78,7 @@ export interface TurnProfile {
     username: string;
     approvalType: ApprovalType;
     toolName: string;
+    toolInput?: Record<string, unknown>;
   }): Promise<boolean>;
 }
 
@@ -87,7 +89,7 @@ export type TurnProfileResolver = (ctx: {
     Partial<Pick<GitLabClient, 'listRepositoryTree' | 'getRepositoryFile'>>;
   capabilities?: readonly DetentCapabilityPack[];
   purpose?: 'turn' | 'approval';
-  approval?: Pick<ApprovalRequestRow, 'approvalType' | 'toolName'>;
+  approval?: Pick<ApprovalRequestRow, 'approvalType' | 'toolName'> & Partial<Pick<ApprovalRequestRow, 'toolInput'>>;
 }) => TurnProfile | Promise<TurnProfile>;
 
 export interface SessionLifecycleHooks {

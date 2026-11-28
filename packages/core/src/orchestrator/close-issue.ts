@@ -10,6 +10,8 @@ export async function checkIssueClosure(
   if (pending && pending.id !== approvalId) return { ok: false, reason: '尚有待审批项，禁止关闭工单' };
   const mrs = await repo.listSessionMergeRequests(session.id);
   if (mrs.some(mr => mr.mrState === 'opened')) return { ok: false, reason: '尚有未合并的 MR，禁止关闭工单' };
+  if ((await repo.listSessionPipelineWatches(session.id)).some(w => w.status === 'PENDING'))
+    return { ok: false, reason: '尚有等待终态的流水线，禁止关闭工单' };
   return profile.canCloseIssue?.({ session, repo }) ?? { ok: true };
 }
 

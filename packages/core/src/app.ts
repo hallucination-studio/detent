@@ -29,6 +29,7 @@ export function createDetentApp(config: AppConfig, extensions: DetentExtensions 
   const report = (error: unknown) =>
     console.error(redactGitUrl(error instanceof Error ? error.message : String(error), configuredSecrets(config)));
   const mrs = new MergeRequestOrchestrator(config, repo, client, runner, { decision, onNotify: extensions.onNotify,
+    wakeQueuedIssue: orchestrator.wakeQueuedIssue.bind(orchestrator),
     runHubEvent: (event, body, label) => runHubEvent(client, config, event, body, orchestrator, label) });
   const watchdog = new Watchdog(orchestrator, report, mrs);
   const queue = new WebhookQueue((event, id) => dispatchWebhook(orchestrator, event, id, mrs), report);

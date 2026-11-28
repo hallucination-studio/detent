@@ -132,7 +132,7 @@ it('deduplicates deliveries per session and consumes an ordered batch only once'
   expect(await repo.drainSessionInbox(other.id)).toHaveLength(1);
 });
 
-it('consumes only the locked IDs on one connection and rolls back a failed write', async () => {
+it('consumes and resolves locked rows transactionally, with durable, bounded inbox keys', async () => {
   const pool = createMySqlPool(loadConfig({}));
   const cx = { beginTransaction: vi.fn(), commit: vi.fn(), rollback: vi.fn(), release: vi.fn(), query: vi.fn() };
   vi.spyOn(pool, 'getConnection').mockImplementation(async () => cx as unknown as Awaited<ReturnType<typeof pool.getConnection>>);
@@ -148,6 +148,22 @@ it('consumes only the locked IDs on one connection and rolls back a failed write
     expect(cx.commit).toHaveBeenCalledOnce();
     expect(cx.rollback).toHaveBeenCalledOnce();
     expect(cx.release).toHaveBeenCalledTimes(2);
+    const watch = '8c505750-d8de-447f-a1ef-6aacd037bb72';
+    const event = { sessionId: 's', sourceKind: 'system', eventId: 'pipeline-watch:' + watch + ':' + Number.MAX_SAFE_INTEGER, content: 'success' };
+    const row = [[{ id: watch, session_id: 's', status: 'PENDING' }], []];
+    const resolve = () => repo.resolveMatchingPipelineWatches(4, Number.MAX_SAFE_INTEGER, 'v2', { inbox: () => event });
+    cx.query.mockResolvedValueOnce(row).mockResolvedValueOnce([{}, []]).mockRejectedValueOnce(Error('inbox unavailable'));
+    await expect(resolve()).rejects.toThrow('inbox unavailable');
+    expect(cx.rollback).toHaveBeenCalledTimes(2);
+    cx.query.mockResolvedValueOnce(row).mockResolvedValueOnce([{}, []]).mockResolvedValueOnce([{}, []]);
+    expect(await resolve()).toMatchObject([{ id: watch, status: 'RESOLVED' }]);
+    const [insert, durable] = cx.query.mock.lastCall!;
+    expect(insert).toContain('INSERT IGNORE INTO session_inbox');
+    expect(insert).toContain("FROM issue_sessions WHERE id=? AND status <> 'DONE'");
+    expect(durable).toEqual([expect.stringMatching(/^[a-f0-9]{64}$/), 'system', null, null, 'success', 's']);
+    const enqueue = vi.spyOn(pool, 'query').mockResolvedValue([[], []]);
+    await repo.enqueueSessionInbox(event);
+    expect(enqueue.mock.lastCall?.[1]).toEqual(durable);
   } finally {
     await pool.end();
   }
@@ -155,10 +171,15 @@ it('consumes only the locked IDs on one connection and rolls back a failed write
 
 it('upgrades the legacy resource key in one ALTER and skips it on subsequent starts', async () => {
   const pool = createMySqlPool(loadConfig({}));
-  const query = vi.spyOn(pool, 'query').mockResolvedValue([[], []]);
+  let legacy = true;
+  const query = vi.spyOn(pool, 'query').mockImplementation(async sql => {
+    if (legacy && String(sql).startsWith('SHOW INDEX')) {
+      legacy = false;
+      return [[{ Key_name: 'hub_project_id' } as RowDataPacket], []];
+    }
+    return [[], []];
+  });
   try {
-    for (let i = 0; i < 6; i++) query.mockResolvedValueOnce([[], []]);
-    query.mockResolvedValueOnce([[{ Key_name: 'hub_project_id' } as RowDataPacket], []]);
     await initMySqlSchema(pool);
     await initMySqlSchema(pool);
     const ddl = query.mock.calls.map(([sql]) => String(sql));

@@ -24,16 +24,23 @@ async function dockerInput(args: string[], input: string) {
 export async function ansibleEntryPoints(gl: E2EGitLabDriver, mr: MR, greenfield: boolean) {
   const id = mr.target_project_id;
   const diffs = await gl.mrDiffs(id, mr.iid);
-  if (!greenfield) assert.ok(diffs.some(d => d.old_path === 'site.yml'), 'Expected the legacy entry point to be refactored');
-  const files = diffs.filter(d => !d.deleted_file && /\.ya?ml$/i.test(d.new_path));
-  if (greenfield) assert.ok(files.some(d => /^roles\/[^/]+\/tasks\//.test(d.new_path)), 'Missing top-level role tasks');
-  const contents = await Promise.all(files.map(async d => [d.new_path, await gl.getFile(id, d.new_path, mr.sha)]));
+  const files = new Set(diffs.filter(d => !d.deleted_file && /\.ya?ml$/i.test(d.new_path)).map(d => d.new_path));
+  assert.ok(files.size, 'Expected a YAML configuration change');
+  if (greenfield) {
+    assert.ok([...files].some(path => /^roles\/[^/]+\/tasks\//.test(path)), 'Missing top-level role tasks');
+  } else {
+    // A change confined to vars or a role still runs through an existing playbook.
+    for (const entry of await gl.listTree(id, mr.sha)) {
+      if (entry.type === 'blob' && /^(?:playbooks\/)?[^/.][^/]*\.ya?ml$/i.test(entry.path)) files.add(entry.path);
+    }
+  }
+  const contents = await Promise.all([...files].map(async path => [path, await gl.getFile(id, path, mr.sha)]));
   const compose = fileURLToPath(new URL('./docker-compose.e2e.yml', import.meta.url));
   const script = await readFile(new URL('./ansible-check.py', import.meta.url), 'utf8');
   const entries: string[] = JSON.parse(await dockerInput(['compose', '-p', 'detent-e2e', '-f', compose,
-    'exec', '-T', 'jms-celery', 'python3', '-c', script], JSON.stringify(Object.fromEntries(contents))));
+    'exec', '-T', 'jms-celery', 'python3', '-c', script, greenfield ? 'new' : 'existing'], JSON.stringify(Object.fromEntries(contents))));
   const valid = greenfield ? entries.filter(path => path.startsWith('playbooks/')) : entries;
-  assert.ok(valid.length, 'Expected a playbook that invokes the refactored role');
+  assert.ok(valid.length, 'Expected an executable playbook for the changed configuration');
   return valid;
 }
 
@@ -71,9 +78,8 @@ function checkResources(resources: Resource[], scenario: HelmCase) {
   assert.ok(service, 'Missing Service selecting the application pods');
   const app = template.spec.containers.find(c => c.ports?.some(p => p.containerPort === 8080));
   assert.ok(app, 'Expected an application container serving port 8080');
-  assert.ok(Object.keys(app.resources?.requests ?? {}).length && Object.keys(app.resources?.limits ?? {}).length, 'Missing requests or limits');
-  assert.ok(app.readinessProbe && app.livenessProbe, 'Missing workload probes');
   if (scenario.namespace === 'demo-e2e') {
+    assert.deepEqual(selector.matchLabels, { 'app.kubernetes.io/name': 'demo-api', 'app.kubernetes.io/instance': 'demo-api' });
     assert.equal(deployment.spec.replicas, 2);
     const config = resources.filter(r => r.kind === 'ConfigMap').find(r => r.data?.APP_ENV === 'prod' && r.data.LOG_LEVEL === scenario.logLevel);
     assert.ok(config, 'Missing application ConfigMap with expected production settings');
@@ -82,6 +88,8 @@ function checkResources(resources: Resource[], scenario: HelmCase) {
     assert.ok(mounted || app.envFrom?.some(e => e.configMapRef?.name === config.metadata.name) ||
       app.env?.some(e => e.valueFrom?.configMapKeyRef?.name === config.metadata.name), 'Application does not consume its ConfigMap');
   } else {
+    assert.ok(Object.keys(app.resources?.requests ?? {}).length && Object.keys(app.resources?.limits ?? {}).length, 'Missing requests or limits');
+    assert.ok(app.readinessProbe && app.livenessProbe, 'Missing workload probes');
     assert.match(app.image, /(?:^|\/)busybox:1\.36$/);
     assert.equal(deployment.metadata.annotations?.['team.detent.io/owner'], 'platform-ops');
     assert.ok(Object.keys(selector.matchLabels ?? {}).length, 'Missing Deployment selector');
@@ -113,12 +121,6 @@ export async function checkChart(gl: E2EGitLabDriver, mr: MR, scenario: HelmCase
     const options = { cwd: dir, env: { ...process.env, PATH: helmPath }, timeout: 15000 };
     const prod = ['-f', 'values-prod.yaml'];
     await run('helm', ['lint', '.', '--strict', ...prod], options);
-    if (scenario.namespace === 'demo-e2e') {
-      const { stdout } = await run('helm', ['show', 'chart', '.'], options);
-      assert.doesNotMatch(stdout, /^version:\s*["']?0\.1\.0["']?\s*$/m);
-      const diffs = await gl.mrDiffs(mr.target_project_id, mr.iid);
-      assert.ok(diffs.some(d => d.new_path === 'templates/deployment.yaml' && !d.deleted_file), 'Legacy Deployment was not updated');
-    }
     const name = scenario.namespace === 'demo-e2e' ? 'demo-api' : 'order-service';
     const { stdout } = await run('helm', ['template', name, '.', '-n', scenario.namespace, ...prod], options);
     const documents: Resource[] = JSON.parse(await dockerInput(['exec', '-i', target, 'python3', '-c',
@@ -132,6 +134,12 @@ export async function checkChart(gl: E2EGitLabDriver, mr: MR, scenario: HelmCase
 export async function targetCommand(container: string, ...args: string[]) {
   const { stdout } = await run('docker', ['exec', '-u', 'ops', '-e', 'HOME=/home/ops', container, ...args], { timeout: 30000 });
   return stdout.trim();
+}
+
+export async function checkImageValues(target: string, base: string, override: string, tag: string) {
+  const values = JSON.parse(await dockerInput(['exec', '-i', target, 'python3', '-c',
+    'import json, sys, yaml; print(json.dumps([yaml.safe_load(v) for v in json.load(sys.stdin)]))'], JSON.stringify([base, override])));
+  assert.equal(String(values[1]?.image?.tag ?? values[0]?.image?.tag), tag, 'Wrong effective image.tag in the environment MR');
 }
 
 export async function checkRelease(target: string, scenario: HelmCase) {

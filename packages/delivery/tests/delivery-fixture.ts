@@ -20,7 +20,7 @@ export async function deliveryFixture(labels: string[]) {
   const notes: string[] = [];
   const gitlab = {
     ...await bareProjects(root), isBotUser: () => false,
-    listRepositoryTree: async (_project: number, dir: string) => dir === 'agents' ? ['audit', 'env-change'].map(id =>
+    listRepositoryTree: async (_project: number, dir: string) => dir === 'agents' ? ['audit', 'env-change', 'release'].map(id =>
       ({ id, name: 'AGENT.md', type: 'blob' as const, path: 'agents/' + id + '/AGENT.md' })) : [],
     getRepositoryFile: async (_project: number, file: string) => file === 'capabilities.json' ? null :
       readFile(new URL('../../../examples/hub-workspace/' + file, import.meta.url), 'utf8'),

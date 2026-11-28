@@ -241,14 +241,16 @@ it('isolates service credentials from the SDK child, prompt, stderr and GitLab n
       expect(prompt).not.toContain(value);
       expect(options?.appendSystemPrompt).not.toContain(value);
     }
-    options?.stderr?.('diagnostic ' + secret);
+    options?.stderr?.('startup\nSpawning Claude Code process: --append-system-prompt ' + options.appendSystemPrompt +
+      ' --mcp-config private-launch-arguments\r\ndiagnostic ' + secret + '\n');
+    options?.stderr?.('Spawning Claude Code native binary: private-native-arguments\nlast error');
     throw Error(secret);
   });
   for (const [key, value] of Object.entries(credentials)) vi.stubEnv(key, value);
   try {
     const progress = vi.fn();
-    const turn = { gate, session, sandbox, tools, controller: new AbortController(), progress, resume: false, prompt: Object.values(credentials).join(' '), systemPrompt: secret };
-    await expect(new SdkClaudeRunner(config).run(turn)).rejects.toThrow(/^diagnostic \*\*\*$/);
+    const turn = { gate, session, sandbox, tools, controller: new AbortController(), progress, resume: false, prompt: Object.values(credentials).join(' '), systemPrompt: 'internal instructions\n' + secret };
+    await expect(new SdkClaudeRunner(config).run(turn)).rejects.toThrow(/^startup\ndiagnostic \*\*\*\nlast error$/);
     expect(await gate.preflight('Bash', { command: 'printf ' + secret })).toMatchObject({ behavior: 'deny' });
     const callback = vi.mocked(query).mock.lastCall![0].options!.canUseTool!;
     expect(await callback('Bash', { command: 'pwd; ls' }, { signal: turn.controller.signal })).toMatchObject({ behavior: 'allow' });

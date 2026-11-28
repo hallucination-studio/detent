@@ -149,7 +149,7 @@ it('auto-allows local development, resumes an extension approval and a user ques
         getMergeRequest: vi.fn().mockResolvedValue({ iid: 1, state: 'opened', assignees: [] }),
         getRepositoryFile: vi.fn().mockResolvedValue(null),
       });
-      const mrs = new MergeRequestOrchestrator(config, repo, client, runner, { runHubEvent: vi.fn() });
+      const mrs = new MergeRequestOrchestrator(config, repo, client, runner, { runHubEvent: vi.fn(), wakeQueuedIssue: orch.wakeQueuedIssue.bind(orch) });
       return new WebhookQueue((event, id) => dispatchWebhook(orch, event, id, mrs), error => errors.push(error));
     }
     let route = pod('A');
@@ -462,7 +462,7 @@ it('applies turn profiles and approval hooks across pods and resumes under the e
     await dispatchWebhook(podB, note('/approve'));
     expect(await repo.getApproval(plan.id)).toMatchObject({ status: 'PENDING' });
     expect(canApprove).toHaveBeenCalledWith({
-      projectId: 1, userId: 7, username: 'dev', approvalType: 'PLAN', toolName: 'Plan',
+      projectId: 1, userId: 7, username: 'dev', approvalType: 'PLAN', toolName: 'Plan', toolInput: {},
     });
     const authorized = { ...actor, id: 8, username: 'reviewer' };
     const coding = dispatchWebhook(podB, note('/approve', authorized));
@@ -472,13 +472,14 @@ it('applies turn profiles and approval hooks across pods and resumes under the e
     await dispatchWebhook(podB, note('/reject'));
     expect(execute).not.toHaveBeenCalled();
     expect(canApprove).toHaveBeenLastCalledWith({
-      projectId: 1, userId: 7, username: 'dev', approvalType: 'TOOL_USE', toolName: 'sample',
+      projectId: 1, userId: 7, username: 'dev', approvalType: 'TOOL_USE', toolName: 'sample', toolInput: {},
     });
     await dispatchWebhook(podB, note('/approve', authorized));
     await coding;
     await dispatchWebhook(podB, note('/approve', authorized));
     expect(execute).toHaveBeenCalledOnce();
     expect(hooks.onApprovalResolved).toHaveBeenCalledTimes(2);
+    expect(runner.run.mock.calls.at(-1)![0].prompt).toMatch(/工具 sample，参数 \{\}[\s\S]*按上述原始参数调用该工具一次[\s\S]*继续已批准的流程/);
     expect(hooks.onApprovalResolved).toHaveBeenLastCalledWith(
       expect.objectContaining({ toolName: 'sample', status: 'APPROVED', decidedBy: 'reviewer' }),
       expect.objectContaining({ id: session.id }),

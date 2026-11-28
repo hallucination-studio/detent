@@ -102,11 +102,10 @@ export function validatePlaybookPath(playbookPath: string) {
   return { ok: true as const };
 }
 
-export function findBlockedAssets(
-  assets: readonly (string | Pick<JumpServerAsset, 'id' | 'name' | 'address' | 'nodes' | 'labels'>)[],
-  blockedAssets: readonly string[],
-): string[] {
-  const rules = blockedAssets.map(rule => rule.trim().toLowerCase()).filter(Boolean);
+type Asset = string | Pick<JumpServerAsset, 'id' | 'name' | 'address' | 'nodes' | 'labels'>;
+
+export function matchAssets(assets: readonly Asset[], match: readonly string[]): string[] {
+  const rules = match.map(rule => rule.trim().toLowerCase()).filter(Boolean);
   return assets.filter(asset => rules.some(rule => {
     if (typeof asset === 'string') return asset.trim().toLowerCase() === rule;
     if (rule.startsWith('label:')) return asset.labels?.some(label => label.trim().toLowerCase() === rule.slice(6));
@@ -116,6 +115,10 @@ export function findBlockedAssets(
     });
     return [asset.id, asset.name, asset.address].some(value => value.trim().toLowerCase() === rule);
   })).map(asset => typeof asset === 'string' ? asset : asset.id);
+}
+
+export function findBlockedAssets(assets: readonly Asset[], blockedAssets: readonly string[]) {
+  return matchAssets(assets, blockedAssets);
 }
 
 // Match the executable of every pipe stage, including shell/command wrappers.

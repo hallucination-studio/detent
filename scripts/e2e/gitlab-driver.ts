@@ -109,14 +109,23 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
     getDiscussion(id: number, iid: number, discussion: string) {
       return api.json<Discussion>(mr(id, iid) + '/discussions/' + encodeURIComponent(discussion));
     },
-    async mergeMergeRequest(id: number, iid: number, sha?: string) {
+    async permitDeveloperMerge(id: number) {
+      const path = project(id) + '/protected_branches';
+      const rule = await api.lookup<{ merge_access_levels: { access_level: number }[] }>(path + '/main');
+      if (rule?.merge_access_levels.some(level => level.access_level === 30)) return;
+      // GitLab CE ignores allowed_to_merge updates. Replace the rule on this run's fresh chart project.
+      if (rule) await api.request(path + '/main', 'DELETE');
+      await api.request(path, 'POST', { name: 'main', merge_access_level: 30, push_access_level: 40 });
+    },
+    async mergeMergeRequest(id: number, iid: number, sha?: string, actor: 'dev' | 'sre' = 'sre') {
       const path = mr(id, iid) + '/merge';
       const deadline = Date.now() + 30000;
       for (;;) {
-        const res = await api.request(path, 'PUT', { should_remove_source_branch: false, sha }, tokens.sre, sha ? [405, 422] : [405, 409, 422]);
+        const res = await api.request(path, 'PUT', { should_remove_source_branch: false, sha }, tokens[actor], sha ? [405, 422] : [405, 409, 422]);
         if (res.ok) {
-          const merged: { state: string; merge_commit_sha: string } = await res.json();
+          const merged: { state: string; merge_commit_sha: string; merge_user: { username: string } } = await res.json();
           assert.equal(merged.state, 'merged');
+          assert.equal(merged.merge_user.username, 'e2e-' + actor);
           assert.match(merged.merge_commit_sha, /^[a-f0-9]{40}$/);
           return merged.merge_commit_sha;
         }
@@ -126,6 +135,9 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
     },
     getTag(id: number, tag: string) {
       return api.lookup<{ commit: { id: string } }>(project(id) + '/repository/tags/' + encodeURIComponent(tag));
+    },
+    async seedTag(id: number, tag: string, sha: string) {
+      await api.request(project(id) + '/repository/tags', 'POST', { tag_name: tag, ref: sha });
     },
     getRelease(id: number, tag: string) {
       return api.lookup<{ tag_name: string; commit: { id: string } }>(project(id) + '/releases/' + encodeURIComponent(tag));

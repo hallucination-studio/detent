@@ -73,6 +73,7 @@ export class TurnRuntime {
     if (!['PLANNING', 'CODING'].includes(s.status)) return false;
     await this.expire(s);
     if (s.recoveryAttempts >= this.config.watchdogMaxRecoveries) {
+      await this.repo.expireSessionPipelineWatches(s.id);
       await this.repo.failRecovery(s.id);
       await channel.createNote('自动恢复次数已用尽，请检查会话并重新发送待处理的指示。');
       await channel.syncStatusLabel('FAILED');
@@ -101,7 +102,9 @@ export class TurnRuntime {
         await run(session, active, comment ? instruction + '\n' + feedback + comment : instruction);
       } else {
         const decision = (await this.repo.getApproval(pending.id))!;
-        const prompt = `GitLab 审批结果 ${status}，工具 ${decision.toolName}，参数 ${JSON.stringify(decision.toolInput)}。审批说明：${comment ?? ''}`;
+        const replay = status === 'APPROVED' && decision.approvalType === 'TOOL_USE'
+          ? '\n上次工具调用在执行前暂停。现在按上述原始参数调用该工具一次，依据工具实际返回的结果继续已批准的流程。还有可执行步骤时在本轮继续，遇到人工审批、评审或已登记的异步回调时再交接。' : '';
+        const prompt = `GitLab 审批结果 ${status}，工具 ${decision.toolName}，参数 ${JSON.stringify(decision.toolInput)}。审批说明：${comment ?? ''}${replay}`;
         await run(session, active, prompt, decision);
       }
     }, async () => {

@@ -12,7 +12,7 @@ import { parseArgs, parseEnv, promisify } from 'node:util';
 import { redactGitUrl } from '../../packages/core/src/gitlab/redact.js';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import { liveGitLab } from './live-gitlab.js';
-import { runScenario, sopNames, type SopName } from './sop-scenarios.js';
+import { runScenario, sopNames, withReleaseTopology, type SopName } from './sop-scenarios.js';
 import { loadStackState, type RealE2EStackState } from './stack.js';
 import { ensureLocalHelmPath } from './toolchain.js';
 
@@ -22,13 +22,14 @@ const run = promisify(execFile);
 function selectedSops(): SopName[] {
   const { values } = parseArgs({ options: { sop: { type: 'string', default: 'all' }, help: { type: 'boolean', short: 'h' } } });
   if (values.help) {
-    console.log('Usage: npm run e2e -- --sop=all|sop1,...,sop9');
+    console.log('Usage: npm run e2e -- --sop=all|' + sopNames.join(','));
+    console.log('sop11 first runs sop10 to deploy the release used by the production rollback.');
     return [];
   }
   if (values.sop === 'all') return sopNames;
   const names = values.sop!.split(',').map(s => s.trim());
   for (const name of names) {
-    if (!sopNames.includes(name as SopName)) throw Error('Expected --sop=all or a comma-separated list of sop1 through sop9');
+    if (!sopNames.includes(name as SopName)) throw Error('Expected --sop=all or a selection from ' + sopNames.join(','));
   }
   return [...new Set(names as SopName[])];
 }
@@ -44,6 +45,7 @@ async function modelConfig() {
   if (missing.length) throw Error('Missing real model configuration in .env: ' + missing.join(', '));
   assert.ok(['bailian', 'typesafe', 'custom'].includes(env.JEV_PROVIDER!.trim().toLowerCase()), 'Enable a real JEV_PROVIDER in .env');
   const keys = [...required, 'CLAUDE_MAX_TURNS', 'JEV_THRESHOLD', 'JEV_TIMEOUT_MS'];
+  if (process.env.CLAUDE_MAX_TURNS) env.CLAUDE_MAX_TURNS = process.env.CLAUDE_MAX_TURNS;
   return Object.fromEntries(keys.filter(key => env[key]?.trim()).map(key => [key, env[key]!]));
 }
 
@@ -164,7 +166,7 @@ async function deleteSessions(db: Pool, projects: number[]) {
   try {
     await conn.beginTransaction();
     const owned = 'SELECT id FROM issue_sessions WHERE hub_project_id IN (?)';
-    for (const table of ['delivery_executions', 'session_merge_requests', 'approval_requests', 'session_worktrees', 'session_inbox', 'session_messages']) {
+    for (const table of ['delivery_executions', 'session_pipeline_watches', 'session_merge_requests', 'approval_requests', 'session_worktrees', 'session_inbox', 'session_messages']) {
       await conn.query('DELETE FROM ' + table + ' WHERE session_id IN (' + owned + ')', [projects]);
     }
     await conn.query('DELETE FROM issue_sessions WHERE hub_project_id IN (?)', [projects]);
@@ -232,7 +234,7 @@ async function main() {
     const publicUrl = gitlab.detentPublicUrl(port);
     const envFile = join(tmp, '.env');
     const local = { PATH: process.env.PATH, HOME: tmp, TMPDIR: tmp };
-    await run(process.execPath, ['--import', 'tsx', 'scripts/bootstrap.ts', '--env-out', envFile], {
+    const bootstrap = () => run(process.execPath, ['--import', 'tsx', 'scripts/bootstrap.ts', '--env-out', envFile], {
       cwd: root, signal: controller.signal, timeout: 240000, env: {
         ...local, GITLAB_BASE_URL: stack.gitlabUrl, GITLAB_ADMIN_TOKEN: stack.gitlabAdminToken,
         GITLAB_TOKEN: botToken, GITLAB_WEBHOOK_SECRET: hookSecret, DETENT_BOT_USERNAME: 'detent-bot',
@@ -240,6 +242,15 @@ async function main() {
         DETENT_TARGET_PROJECTS: Object.values(gitlab.targetProjects).join(','),
       },
     });
+    try {
+      await bootstrap();
+    } catch (error) {
+      // A newly granted bot can briefly see a project-file 404. Bootstrap fills only missing resources.
+      if (!/GitLab HTTP 404 at \/projects\/\d+\/repository\/files\//.test(message(error))) throw error;
+      console.log('Retrying Hub bootstrap after a GitLab file visibility delay');
+      await delay(1500, undefined, { signal: controller.signal });
+      await bootstrap();
+    }
     const config = parseEnv(await readFile(envFile, 'utf8'));
     const paths = gitlab.targetProjects;
     const [hub, web, api, ansible, helm] = await Promise.all([gitlab.hubProjectPath, paths.web, paths.api, paths.ansible, paths.helm].map(gitlab.project));
@@ -256,9 +267,11 @@ async function main() {
     const hubInstructions = await gitlab.getFile(hub.id, 'CLAUDE.md');
     await gitlab.upsertFile(hub.id, 'CLAUDE.md', [
       hubInstructions, '',
+      '目标机仅授权 ops 普通账号。/etc/detent-demo 和其中的 app.conf 归 ops:ops 管理。维护此目录及文件时沿用现有属主和权限，以 ops 直接执行，作业不使用 sudo 或 become。',
+      '本栈的 JumpServer 作业会掩码名为 key 的模板字段。Playbook 请使用业务含义明确的变量名。',
       '通过 `target-node-01` 访问的 E2E Kubernetes 验证集群仅有控制平面，没有可调度 Pod 的工作节点。',
-      '执行 `helm upgrade --install` 时请省略 `--wait`；部署后用 `helm status` 检查 release 状态，并核对集群中 Kubernetes 资源的 spec。', '',
-    ].join('\n'), 'Document the E2E verification cluster topology');
+      '所有发布机共用这个验证集群。执行 helm upgrade --install 时省略 --atomic 和 --wait（--atomic 会隐式等待 Pod）。同一作业用 helm status 检查 release 状态，并核对集群中 Kubernetes 资源的 spec。', '',
+    ].join('\n'), 'Document the E2E host permissions and verification cluster');
     checkRunning();
 
     const helmPath = await ensureLocalHelmPath();
@@ -286,14 +299,15 @@ async function main() {
     } while (Date.now() < deadline);
     assert.ok(ready, 'Delivery Pod did not become healthy within 60s: ' + lastHealthError);
 
-    for (const name of selected) {
+    const context = { db, gitlab, stack, hub: hub.id, web, api, ansible, helm, groupPath: gitlab.groupPath, helmPath, botId, timeoutMs,
+      redact: (text: string) => audit.redact(text), webhookUrl: publicUrl + '/webhooks/gitlab', checkRunning, registerProject: (id: number) => projectIds.add(id) };
+    async function runSop(name: SopName) {
       checkRunning();
       const start = performance.now();
       console.log('Starting ' + name);
       let result = 'FAILED';
       try {
-        await runScenario(name, { db, gitlab, stack, hub: hub.id, web, api, ansible, helm, groupPath: gitlab.groupPath, helmPath, botId, timeoutMs, sopDeadline: start + sopTimeoutMs,
-          redact: text => audit.redact(text), webhookUrl: publicUrl + '/webhooks/gitlab', checkRunning, registerProject: id => projectIds.add(id) });
+        await runScenario(name, { ...context, sopDeadline: start + sopTimeoutMs });
         checkRunning();
         result = 'passed';
       } catch (error) {
@@ -306,6 +320,19 @@ async function main() {
         timings.push({ sop: name, result, seconds });
         console.log(name + ' ' + result + ' (' + seconds + 's)');
       }
+      return result === 'passed';
+    }
+    for (const name of selected) {
+      if (name === 'sop11' && selected.includes('sop10')) continue;
+      if (name === 'sop10' || name === 'sop11') {
+        await withReleaseTopology(context, async () => {
+          const deployed = await runSop('sop10');
+          if (selected.includes('sop11')) {
+            if (deployed) await runSop('sop11');
+            else timings.push({ sop: 'sop11', result: 'skipped (sop10 failed)', seconds: '0' });
+          }
+        });
+      } else await runSop(name);
     }
   } catch (error) { errors.push(error); }
   finally {

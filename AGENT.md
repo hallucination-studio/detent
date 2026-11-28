@@ -30,9 +30,9 @@
 
 ---
 
-Stage 1 的装配入口为 `createDetentApp(config, extensions)`。工具按每轮 profile 的白名单注册到 MCP。审批按待审记录的类型和工具名检查权限，外部续跑与 Issue 指令共用租约和临时沙箱。
+Stage 1 的装配入口为 `createDetentApp(config, extensions)`。工具按每轮 profile 的白名单注册到 MCP。审批按待审记录的类型、工具名和原始工具入参检查权限，外部续跑与 Issue 指令共用租约和临时沙箱。
 
-扩展使用 `defineExtensionTool` 注册不同 Schema 的工具。`always_approve` 放行后，执行前的 `guard` 与 `execute` 从本次调用的 `ctx.approvalId` 取得审批单 ID。轮次和审批共用 `resolveTurnProfile({ session, repo, gitlab })`，可按 Issue 标签选择策略。`matchWebhookEvent` 同步返回队列键和处理函数，由 WebhookQueue 调度。业务表通过 `onInitSchema(pool)` 在 Core 建表后复用同一连接池初始化。
+扩展使用 `defineExtensionTool` 注册不同 Schema 的工具。`always_approve` 放行后，执行前的 `guard` 与 `execute` 从本次调用的 `ctx.approvalId` 取得审批单 ID。轮次和审批共用 `resolveTurnProfile({ session, repo, gitlab })`，可按 Issue 标签选择策略。审批时以 purpose=approval 传入待审记录的 toolInput，并向 canApprove 传递同一份入参。`matchWebhookEvent` 同步返回队列键和处理函数，由 WebhookQueue 调度。业务表通过 `onInitSchema(pool)` 在 Core 建表后复用同一连接池初始化。
 
 Stage 2 的 Delivery 合并事件处理器按目标项目 ID 和 MR IID 查找所有关联会话。在各自的 `resumeSession.beforeRun` 租约内原子记录合并 SHA、合并人和时间。仅首次更新写入 Hub Issue 通知。会话正在等待方案或工具审批时，回调返回 `false` 并保留待审单；已关闭的会话仅记录合并信息，其余会话用 `default` 权限模式续跑。
 
@@ -42,23 +42,25 @@ Stage 3 的只读和自动工具在 `preflight` 执行守卫。生产任务在�
 
 显式流程标签使用对应 SOP 的能力、账号、命令前缀、审批等级和关单策略。缺少必需能力时，编排器在创建沙箱前发布配置指引并回到 `IDLE`。
 
-`DetentCapabilityPack` 以 `enabled` 表达能力是否就绪，未启用的包通过 `setupHint` 提供配置指引。Delivery 的 `jumpserver` 包可空。默认启用的 `gitlab-release` 包提供只读的 `detent_list_tags` 和须审批的 `detent_create_release`，发布审批绑定项目、Tag 和完整提交 SHA。
+`DetentCapabilityPack` 以 `enabled` 表达能力是否就绪，未启用的包通过 `setupHint` 提供配置指引。Delivery 的 `jumpserver` 包可空。默认启用的 `gitlab-release` 包提供只读的 `detent_list_tags`、`detent_await_pipeline`，方案获批后可用的 `detent_trigger_pipeline`，以及须人工审批的 `detent_create_release`。打 Tag 绑定项目与完整提交 SHA。触发流水线时自动登记终态回调，等待已有流水线时可指定 ID 或 ref。
 
 `npm run bootstrap` 只补齐缺失的 Hub 规范、流程、Issue 模板和标签，复用同一输出文件内的凭证。
 
-`jms_job` 与 `detent_create_release` 的待审单仅能在当前流程非只读且显式启用该工具时获批。两者始终校验生产审批人，`approver_tier: prod` 的流程对所有工具审批执行同样校验。方案审批沿用普通项目权限。生产审批要求 `DELIVERY_PROD_APPROVERS` 名单加项目成员门槛，或在名单为空时满足 `DELIVERY_PROD_MIN_ACCESS_LEVEL`（默认 40）。
+`jms_job` 与 `detent_create_release` 的待审单仅能在当前流程非只读且显式启用该工具时获批。发布能力的 `approver_tier` 缺省为 `prod`，显式配置为 `standard` 后服务 Owner 可批准打 Tag。JumpServer 配置 `environments` 时，发卡与执行前都须验证环境已定义且全部目标资产命中该环境。投票时重读 Hub、实时核验资产归属与黑名单，仅在明确的 standard 环境通过全部检查时允许普通成员批准。缺少配置或无法核验均按 prod 审批。`approver_tier: prod` 流程对所有工具审批要求生产权限，建仓、自助接入与 prod 外部能力同样保持生产审批。方案审批沿用普通项目权限。生产审批要求 `DELIVERY_PROD_APPROVERS` 名单加项目成员门槛，或在名单为空时满足 `DELIVERY_PROD_MIN_ACCESS_LEVEL`（默认 40）。
 
 `delivery_executions` 通过 `onInitSchema(pool)` 在 Core 表之后、调用方建表之前初始化。所有权、执行状态和审批单关联均以仓储为准，审批卡渲染也从仓储读取 MR。禁止 Delivery 另建池或在 Pod 内缓存业务状态。结果查询更新审计，`renderStatusExtra` 将当前会话的执行记录加入 `/status`。环境变量全集与 Hub 规范见 [.env.example](.env.example) 和 [工作区示例](examples/hub-workspace/CLAUDE.md)。
 
+共享环境契约位于 `skills/env-topology/SKILL.md`。发布、日常变更和失败回退均走同一环境 MR、人工合并、部署与健康核验流程。按 Hub 的 `promotion_gate` 交接下一环境，失败时仅将故障环境退回已记录的稳定 Tag，并保留工单。
+
 ### V4 工单闭环（Stage 8）
 
-Hub SOP 的 `close_policy` 默认 `manual`。`auto` 和 `approve` 启用每轮的 `detent_close_issue`，其中 `approve` 按流程审批人等级发卡。readonly 角色使用 SDK default 模式，禁用 Edit/Write，在 disableBash 时禁用 Bash；PermissionGate 与 WorkspaceTools 始终强制工作区只读。关单工具仅登记本轮请求。编排器在轮次成功、transcript 与工作区已保存后复核方案、待审单、未合并 MR 和 `TurnProfile.canCloseIssue`，先归档 Worktree，再刷新最终评论，随后关闭 Issue 并同步 `DONE` / `claude::done`。Delivery 要求最新执行记录为 `SUCCESS`。人工关单同样归档并进入 `DONE`。
+Hub SOP 的 `close_policy` 默认 `manual`。`auto` 和 `approve` 启用每轮的 `detent_close_issue`，其中 `approve` 按流程审批人等级发卡。readonly 角色使用 SDK default 模式，禁用 Edit/Write，在 disableBash 时禁用 Bash；PermissionGate 与 WorkspaceTools 始终强制工作区只读。关单工具仅登记本轮请求。编排器在轮次成功、transcript 与工作区已保存后复核方案、待审单、未合并 MR、仍为 PENDING 的流水线订阅和 `TurnProfile.canCloseIssue`，先归档 Worktree，再刷新最终评论，随后关闭 Issue 并同步 `DONE` / `claude::done`。Delivery 要求最新执行记录为 `SUCCESS`。人工关单同样归档并进入 `DONE`。
 
-每轮 Claude 通过带令牌认证的回环 HTTP MCP 调用工具。工具审批和提问先保存会话并释放 Pod 租约，获授权的用户回复后由新进程恢复。通过 `jms_list_assets` 查询资产，向 `jms_shell` 传入 `commands` 数组完成批量巡检。生产审批通过后，`jms_job` 异步提交任务并返回链接，本轮结束。Delivery 记录终态并唤醒原 Issue 进行核验。`jms_job_status` 可查询当前会话所属的任务。
+每轮 Claude 通过带令牌认证的回环 HTTP MCP 调用工具。工具审批和提问先保存会话并释放 Pod 租约，获授权的用户回复后由新进程恢复。获批的工具在恢复轮次按审批单原参数执行一次。同步成功后继续实施已批准的步骤，遇到评审、审批或已登记的回调时交接。通过 `jms_list_assets` 查询资产，向 `jms_shell` 传入 `commands` 数组完成批量巡检。生产执行以 `jms_job` 返回的任务 ID 与链接确认提交，本轮结束。Delivery 记录终态并唤醒原 Issue 进行核验。`jms_job_status` 可查询当前会话所属的任务。
 
 ### Stage 9 真实服务栈 SOP E2E
 
-第 2 步将提供真实服务栈验收入口。依次使用 `npm run e2e:up` 启动测试环境、`npm run e2e` 构建并运行 SOP 场景、`npm run e2e:down` 拆除环境。场景通过真实 GitLab API 操作 Issue、审批和 MR，由 GitLab 投递 Webhook。关单时核对 GitLab 状态和审批人身份，以及 MySQL 会话终态和 Worktree 归档记录。
+依次使用 `npm run e2e:up` 启动测试环境、`npm run e2e` 构建并运行 SOP 场景、`npm run e2e:down` 拆除环境。脚本在宿主机启动 Delivery 时，Ansible 场景从 PATH 查找 yamllint，交付镜像已内置该工具。场景通过真实 GitLab API 操作 Issue、审批和 MR，由 GitLab 投递 Webhook。关单时核对 GitLab 状态和审批人身份，以及 MySQL 会话终态和 Worktree 归档记录。SOP10 从真实 Hub 读取在线环境矩阵，分别核验 Developer 和 Maintainer 在 pre、prod 的合并与执行审批，以及两个 K3s 命名空间实际部署的相同镜像版本。SOP11 接着开独立的 env-change 工单，只回退 prod，复核 pre 的 Helm revision 与 Deployment、生产审批、工单关闭及 Worktree 归档。两个场景各自计时。
 
 ### Jev 命令风控
 
@@ -82,7 +84,7 @@ Core 持有通用 System One 客户端（百炼 Decision Model API、TypeSafe、
 
 ### V6 控制面基础（Stage 10）
 
-Issue 与 MR 按 `(session_kind, hub_project_id, hub_issue_iid)` 独立标识。新增的 `session_inbox` 按会话和事件去重。持租约的 Issue 与 MR 轮次在 PostToolUse 注入新指示，并在工具结束、沙箱清理与释放租约之间接续晚到的评论。Watchdog 默认每 30 秒加抖动扫描，最小间隔 15 秒，设为 0 可关闭。扫描只读，恢复在租约内完成。
+Issue 与 MR 按 `(session_kind, hub_project_id, hub_issue_iid)` 独立标识。`session_inbox` 按会话和事件去重。`session_pipeline_watches` 按目标项目与流水线 ID 匹配，无 ID 时按 ref 匹配。GitLab 的 success、failed、canceled、skipped 事件将等待记录置为 RESOLVED，并在同一事务内按事件 ID 给未关闭会话入箱。提交后唤醒对应 Issue，常规系统事件只在首次入箱时尝试取得租约。关单同步过期尚未消费的消息。人工关闭、重置、中止及恢复耗尽会将未决记录置为 EXPIRED。`/status` 展示未决订阅。持租约的 Issue 与 MR 轮次在 PostToolUse 注入新指示，并在工具结束、沙箱清理与释放租约之间接续晚到的评论。Watchdog 默认每 30 秒加抖动扫描，最小间隔 15 秒，设为 0 可关闭。扫描只读，恢复在租约内完成。
 
 沙箱内 Hub 根目录的 `events.json` 受写保护。WebhookQueue 从 Hub 默认分支读取规则，按首条命中规则处理扩展匹配器交还的事件。人为事件带有 actor ID 且处置为 `run` 时，先校验来源项目的审批权限；缺少项目 ID 时使用 Hub。`semantic` 仅在规则命中时调用 Jev。通知通过 GitLab 客户端渲染后触发 `onNotify`。
 
@@ -148,6 +150,6 @@ Issue 与 MR 的普通回复只可回答当前待审的 `ASK_USER`，沿用审�
 
 `DETENT_SECRET_*` 仅在父进程解析。新增输出路径必须使用完整配置密钥集合脱敏，包含 SDK 输入、代理元数据、工具参数与结果、审批、Jev、GitLab 和增量 transcript。沙箱保护 Hub 根目录的 `capabilities.json`，包含 Edit、Write、Bash 和符号链接路径。
 
-Issue 的 `/help`、轮次、审批分别读取 Hub 默认分支的能力配置。单轮解析所得的工具与流程授权使用同一份能力清单。MCP 请求头只在服务端展开；Hub 配置不能展开通用进程环境变量。临时连接在发现或调用结束时释放。Delivery 解释业务能力字段，Core 透传通用的流程 `account` 与 `allow_prefixes`。Hub 的 JumpServer `auth` 通过 `$secret:JMS_AK_ID` 和 `$secret:JMS_AK_SECRET` 引用父进程密钥。先使用流程 `account`，其次使用 Hub `default_account`。两者均未设置时，逐资产按 JumpServer 返回顺序选择首个有效授权账号，跳过停用账号和以 `@` 开头的虚拟账号。巡检按账号分组并汇总结果。单个 Ansible 任务要求所有目标使用同一账号，否则须指定共同的 `account` 或分组执行。缺少有效账号时，错误指出对应资产。
+Issue 的 `/help`、轮次、审批分别读取 Hub 默认分支的能力配置。单轮解析所得的工具与流程授权使用同一份能力清单。MCP 请求头只在服务端展开；Hub 配置不能展开通用进程环境变量。临时连接在发现或调用结束时释放。Delivery 解释业务能力字段，工具从 `WorkflowToolConfig` 读取当前流程的账号、巡检前缀及 `approverTier`。Hub 的 JumpServer `auth` 通过 `$secret:JMS_AK_ID` 和 `$secret:JMS_AK_SECRET` 引用父进程密钥。先使用流程 `account`，其次使用 Hub `default_account`。两者均未设置时，逐资产按 JumpServer 返回顺序选择首个有效授权账号，跳过停用账号和以 `@` 开头的虚拟账号。巡检按账号分组并汇总结果。单个 Ansible 任务要求所有目标使用同一账号，否则须指定共同的 `account` 或分组执行。缺少有效账号时，错误指出对应资产。
 
 JumpServer 即时巡检与 Playbook 定义均在 `POST /api/v1/ops/jobs/` 显式发送 `is_periodic: false`。巡检按等价标志静态放行 `ss -lntp`。白名单外诊断要求 Jev 返回 `choice=pure_readonly`、`noul ≥ 0.75`、`0 ≤ impact ≤ 1.35`，拒绝理由保留三项指标。Jev 请求默认超时 6000 ms。

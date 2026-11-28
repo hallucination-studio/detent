@@ -314,6 +314,29 @@ async function setup(mode: PermissionMode = 'default', config: DeliveryConfig = 
   return { replay, gate, client, session, repo, mr, gitlab, tracker, records, core, tools, controller };
 }
 
+it('requires every asset to belong to the declared environment before approval and again at execution', async () => {
+  const config = loadDeliveryConfig(env);
+  config.environments = { pre: { match: ['label:env:pre'], approverTier: 'standard' }, prod: { match: ['/DEFAULT/prod'], approverTier: 'prod' } };
+  const { gate, replay, client, repo, mr, gitlab } = await setup('default', config);
+  await repo.upsertMergeRequest(mr);
+  const args = { ...input, environment: 'pre', asset_ids: ['pre1'] };
+  await expect(gate.invokeExtension(asTool('job'), args)).rejects.toThrow('无法实时核验');
+  let moved = false;
+  Object.assign(client, { getAsset: async (id: string) => ({ id, name: id, address: 'shared-host',
+    labels: [id === 'pre1' && !moved ? 'env:pre' : 'env:prod'], nodes: ['/DEFAULT/prod/app'] }) });
+  for (const environment of [undefined, 'unknown']) {
+    await expect(gate.invokeExtension(asTool('job'), { ...args, environment })).rejects.toThrow('pre、prod');
+  }
+  for (const asset_ids of [['prod1'], ['pre1', 'prod1']])
+    await expect(gate.invokeExtension(asTool('job'), { ...args, asset_ids })).rejects.toThrow(/不属于目标环境 pre.*prod1/);
+  expect(gitlab.createIssueNote).not.toHaveBeenCalled();
+  await expect(gate.invokeExtension(asTool('job'), args)).rejects.toBeInstanceOf(ColdHold);
+  expect(gitlab.createIssueNote.mock.lastCall?.[2]).toContain('### 🚀 环境变更执行审批 [pre]');
+  moved = true;
+  await expect(replay(args)).rejects.toThrow(/不属于目标环境 pre.*pre1/);
+  expect(client.runAnsibleJob).not.toHaveBeenCalled();
+});
+
 it.each(['plan', 'default'] as const)('gates readonly inspection and lists assets in %s mode', async mode => {
   const { client, gate, gitlab, tools } = await setup(mode);
   expect(await gate.invokeExtension(asTool('list_nodes'), {})).toEqual([]);

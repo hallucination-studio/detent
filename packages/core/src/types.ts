@@ -122,6 +122,16 @@ export interface SessionMergeRequestRow {
   updatedAt: Date;
 }
 
+export interface SessionPipelineWatchRow {
+  id: string;
+  sessionId: string;
+  targetProjectId: number;
+  pipelineId: number | null;
+  refName: string | null;
+  status: 'PENDING' | 'RESOLVED' | 'EXPIRED';
+  createdAt: Date;
+}
+
 export interface ApprovalRequestRow {
   id: string;
   sessionId: string;

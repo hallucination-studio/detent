@@ -1,4 +1,4 @@
-import { resolveJumpServerSettings } from './hub-config.js';
+import { releaseSettings, resolveJumpServerSettings } from './hub-config.js';
 import {
   createDecisionClient, createDetentApp, createGitLabOnboardingCapability, createGitLabReleaseCapability, GitLabClient, loadConfig, loadHubCapabilities,
   type AppConfig, type DetentCapabilityPack, type DetentExtensions, type ReleaseGitLab, type OnboardingGitLab,
@@ -7,7 +7,7 @@ import { createDeliveryTurnProfileResolver } from './agents/profiles.js';
 import { MySqlDeliveryAuditRepository, formatDeliveryExecutionsStatus, type DeliveryAuditRepository } from './db/audit.js';
 import { authSecrets, loadDeliveryConfig, redactDeliveryOutput, type DeliveryConfig } from './config.js';
 import { HttpJumpServerClient, type JobResultResponse, type JumpServerClient } from './jumpserver/client.js';
-import { createJumpServerTools, type DeliveryExecutionTracker } from './jumpserver/tools.js';
+import { createJumpServerCapability, createJumpServerTools, type DeliveryExecutionTracker } from './jumpserver/tools.js';
 import { DeliveryJobPoller } from './jumpserver/job-poller.js';
 import { matchMergeRequestWebhook } from './webhooks/merge-request.js';
 
@@ -55,13 +55,14 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
   const release: DetentCapabilityPack = deliveryConfig.enableReleaseTools
     ? {
         ...createGitLabReleaseCapability({ gitlab: api, blockFailedPipeline: deliveryConfig.blockFailedPipeline }),
+        approverTier: 'prod',
         setupHint: '可在服务端设置 DELIVERY_ENABLE_RELEASE_TOOLS=true 启用发版能力包',
       }
     : { name: 'gitlab-release', enabled: false, setupHint: '服务端已禁用 gitlab-release（DELIVERY_ENABLE_RELEASE_TOOLS=false）', tools: [] };
   const jumpserver: DetentCapabilityPack = {
-    name: 'jumpserver', enabled: !!client,
+    ...(client ? createJumpServerCapability('jumpserver', { client, config: deliveryConfig, tracker, decision, onTerminalResult })
+      : { name: 'jumpserver', enabled: false, tools: [] }),
     setupHint: '请在 Hub capabilities.json 配置 jumpserver.base_url 和 auth，并在服务端提供 DETENT_SECRET_JMS_AK_ID 与 DETENT_SECRET_JMS_AK_SECRET',
-    tools: client ? createJumpServerTools({ client, config: deliveryConfig, tracker, decision, onTerminalResult }) : [],
   };
   const packs = new Map<string, DetentCapabilityPack>();
   for (const pack of [release, jumpserver, onboarding, ...(extensions.capabilities ?? [])]) packs.set(pack.name.trim().toLowerCase(), pack);
@@ -73,15 +74,15 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
       for (const [name, entry] of Object.entries(ctx.document.entries)) {
         if (entry.type === 'jumpserver') {
           const resolved = resolveJumpServerSettings(entry, ctx.config.secrets, deliveryConfig);
-          dynamic.push('setupHint' in resolved ? { name, enabled: false, tools: [], setupHint: resolved.setupHint } : {
-            name, enabled: true, tools: createJumpServerTools({ config: resolved.config, tracker, decision, onTerminalResult, defaultAccount: resolved.defaultAccount,
-              client: new HttpJumpServerClient(resolved.config, ctx.config) }),
-          });
+          dynamic.push('setupHint' in resolved ? { name, enabled: false, tools: [], setupHint: resolved.setupHint }
+            : createJumpServerCapability(name, { config: resolved.config, tracker, decision, onTerminalResult, defaultAccount: resolved.defaultAccount,
+              client: new HttpJumpServerClient(resolved.config, ctx.config) }));
         } else if (entry.type === 'gitlab-release') {
-          const flag = entry.block_failed_pipeline;
-          dynamic.push(entry.enabled === false || (flag !== undefined && typeof flag !== 'boolean')
-            ? { name, enabled: false, tools: [], setupHint: '请检查 Hub capabilities.json 中的 gitlab-release 配置' }
-            : { ...createGitLabReleaseCapability({ gitlab: api, blockFailedPipeline: flag ?? deliveryConfig.blockFailedPipeline }), name });
+          const parsed = releaseSettings.safeParse(entry);
+          dynamic.push(entry.enabled === false || !parsed.success
+            ? { name, enabled: false, tools: [], setupHint: '请检查 Hub capabilities.json 中的 gitlab-release 配置（approver_tier 支持 standard 或 prod）' }
+            : { ...createGitLabReleaseCapability({ gitlab: api, blockFailedPipeline: parsed.data.block_failed_pipeline ?? deliveryConfig.blockFailedPipeline }),
+              name, approverTier: parsed.data.approver_tier });
         }
       }
       return [...dynamic, ...(await extensions.resolveCapabilities?.(ctx) ?? [])];

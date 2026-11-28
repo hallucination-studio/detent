@@ -54,10 +54,12 @@ interface MergeRequest {
 export type LiveMr = Awaited<ReturnType<GitLabClient['getMergeRequest']>>;
 interface Pipeline {
   project_id?: number;
+  web_url?: string;
   id: number;
   ref: string;
   status: string;
 }
+export const isTerminalPipeline = (status: string) => ['success', 'failed', 'canceled', 'skipped'].includes(status);
 interface TreeEntry {
   id: string;
   name: string;
@@ -372,6 +374,14 @@ export class GitLabClient {
         ? '/merge_requests/' + ref + '/pipelines'
         : '/pipelines?ref=' + encodeURIComponent(ref);
     return this.json<Pipeline[]>(this.project(p) + path);
+  }
+  createPipeline(project: number, { ref, variables }: { ref: string; variables?: Record<string, string> }) {
+    return this.json<Pipeline>(this.project(project) + '/pipeline', 'POST', {
+      ref, variables: variables && Object.entries(variables).map(([key, value]) => ({ key, value })),
+    });
+  }
+  getPipeline(project: number, pipelineId: number) {
+    return this.json<Pipeline>(this.project(project) + '/pipelines/' + pipelineId);
   }
   getPipelineJobs(p: number, id: number) {
     return this.pages<{ id: number; name: string; status: string }>(

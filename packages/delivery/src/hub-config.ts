@@ -3,6 +3,8 @@ import { z } from 'zod';
 import type { DeliveryConfig } from './config.js';
 import type { JumpServerAuth } from './jumpserver/client.js';
 
+const tier = z.enum(['standard', 'prod']).default('prod');
+export const releaseSettings = z.object({ approver_tier: tier, block_failed_pipeline: z.boolean().optional() });
 const settings = z.object({
   base_url: z.string().trim().url().refine(raw => {
     if (!URL.canParse(raw)) return false;
@@ -15,6 +17,9 @@ const settings = z.object({
   org_id: z.string().trim().min(1).optional(),
   inspect_allow_prefixes: z.array(z.string().trim().min(1)).optional(),
   blocked_assets: z.array(z.string().trim().min(1)).optional(),
+  environments: z.record(z.string().trim().min(1).max(64), z.object({
+    match: z.array(z.string().trim().min(1)).nonempty(), approver_tier: tier,
+  })).optional(),
   block_failed_pipeline: z.boolean().optional(),
 });
 
@@ -39,6 +44,8 @@ export function resolveJumpServerSettings(entry: HubCapabilityEntry, vault: Reco
   const config: DeliveryConfig = { ...fallback, jumpserverBaseUrl: hub.base_url, jumpserverOrgId: hub.org_id,
     jumpserverReadonlyAuth: auth, jumpserverJobAuth: auth, jumpserverReadonlyAccount: undefined,
     inspectAllowPrefixes: hub.inspect_allow_prefixes ?? fallback.inspectAllowPrefixes,
+    environments: hub.environments && Object.fromEntries(Object.entries(hub.environments).map(([name, env]) =>
+      [name, { match: env.match, approverTier: env.approver_tier }])),
     blockedAssets: hub.blocked_assets ?? fallback.blockedAssets, blockFailedPipeline: hub.block_failed_pipeline ?? fallback.blockFailedPipeline };
   return { config, defaultAccount: hub.default_account || undefined };
 }

@@ -142,8 +142,8 @@ it('checks out the assigned source, registers only MR tools, resolves a real sha
     expect(tree).toMatchObject({ branchName: 'feature', baseBranch: 'main', status: 'ACTIVE' });
     const dir = path.join(t.sandbox.workspaceRoot, 'projects', tree.directoryName);
     expect((await readdir(t.sandbox.workspaceRoot)).sort()).toEqual(['CLAUDE.md', 'projects']);
-    expect(t.systemPrompt).toContain('If CLAUDE.md or skills/ exist in the workspace root, read relevant conventions before reviewing or modifying code.');
-    for (const text of ['GitLab MR org/project2 (#2)!1 · Review me', 'project: 2', 'Read/Glob/Grep inside projects/' + tree.directoryName, mr.title, mr.description!, 'feature -> main', 'draft=true', 'has_conflicts=true', 'lint', 'tracked:7', tree.directoryName])
+    expect(t.systemPrompt).toContain('评审或修改前读取工作区 CLAUDE.md 和相关 Skill。');
+    for (const text of ['GitLab MR org/project2 (#2)!1 · Review me', 'project: 2', 'Read、Glob、Grep 查看 projects/' + tree.directoryName, mr.title, mr.description!, 'feature → main', '草稿：是', '合并冲突：是', 'lint', 'tracked:7', tree.directoryName])
       expect(t.systemPrompt).toContain(text);
     expect(t.systemPrompt).not.toContain('test-secret');
     for (const command of ['sh check.sh', 'cat check.sh && cat health.txt', 'cd projects/' + tree.directoryName + ' && git status && git remote -v'])
@@ -328,7 +328,7 @@ it('checks fork write permission and uses read-only suggestions while retaining 
   run.mockImplementationOnce(async t => {
     const [tree] = await repo.listActiveWorktrees(t.session.id);
     expect(tree.targetProjectId).toBe(3);
-    expect(t.systemPrompt).toContain('Read-only fork');
+    expect(t.systemPrompt).toContain('此 Fork 只读');
     expect(t.systemPrompt).toContain('GitLab MR org/project2 (#2)!1');
     expect(await t.gate.canUseTool('Bash', { command: 'git status' })).toMatchObject({ behavior: 'deny' });
     for (const [name, input] of [['Edit', { file_path: 'a' }], ['detent_commit_and_push', {}], ['mcp__detent__detent_sync_target_branch', {}]] as const)
@@ -526,5 +526,14 @@ it('answers targeted help in place before takeover and keeps the takeover footer
   await send(opened);
   expect(gitlab.updateMergeRequestNote).toHaveBeenLastCalledWith(2, 1, expect.any(Number), expect.stringContaining('已接管此 MR'));
   await send(note('/reset'));
+  expect(gitlab.updateMergeRequestNote).toHaveBeenLastCalledWith(2, 1, expect.any(Number), 'fixed');
+});
+
+it('omits the takeover footer on the first working note of a linked Hub MR', async () => {
+  const { link, send, gitlab, run } = await setup();
+  await link();
+  await send(opened);
+  expect(run).toHaveBeenCalledOnce();
+  expect(gitlab.createMergeRequestNote).toHaveBeenCalledWith(2, 1, '正在检查 MR…');
   expect(gitlab.updateMergeRequestNote).toHaveBeenLastCalledWith(2, 1, expect.any(Number), 'fixed');
 });

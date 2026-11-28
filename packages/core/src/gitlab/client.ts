@@ -5,6 +5,7 @@ import type { GitLabUser, SessionStatus } from '../types.js';
 
 interface Project {
   id: number;
+  web_url?: string;
   path_with_namespace: string;
   http_url_to_repo: string;
   default_branch: string;
@@ -174,6 +175,9 @@ export class GitLabClient {
   createIssueNote(p: number, i: number, body: string) {
     return this.createNote(this.notes(p, i), body);
   }
+  getIssueNote(p: number, i: number, noteId: number) {
+    return this.json<IssueNote>(this.notes(p, i) + '/' + noteId);
+  }
   async updateIssueNote(p: number, i: number, n: number, body: string) {
     await this.updateNote(this.notes(p, i), n, body);
   }
@@ -317,6 +321,9 @@ export class GitLabClient {
   }
   createMergeRequestNote(project: number, mrIid: number, body: string) {
     return this.createNote(this.mrPath(project, mrIid) + '/notes', body);
+  }
+  getMergeRequestNote(project: number, mrIid: number, noteId: number) {
+    return this.json<MergeRequestNote>(this.mrPath(project, mrIid) + '/notes/' + noteId);
   }
   updateMergeRequestNote(project: number, mrIid: number, noteId: number, body: string) {
     return this.updateNote(this.mrPath(project, mrIid) + '/notes', noteId, body);

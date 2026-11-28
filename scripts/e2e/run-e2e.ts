@@ -348,9 +348,52 @@ async function main() {
     if (projectIds.size) {
       console.log('Auditing GitLab notes and MySQL records');
       let notes = 0;
+      const samples = new Set<string>();
       for (const id of projectIds) {
         await finish('Audit GitLab project ' + id, async () => {
-          notes += await gitlab.auditNotes(id, (body, location) => audit.check(body, location));
+          const [cards] = ready ? await db.query<RowDataPacket[]>(`SELECT a.id, a.gitlab_note_id, a.approval_type, a.tool_name, a.status, a.decided_by
+            FROM approval_requests a JOIN issue_sessions s ON s.id=a.session_id WHERE s.hub_project_id=? AND
+            a.approval_type IN ('PLAN','TOOL_USE') AND a.status IN ('APPROVED','REJECTED') AND a.gitlab_note_id IS NOT NULL`, [id]) : [[]];
+          const expected = new Map(cards.map(card => [Number(card.gitlab_note_id), card]));
+          let traces = 0, holds = 0;
+          notes += await gitlab.auditNotes(id, (body, location, note) => {
+            audit.check(body, location);
+            if (note.system || note.author.username !== 'detent-bot') return;
+            assert.doesNotMatch(body, /\/(?:private\/)?(?:var|tmp)\/[^\s"`]*\/turn-[\da-f-]{36}\//i, 'Sandbox path in ' + location);
+            assert.ok(!body.includes('⏳ 执行中…'), 'Unfinished tool step in ' + location);
+            if (body.includes('🔍 工具调用轨迹')) {
+              traces++;
+              assert.doesNotMatch(body, /↳ `+\[\{"type":"text","text":/, 'Raw MCP result in ' + location);
+              if (!samples.has('trace')) {
+                samples.add('trace');
+                console.log('  Trace sample ' + location + ' · ' + body.split('\n').find(line => line.includes('↳'))?.trim());
+              }
+              assert.doesNotMatch(body.split('\n')[0], /上方审批卡/, 'Reversed ColdHold direction in ' + location);
+            }
+            if (body.startsWith('📋 已提交操作审批') || body.startsWith('💬 需要你的确认')) {
+              assert.match(body.split('\n')[0], /下方/, 'Approval direction in ' + location);
+              holds++;
+              if (!samples.has('hold')) {
+                samples.add('hold');
+                console.log('  ColdHold sample ' + location + ' · ' + body.split('\n')[0]);
+              }
+            }
+            const card = expected.get(note.id);
+            if (!card) return;
+            const status = card.status === 'APPROVED' ? '✅ **已批准**' : '❌ **已拒绝**';
+            assert.ok(body.includes(status + ' · 由 @' + card.decided_by), 'Missing decision on ' + location);
+            assert.ok(body.includes('| 项目 | 内容 |') && body.includes('<sub>审批单 `' + card.id + '`</sub>'), 'Approval layout on ' + location);
+            console.log('  Card ' + location + ' · ' + card.tool_name + ' · ' + status + ' @' + card.decided_by);
+            const role = body.split('\n').find(line => line.startsWith('> 请') && line.includes('/approve'));
+            assert.ok(role, 'Missing approver instructions on ' + location);
+            if (!samples.has(card.tool_name + role)) {
+              samples.add(card.tool_name + role);
+              console.log('    ' + body.split('\n')[0] + ' · ' + role + ' · ' + body.split('\n').at(-1));
+            }
+            expected.delete(note.id);
+          });
+          assert.equal(expected.size, 0, 'Decided cards missing from GitLab');
+          if (traces || holds) console.log('  Project #' + id + ' · ' + traces + ' finalized traces · ' + holds + ' holds point to the following card');
         });
       }
       if (ready) {

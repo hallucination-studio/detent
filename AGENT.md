@@ -34,7 +34,7 @@ Stage 1 的装配入口为 `createDetentApp(config, extensions)`。工具按每�
 
 扩展使用 `defineExtensionTool` 注册不同 Schema 的工具。`always_approve` 放行后，执行前的 `guard` 与 `execute` 从本次调用的 `ctx.approvalId` 取得审批单 ID。轮次和审批共用 `resolveTurnProfile({ session, repo, gitlab })`，可按 Issue 标签选择策略。审批时以 purpose=approval 传入待审记录的 toolInput，并向 canApprove 传递同一份入参。`matchWebhookEvent` 同步返回队列键和处理函数，由 WebhookQueue 调度。业务表通过 `onInitSchema(pool)` 在 Core 建表后复用同一连接池初始化。
 
-Stage 2 的 Delivery 合并事件处理器按目标项目 ID 和 MR IID 查找所有关联会话。在各自的 `resumeSession.beforeRun` 租约内原子记录合并 SHA、合并人和时间。仅首次更新写入 Hub Issue 通知。会话正在等待方案或工具审批时，回调返回 `false` 并保留待审单；已关闭的会话仅记录合并信息，其余会话用 `default` 权限模式续跑。
+Stage 2 的 Delivery 合并事件处理器按目标项目 ID 和 MR IID 查找所有关联会话。在各自的 `resumeSession.beforeRun` 租约内原子记录合并 SHA、合并人和时间。仅首次更新写入 Hub Issue 通知。会话正在等待方案或工具审批时，回调返回 `false` 并保留待审单；已关闭的会话仅记录合并信息。合并后立即归档没有其他打开 MR 引用的工作树。纯代码会话还有打开的 MR 时只发进度评论，最后一个 MR 合并时才唤醒核验。当前流程需要部署能力时，每次合并都可立即续跑。
 
 Stage 3 的只读和自动工具在 `preflight` 执行守卫。生产任务在发卡前、批准后复核，提交前重读当前会话 MR。Hub 的单个 `auth` 同时用于巡检和执行，旧环境可显式配置两套凭证。资产黑名单同时约束巡检和执行。结果查询必须由注入的 `DeliveryExecutionTracker` 验证会话归属。审批卡渲染、执行与归属判断均读取仓储。
 
@@ -52,11 +52,13 @@ Stage 3 的只读和自动工具在 `preflight` 执行守卫。生产任务在�
 
 共享环境契约位于 `skills/env-topology/SKILL.md`。发布、日常变更和失败回退均走同一环境 MR、人工合并、部署与健康核验流程。按 Hub 的 `promotion_gate` 交接下一环境，失败时仅将故障环境退回已记录的稳定 Tag，并保留工单。
 
+Delivery 在进程内按连接配置和凭证指纹复用最多 16 个 HTTP 客户端，并行查询多个资产的授权账号。
+
 ### V4 工单闭环（Stage 8）
 
 Hub SOP 的 `close_policy` 默认 `manual`。`auto` 和 `approve` 启用每轮的 `detent_close_issue`，其中 `approve` 按流程审批人等级发卡。readonly 角色使用 SDK default 模式，禁用 Edit/Write，在 disableBash 时禁用 Bash；PermissionGate 与 WorkspaceTools 始终强制工作区只读。关单工具仅登记本轮请求。编排器在轮次成功、transcript 与工作区已保存后复核方案、待审单、未合并 MR、仍为 PENDING 的流水线订阅和 `TurnProfile.canCloseIssue`，先归档 Worktree，再刷新最终评论，随后关闭 Issue 并同步 `DONE` / `claude::done`。Delivery 要求最新执行记录为 `SUCCESS`。人工关单同样归档并进入 `DONE`。
 
-每轮 Claude 通过带令牌认证的回环 HTTP MCP 调用工具。工具审批和提问先保存会话并释放 Pod 租约，获授权的用户回复后由新进程恢复。获批的工具在恢复轮次按审批单原参数执行一次。同步成功后继续实施已批准的步骤，遇到评审、审批或已登记的回调时交接。通过 `jms_list_assets` 查询资产，向 `jms_shell` 传入 `commands` 数组完成批量巡检。生产执行以 `jms_job` 返回的任务 ID 与链接确认提交，本轮结束。Delivery 记录终态并唤醒原 Issue 进行核验。`jms_job_status` 可查询当前会话所属的任务。
+每轮 Claude 通过带令牌认证的回环 HTTP MCP 调用工具。工具审批和提问先保存会话并释放 Pod 租约，获授权的用户回复后由新进程恢复。默认由恢复轮次按审批单原参数调用工具一次。声明 `directExecuteOnApproval` 的工具由服务端在会话租约内重新读取能力与流程，核验审批权限、工具白名单、Schema 与实时 guard，再以空 workspaceRoot 执行。异步工具用 `handoff` 回到 IDLE 并消费已到达的收件箱消息，同步工具用 `resume` 将脱敏结果送入下一轮。两种方式均消费同一张审批单。同步成功后继续实施已批准的步骤，遇到评审、审批或已登记的回调时交接。通过 `jms_list_assets` 查询资产，向 `jms_shell` 传入 `commands` 数组完成批量巡检。生产执行以 `jms_job` 返回的任务 ID 与链接确认提交，本轮结束。Delivery 记录终态并唤醒原 Issue 进行核验。`jms_job_status` 可查询当前会话所属的任务。
 
 ### Stage 9 真实服务栈 SOP E2E
 
@@ -104,13 +106,13 @@ Issue 与 MR 复用 NoteStreamer 折叠工具轨迹。MR 验收通过 GitLab 分
 
 依照 `INSTALL.md` 使用 `Dockerfile` 和 `docker-compose.yml` 安装。bootstrap 支持 `DETENT_TARGET_GROUPS` 与 Bot 欢迎工单。管理员模式先准备 Bot PAT，再在 Hub 项目授予 `@detent-bot` Owner（50）；仅用 Bot PAT 时先校验 Hub 有效权限至少为 Maintainer（40）。Hub 模板、标签、Webhook 和可选欢迎工单均用 Bot PAT 写入。新建 Hub 直接写入模板首页，已有 Hub 保留自己的首页。目标业务项目与群组授予 Developer（30），保留已有的更高权限。
 
-Hub 和 MR 的 `/help` 在检查成员权限后直接发评论，禁止创建会话或调用模型。MR 还须验证实时分配或显式提及，首次接管提示只出现在首条工作评论。`agents/onboarding/AGENT.md` 使用 Core 通用 `gitlab-onboarding` 能力包。回调地址来自 `DETENT_PUBLIC_URL`。服务端检查所有目标的有效 Maintainer 权限，Delivery 对写 Webhook 工具强制生产审批。Webhook 密钥只进入 GitLab 管理请求；模型 API 凭证由父进程为上游请求注入。
+Hub 和 MR 的 `/help` 在检查成员权限后直接发评论，禁止创建会话或调用模型。MR 还须验证实时分配或显式提及，外部 MR 的首次接管提示只出现在首条工作评论。已有 Hub 关联记录的 MR 省略接管提示。`agents/onboarding/AGENT.md` 使用 Core 通用 `gitlab-onboarding` 能力包。回调地址来自 `DETENT_PUBLIC_URL`。服务端检查所有目标的有效 Maintainer 权限，Delivery 对写 Webhook 工具强制生产审批。Webhook 密钥只进入 GitLab 管理请求；模型 API 凭证由父进程为上游请求注入。
 
 ### 用户交互与审批反馈
 
 能力缺失时直接列出所需能力与已就绪流程，管理员配置提示来自 `setupHint`。Hub 示例只提供协作规范，仓库与资产以实时查询为准。
 
-Issue 与 MR 的普通回复只可回答当前待审的 `ASK_USER`，沿用审批身份校验与冷恢复。`TOOL_USE` 保留显式审批。审批时按待审类型和工具名复核当前流程，已撤销授权的工具保持静默。生产审批权限不足的项目成员收到去重提示，外部人员无反馈。Issue 与 MR 的折叠工具轨迹逐次展示所有工具的名称、原始路径与参数，原位更新执行结果、错误或拒绝原因。参数和结果先脱敏再截断。超过 60 步时展示首尾各 30 步及省略数量，无工具调用时省略轨迹。
+Issue 与 MR 的普通回复只可回答当前待审的 `ASK_USER`，沿用审批身份校验与冷恢复。`TOOL_USE` 保留显式审批。审批时按待审类型和工具名复核当前流程，已撤销授权的工具保持静默。生产审批权限不足的项目成员收到去重提示，外部人员无反馈。Issue 与 MR 的折叠工具轨迹逐次展示所有工具的名称、工作区相对路径与参数，原位更新执行结果、错误或拒绝原因。工作评论结束时收口所有进行中的步骤。常规回复列出 MR，状态查询与模型上下文同时保留活跃工作树。Plan 和工具审批裁决后，尽力将审批结果与操作者写回原卡，并记录回写错误。参数和结果先脱敏再截断。超过 60 步时展示首尾各 30 步及省略数量，无工具调用时省略轨迹。
 
 ## 二、 质量门禁：本地提交前检查与推送前 OpenCodeReview 委托审查（必须遵守）
 

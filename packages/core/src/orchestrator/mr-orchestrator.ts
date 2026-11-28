@@ -9,7 +9,7 @@ import type { ClaudeRunner } from '../claude/runner.js';
 import { TranscriptHydrator } from '../claude/transcript-hydrator.js';
 import { isTerminalPipeline, redactGitUrl, type GitLabClient } from '../gitlab/client.js';
 import { hasBotMention, parseNoteIntent, parseEmojiIntent } from '../gitlab/command-parser.js';
-import { NoteStreamer, recoveryHint, renderPlanApprovalCard, renderStatus, renderSummary, waitingToolGuidance } from '../gitlab/note-streamer.js';
+import { formatUserError, NoteStreamer, renderPlanApprovalCard, renderStatus, renderSummary, waitingToolGuidance } from '../gitlab/note-streamer.js';
 import { actionableMr, normalizeGitLabEvent, type EventOf } from '../gitlab/webhook.js';
 import { evaluateEventPolicy, loadHubEventPolicy } from '../router/event-policy.js';
 import { sendEventNotification } from '../router/notifier.js';
@@ -147,10 +147,10 @@ export class MergeRequestOrchestrator extends TurnRuntime {
     if (intent.type === 'STATUS') {
       const summary = renderSummary(...await Promise.all([
         this.repo.listActiveWorktrees(s.id), this.repo.listSessionMergeRequests(s.id),
-      ]));
+      ]), { includeWorktrees: true });
       await this.channel(s, discussion).createNote([renderStatus(s.status, pending), summary].filter(Boolean).join('\n\n'));
     } else if (intent.type === 'APPROVE' || intent.type === 'REJECT') {
-      if (pending?.status === 'PENDING') await this.applyApproval(s, pending, intent, (session, active, prompt, previous) =>
+      if (pending?.status === 'PENDING') await this.applyApproval(s, pending, intent, this.channel(s), (session, active, prompt, previous) =>
         this.run(session, active, prompt, discussion ? [discussion] : [], previous));
     } else if (['PLAN', 'ABORT', 'RESET'].includes(intent.type)) {
       if (intent.type !== 'PLAN') await this.stop(s);
@@ -221,7 +221,8 @@ export class MergeRequestOrchestrator extends TurnRuntime {
       const plan = s.permissionMode === 'plan';
       const resume = !!s.claudeSessionId && s.lastMessageSeq > 0;
       s.claudeSessionId ??= randomUUID();
-      const footer = s.activeNoteId ? '' : '\n\n> 💡 已接管此 MR · 发 `/plan` 可先审方案 · 发 `/help` 查看指令 · 移出 Assignee 即可交回人工';
+      const takenOver = !s.activeNoteId && !(await this.repo.findMergeRequest(s.hubProjectId, mr.iid)).length;
+      const footer = takenOver ? '\n\n> 💡 已接管此 MR · 发 `/plan` 可先审方案 · 发 `/help` 查看指令 · 移出 Assignee 即可交回人工' : '';
       const note = await channel.createNote('正在检查 MR…' + footer);
       s.activeNoteId = note.id;
       s.status = plan ? 'PLANNING' : 'CODING';
@@ -229,6 +230,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
         permissionMode: s.permissionMode, claudeSessionId: s.claudeSessionId });
       streamer = new NoteStreamer(this.config.noteStreamThrottleMs, body => channel.updateNote(note.id, body + footer), async () => '', secrets);
       sandbox = await host.prepareTurnSandbox(s);
+      streamer.scopeWorkspace(sandbox.workspaceRoot);
       const tree = await host.ensureMrWorktree(sandbox, s.id, { sourceProjectId: mr.source_project_id, sourceBranch: mr.source_branch, targetBranch: mr.target_branch });
       const transcript = new TranscriptHydrator(this.repo, this.secrets);
       const { workspaceRoot, claudeHome } = sandbox;
@@ -269,7 +271,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
         await this.repo.updateApprovalNoteId(card.id, note.id);
         s.status = 'WAITING_PLAN';
         await this.repo.updateSessionState(s.id, { status: s.status });
-        await streamer.flush(renderPlanApprovalCard(result));
+        await streamer.flush(renderPlanApprovalCard(result, card.id));
       } else {
         discussionReply = await streamer.flush(result);
         s.status = 'IDLE';
@@ -289,7 +291,7 @@ export class MergeRequestOrchestrator extends TurnRuntime {
           const stopped = cause instanceof StopTurn;
           s.status = stopped ? 'IDLE' : 'FAILED';
           await this.repo.updateSessionState(s.id, { status: s.status });
-          const body = stopped ? '本轮已中止。' : redact('本轮执行失败：' + String(cause)) + recoveryHint;
+          const body = stopped ? '本轮已中止。' : formatUserError(cause, secrets);
           if (streamer) await streamer.flush(body);
           else await channel.createNote(body);
         }

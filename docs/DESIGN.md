@@ -134,7 +134,9 @@ export interface ExtensionToolContext {
   repo: DetentRepository;
   workspaceRoot: string;
   permissionMode: PermissionMode;
+  workflow?: WorkflowToolConfig;
   approvalId?: string;
+  approvedBy?: string;
   profileName?: string;
 }
 
@@ -148,6 +150,8 @@ export interface DetentExtensionTool<TSchema extends z.ZodRawShape = z.ZodRawSha
    * - always_approve: plan 阶段禁止，coding 阶段强制弹出 GitLab Issue 审批卡片（如生产变更执行）
    */
   policy: ToolGovernancePolicy;
+  directExecuteOnApproval?: 'handoff' | 'resume';
+  formatDirectResult?: (result: unknown, input: z.infer<z.ZodObject<TSchema>>, ctx: ExtensionToolContext) => string;
   /**
    * 只读与自动工具在 preflight 中校验一次。强制审批工具在发卡前与批准后各校验一次。
    * 返回 { ok: false, reason } 时直接拒绝，哪怕 LLM 幻觉想跳过前置步骤也无法绕过。
@@ -162,6 +166,8 @@ export interface DetentExtensionTool<TSchema extends z.ZodRawShape = z.ZodRawSha
 ```
 
 使用 `defineExtensionTool({ schema, ... })` 定义每个工具，回调的入参类型从该工具的 Zod Schema 推导。返回的工具可放入同一个 `readonly AnyDetentExtensionTool[]`。对于获批的 `always_approve` 调用，执行前复检和执行函数均收到对应审批记录的 `ctx.approvalId`。
+
+人工批准后，Issue 编排器在租约内重新加载当前能力和轮次角色，检查非只读、工具白名单、审批人权限、原参数的 Zod Schema 及实时 guard。声明 `directExecuteOnApproval` 的工具须能以空工作区执行。异步 `handoff` 更新 IDLE、标签与进度评论，并在原租约下检查收件箱。同步 `resume` 将脱敏的结构化执行结果交给模型，新的工具调用仍需独立授权。未声明的工具沿用冷恢复路径。Plan 与工具裁决会尽力在原 GitLab 评论追加结果、操作者和拒绝原因。
 
 #### 扩展点 2：外部 Webhook 事件扩展与受控会话唤醒（`resumeSession`）
 - `SessionOrchestrator.resumeSession(sessionId: string, prompt: string, options?: { permissionMode?: PermissionMode; beforeRun?: (session: IssueSessionRow) => Promise<boolean> })`：
@@ -265,6 +271,8 @@ sequenceDiagram
 | `jms_job_status` | Hub AccessKey | `readonly` | 必须由 tracker 确认本 Session 拥有任务 ID；未配置则拒绝 | 按需查询 JumpServer 任务中心执行状态、标准输出摘要及 JumpServer Web 审计链接 |
 
 环境变更 SOP 的验收点包括异步提交、回调核验和关单。终态与 `callback_pending` 在同一次更新中提交。投递失败后重新扫描终态行并使用已保存的摘要，收件箱按会话和事件 ID 去重。
+
+同一 Delivery 实例的能力解析和任务扫描共享 HTTP 客户端，最多缓存 16 个连接配置。URL、组织、认证信息和超时决定配置指纹。客户端复用节点、账号与端点探测结果，并行读取多个资产的账号。任务按 `DELIVERY_JOB_POLL_INTERVAL_MS` 固定周期扫描，设为 0 时停用。
 
 Stage 3 通过 `createDeliveryApp(config, options)` 装配。Hub 配置服务地址和 `auth` 后启用四个工具。默认使用同一 AccessKey 做 HMAC-SHA256 签名。未配置 Hub 条目的旧部署仍可使用环境变量为两个角色分别指定凭证。巡检与 Playbook 均校验资产账号，并发送 `runas` 和 `runas_policy=skip`。
 
@@ -470,7 +478,7 @@ MR 轮次可用 Read、Glob、Grep、Edit、Write、Bash、AskUserQuestion，以
 
 每次失败流水线先更新关联 MR 记录，再检查 MR 状态、提交 SHA 和首条命中策略。缺省时自动修复已分配的 MR，向未分配 MR 关联的 Hub Issue 通知失败。自动修复额度与待处理消息在同一事务内持久化，达到上限后在 MR 和关联工单请求人工介入。成功流水线与有效用户评论重置额度。没有匹配 MR 的流水线依 Hub 策略通知或启动 Hub Issue。
 
-MR 完结时终止活跃轮次、作废审批、归档工作树并置 DONE。合并事件的扩展处理器使用独立队列键和事件 ID，关联 Hub Issue 可继续执行原流程。
+MR 完结时终止活跃轮次、作废审批、归档工作树并置 DONE。合并事件的扩展处理器使用独立队列键和事件 ID。关联 Hub 会话在租约内标记 MR 并归档没有其他打开 MR 共享的工作树。纯代码交付在最后一个 MR 合并时唤醒，部署流程在每次合并时唤醒。沙箱并行克隆 Hub 和活跃工作树，所有还原任务结束后统一清理失败目录。
 
 ### V6 MySQL upgrade
 
@@ -503,9 +511,11 @@ ALTER TABLE issue_sessions DROP INDEX hub_project_id,
 
 `WATCHDOG_INTERVAL_MS` 默认为 30000，启用时至少 15000，设为 0 关闭。每个实例在基础间隔上加小于 10% 的随机抖动。`WATCHDOG_MAX_RECOVERIES` 默认为 1（0–5），`MR_MAX_AUTO_FIX_ATTEMPTS` 默认为 3（0–10），匹配规则中的 `maxAutoFixAttempts` 可覆盖该 MR 修复额度。
 
+工具轨迹使用沙箱相对路径，展示 MCP 文本结果，遇到审批或中断时收口未完成步骤。占位评论指向下方新卡，后续状态查询指向上方已有卡。常规评论保留关联 MR，/status 与系统提示保留工作树。流水线订阅尽量链接到项目流水线或 ref。外部 MR 的首条工作评论显示接管提示，Hub 自建的 MR 通过其关联记录识别。
+
 ### 8.2 Stage 12 验收
 
-Issue 和 MR 的 NoteStreamer 按调用 ID 在折叠轨迹中逐步更新内置工具、工作区工具与 MCP 扩展的参数和结果（含错误与拒绝原因）。路径保留原样，每次读取单列一步，工具名仅去除前缀 `mcp__detent__`。参数与结果先脱敏再截至 300 字符。超过 60 步时展示首尾各 30 步及省略数量。MR 场景按源分支提交、原讨论串回复及 MySQL 会话终态验收。流水线失败时通过 GitLab API 查询任务与日志。轮中评论通过 PostToolUse 进入当前轮次，以同一轮提交验证处理结果。部署失败按 Hub 策略创建带标签的告警 Issue。
+Issue 和 MR 的 NoteStreamer 按调用 ID 在折叠轨迹中逐步更新内置工具、工作区工具与 MCP 扩展的参数和结果（含错误与拒绝原因）。每次读取单列一步，工具名仅去除前缀 `mcp__detent__`。参数与结果先脱敏再截取 300 字符。超过 60 步时展示首尾各 30 步及省略数量。MR 场景按源分支提交、原讨论串回复及 MySQL 会话终态验收。流水线失败时通过 GitLab API 查询任务与日志。轮中评论通过 PostToolUse 进入当前轮次，以同一轮提交验证处理结果。部署失败按 Hub 策略创建带标签的告警 Issue。
 
 ## Stage 13–14 · 安装、帮助与仓库接入
 

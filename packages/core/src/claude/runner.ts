@@ -10,7 +10,7 @@ import type { AppConfig } from '../config.js';
 import { formatInboxMessages } from '../orchestrator/turn-runtime.js';
 import type { IssueSessionRow, SessionInboxRow } from '../types.js';
 import type { TurnSandbox } from '../workspace/ephemeral-sandbox.js';
-import { schemas, type ToolName, type WorkspaceTools } from '../workspace/mcp-tools.js';
+import { schemas, toolDescriptions, type ToolName, type WorkspaceTools } from '../workspace/mcp-tools.js';
 import { ColdHold, ToolDenied, type PermissionGate } from './permission-gate.js';
 
 const textDelta = z.object({
@@ -41,7 +41,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
     const secrets = configuredSecrets(this.config);
     const redact = (value: string) => redactGitUrl(value, secrets);
     const id = session.claudeSessionId!;
-    const trace = new ToolTrace(t.progress, redact);
+    const trace = new ToolTrace(t.progress, redact, sandbox.workspaceRoot);
     const failed = new Set<string>();
     const calls = new Map<string, { name: string; input: unknown }>();
     const canUseTool = async (name: string, input: Record<string, unknown>, step = trace.handler(name, input)) => {
@@ -67,7 +67,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
         const message = error instanceof Error ? error.message : String(error);
         if (!failed.has(step.id)) {
           const prefix = error instanceof ColdHold ? '' : error instanceof ToolDenied ? '⛔ 已拦截：' : '❌ ';
-          trace.update(step, message, prefix);
+          trace.update(step, error instanceof ColdHold ? '⏸️ 等待审批' : message, prefix);
         }
         failed.add(step.id);
         if (error instanceof ColdHold || error instanceof ToolDenied)
@@ -77,7 +77,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
     };
     const tools: McpTool[] = [
       ...(t.allowedWorkspaceTools ?? Object.keys(schemas) as ToolName[]).map((name): McpTool => ({
-        name, description: 'GitLab workspace: ' + name, inputSchema: schemas[name],
+        name, description: toolDescriptions[name], inputSchema: schemas[name],
         handler: (input, extra) => invoke(name, extra, async step => {
           const decision = await canUseTool(name, input, step);
           if (decision.behavior === 'deny') throw new ToolDenied(decision.message);
@@ -90,7 +90,7 @@ export class SdkClaudeRunner implements ClaudeRunner {
         handler: (input, extra) => invoke(extension.name, extra, () => gate.invokeExtension(id, input)),
       })),
       {
-        name: 'AskUserQuestion', description: 'Ask a question on GitLab',
+        name: 'AskUserQuestion', description: '在 GitLab 询问缺失的关键信息，等待用户直接回复。',
         inputSchema: { questions: z.array(z.object({ question: z.string() })).min(1) },
         handler: (input, extra) => invoke('AskUserQuestion', extra, async step => {
           const decision = await canUseTool('AskUserQuestion', input, step);
@@ -240,17 +240,18 @@ export class SdkClaudeRunner implements ClaudeRunner {
       }
       t.controller.signal.throwIfAborted();
       if (resultText === undefined) throw Error('Claude ended without a result');
-      return redact(resultText);
+      return trace.redact(resultText);
     } catch (error) {
       if (t.controller.signal.reason instanceof ColdHold) throw t.controller.signal.reason;
       const original = error instanceof Error ? error.message : String(error);
-      const detail = t.controller.signal.aborted ? original : diagnostic.trim() || original;
-      throw Error(redact(detail));
+      const detail = t.controller.signal.aborted || /error_max_turns|Claude ended without a result/.test(original) ? original : diagnostic.trim() || original;
+      throw Error(trace.redact(detail));
     } finally {
       model?.close();
       clearTimeout(shutdown);
       if (interrupt) t.controller.signal.removeEventListener('abort', interrupt);
       await mcp?.close();
+      trace.finish(t.controller.signal.reason instanceof ColdHold);
     }
   }
 }

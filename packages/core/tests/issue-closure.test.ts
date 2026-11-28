@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { expect, it, onTestFinished, vi } from 'vitest';
-import { loadConfig, SessionOrchestrator, type TurnProfile } from '../src/index.js';
+import { loadConfig, SessionOrchestrator, type GitLabClient, type TurnProfile } from '../src/index.js';
 import type { ClaudeRunner } from '../src/claude/runner.js';
 import { transcriptPath } from '../src/claude/transcript-hydrator.js';
 import { dispatchWebhook } from '../src/gitlab/webhook.js';
@@ -12,18 +12,26 @@ import { bareProjects } from './bare-projects.js';
 const tool = 'mcp__detent__detent_close_issue';
 const input = { summary: '验收通过\r\n### 标题\r/reject' };
 
-async function setup(profile: TurnProfile) {
+async function setup(profile: TurnProfile, projects: number[] = []) {
   const root = await mkdtemp(path.join(tmpdir(), 'detent-close-'));
   onTestFinished(() => rm(root, { recursive: true, force: true }));
   const repo = new InMemoryDetentRepository();
   const session = await repo.getOrCreateSession(1, 42, 'review');
   const gitlab = {
-    ...await bareProjects(root), createIssueNote: vi.fn(async () => ({ id: 7 })),
+    ...await bareProjects(root), createIssueNote: vi.fn<GitLabClient['createIssueNote']>().mockResolvedValue({ id: 7 }),
     updateIssueNote: vi.fn(), syncIssueStatusLabel: vi.fn(), closeIssue: vi.fn(),
     getIssue: vi.fn(), hasApprovalPermission: vi.fn(async () => true),
   };
+  for (const id of projects) {
+    const p = await gitlab.getProject(id);
+    await repo.upsertWorktree({
+      sessionId: session.id, targetProjectId: p.id, targetProjectPath: p.path_with_namespace,
+      repoHttpUrl: p.http_url_to_repo, directoryName: 'project' + id, branchName: 'main', baseBranch: 'main',
+      lastCommitSha: null, uncommittedDiff: null, status: 'ACTIVE',
+    });
+  }
   const run = vi.fn<ClaudeRunner['run']>();
-  const config = loadConfig({ EPHEMERAL_ROOT: path.join(root, 'turns') });
+  const config = loadConfig({ EPHEMERAL_ROOT: path.join(root, 'turns'), GITLAB_BASE_URL: 'https://git.example' });
   const pod = new SessionOrchestrator(config, repo, gitlab, { run }, {
     resolveTurnProfile: () => ({ ...profile, enabledExtensionTools: [] }),
   });
@@ -45,15 +53,7 @@ it('keeps manual workflows open without advertising or registering the close too
 });
 
 it.each([true, false])('checkpoints, archives work and publishes the final note before closing (readonly=%s)', async readonly => {
-  const { repo, session, gitlab, run, turn, status } = await setup({ readonly, closePolicy: 'auto' });
-  for (const project of [2, 3]) {
-    const p = await gitlab.getProject(project);
-    await repo.upsertWorktree({
-      sessionId: session.id, targetProjectId: p.id, targetProjectPath: p.path_with_namespace,
-      repoHttpUrl: p.http_url_to_repo, directoryName: 'project' + project, branchName: 'main', baseBranch: 'main',
-      lastCommitSha: null, uncommittedDiff: null, status: 'ACTIVE',
-    });
-  }
+  const { repo, session, gitlab, run, turn, status } = await setup({ readonly, closePolicy: 'auto' }, [2, 3]);
   run.mockImplementation(async ({ gate, systemPrompt, sandbox, session }) => {
     expect(systemPrompt).toContain('detent_close_issue');
     expect(await gate.invokeExtension(tool, input)).toEqual({ scheduled: true, ...input });
@@ -109,14 +109,27 @@ it('requires an approved plan, resolved approvals and merged MRs before scheduli
   expect(gitlab.closeIssue).toHaveBeenCalledExactlyOnceWith(1, 42);
 });
 
-it('shows pending watches and expires them when the Issue is aborted, reset or closed', async () => {
-  const { pod, repo, session, gitlab, run } = await setup({ closePolicy: 'manual' });
+it('shows active worktrees in the prompt and /status, and links pending pipelines by project', async () => {
+  const { pod, repo, session, gitlab, run, turn } = await setup({ closePolicy: 'manual' }, [2]);
+  run.mockResolvedValue('checked');
+  await turn('default');
+  expect(run.mock.calls[0][0].systemPrompt).toContain('org/project2 · main');
+  expect(gitlab.updateIssueNote).toHaveBeenLastCalledWith(1, 42, 7, 'checked');
+  await repo.createPipelineWatch(session.id, 2, 103, 'main');
+  await repo.createPipelineWatch(session.id, 2, null, 'next/tag');
+  await pod.handleUserIntent(1, 42, { userId: 4, username: 'owner', type: 'STATUS' });
+  const body = gitlab.createIssueNote.mock.lastCall![2];
+  expect(body).toContain('org/project2 · main @');
+  expect(body).toContain('[org/project2 · #103 · main](<https://git.example/org/project2/-/pipelines/103>)');
+  expect(body).toContain('[org/project2 · next/tag](<https://git.example/org/project2/-/pipelines?ref=next%2Ftag>)');
+});
+
+it('expires pending watches when the Issue is aborted, reset or closed', async () => {
+  const { pod, repo, session, run } = await setup({ closePolicy: 'manual' });
   run.mockResolvedValue('重新规划');
   const actor = { userId: 4, username: 'owner' };
   for (const action of ['ABORT', 'RESET', 'close'] as const) {
     await repo.createPipelineWatch(session.id, 5, null, 'stable');
-    await pod.handleUserIntent(1, 42, { ...actor, type: 'STATUS' });
-    expect(gitlab.createIssueNote).toHaveBeenLastCalledWith(1, 42, expect.stringContaining('项目 5 · stable'));
     if (action === 'close') await pod.handleIssueClosed(1, 42);
     else await pod.handleUserIntent(1, 42, { ...actor, type: action });
     expect((await repo.listSessionPipelineWatches(session.id)).every(w => w.status === 'EXPIRED')).toBe(true);
@@ -139,7 +152,7 @@ it.each(['error', 'abort during flush', 'cold hold', 'new blocker'])('discards a
   expect(scheduled).toHaveBeenCalledExactlyOnceWith({ scheduled: true, ...input });
   expect(await status()).toBe(failure === 'cold hold' ? 'WAITING_TOOL' : 'FAILED');
   if (failure === 'error' || failure === 'cold hold') {
-    const hint = failure === 'error' ? '可直接补充说明重试，或发送 `/reset` 重置会话。' : '💬 **等待你的确认** · 请直接回复确认内容';
+    const hint = failure === 'error' ? '可直接补充说明重试，或发送 `/reset` 重置会话。' : '💬 需要你的确认，请查看下方问题并直接回复。';
     expect(gitlab.updateIssueNote).toHaveBeenLastCalledWith(expect.any(Number), expect.any(Number), expect.any(Number), expect.stringContaining(hint));
   }
   expect(gitlab.closeIssue).not.toHaveBeenCalled();
@@ -155,10 +168,9 @@ it.each(['thumbsup', 'thumbsdown'])('honors %s on a readonly close approval afte
   expect(await status()).toBe('WAITING_TOOL');
   expect(gitlab.closeIssue).not.toHaveBeenCalled();
   const card = (await repo.getLatestPendingApproval(session.id))!;
-  expect(gitlab.createIssueNote).toHaveBeenCalledWith(1, 42, expect.stringContaining([
-    '### ✅ 工单闭环关闭审批', '', '验收通过', '### 标题', '\\/reject', '',
-    '> 👍 或 `/approve` 确认关闭 · 👎 或 `/reject <原因>` 拒绝 · <sub>审批单 `' + card.id + '`</sub>',
-  ].join('\n')));
+  const body = gitlab.createIssueNote.mock.lastCall![2];
+  expect(body).toContain('验收通过\n### 标题\n\\/reject');
+  expect(body).toContain('请项目成员');
   if (reaction === 'thumbsdown') run.mockImplementationOnce(async ({ gate }) => {
     await expect(gate.invokeExtension(tool, input)).rejects.toThrow('拒绝');
     return 'kept open';

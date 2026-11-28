@@ -5,7 +5,7 @@ import { appendFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { expect, it, onTestFinished, vi } from 'vitest';
-import { createWebhookApp, loadConfig, SessionOrchestrator } from '@detent/core';
+import { createWebhookApp, defineExtensionTool, loadConfig, SessionOrchestrator, type DetentExtensions } from '@detent/core';
 import type { TurnInput } from '../../core/src/claude/runner.js';
 import { transcriptPath } from '../../core/src/claude/transcript-hydrator.js';
 import { dispatchWebhook } from '../../core/src/gitlab/webhook.js';
@@ -24,7 +24,7 @@ const merge = {
   object_attributes: { iid: 5, action: 'merge', state: 'merged', merge_commit_sha: sha, last_commit: { id: 'different' } },
 };
 
-async function setup() {
+async function setup(extensions: DetentExtensions = {}) {
   const root = await mkdtemp(path.join(tmpdir(), 'detent-mr-'));
   onTestFinished(() => rm(root, { recursive: true, force: true }));
   const config = loadConfig({ EPHEMERAL_ROOT: path.join(root, 'turns'), GITLAB_WEBHOOK_SECRET: 'test' });
@@ -45,7 +45,7 @@ async function setup() {
     return 'done';
   }
   const run = vi.fn(recordTurn);
-  const orchestrator = new SessionOrchestrator(config, repo, gitlab, { run });
+  const orchestrator = new SessionOrchestrator(config, repo, gitlab, { run }, extensions);
   const report = vi.fn();
   const clientForMr = Object.assign(new GitLabClient(config, async () => { throw Error('Unexpected GitLab API call'); }), gitlab);
   const mrs = new MergeRequestOrchestrator(config, repo, clientForMr, { run }, { runHubEvent: vi.fn(), wakeQueuedIssue: orchestrator.wakeQueuedIssue.bind(orchestrator) });
@@ -79,7 +79,7 @@ async function setup() {
     return mr;
   }
   const mergeNotes = () => gitlab.createIssueNote.mock.calls.filter(([, , body]) => body.startsWith('✅ 关联 MR'));
-  return { post, queue, session, repo, run, approveAndCreateMr, mergeNotes };
+  return { post, queue, session, repo, run, gitlab, approveAndCreateMr, mergeNotes };
 }
 
 it('records a cross-project merge and resumes the approved Claude session once across distinct deliveries', async () => {
@@ -97,7 +97,7 @@ it('records a cross-project merge and resumes the approved Claude session once a
   expect((await repo.getSession(worker.id))?.status).toBe('DONE');
   expect(mark).toHaveBeenCalledExactlyOnceWith(mr.id, sha, user.username);
   expect(mergeNotes()).toEqual([[hub.id, issue.iid,
-    `✅ 关联 MR [org/project2!5](<${url}>) 已由 @maintainer 合并 (commit 1234abcd)，正在自动恢复变更会话…`]]);
+    `✅ 关联 MR [org/project2!5](<${url}>) 已由 @maintainer 合并 (commit 1234abcd)。正在自动恢复变更会话…`]]);
   expect(run).toHaveBeenCalledTimes(3);
   const [turn] = run.mock.calls[2];
   expect(turn).toMatchObject({
@@ -107,6 +107,41 @@ it('records a cross-project merge and resumes the approved Claude session once a
   expect(turn.systemPrompt).toContain('已获方案审批');
   for (const value of ['org/project2!5', url, 'change-42', 'main', '@maintainer', sha])
     expect(turn.prompt).toContain(value);
+});
+
+it.each(['code', 'shared worktree', 'deployment'] as const)('archives and wakes the right multi-MR session for %s', async mode => {
+  const job = defineExtensionTool({ name: 'jms_job', description: '部署', schema: {}, policy: 'always_approve', execute: vi.fn() });
+  const { post, queue, session, repo, run, gitlab, approveAndCreateMr, mergeNotes } = await setup({
+    tools: [job], resolveTurnProfile: () => ({ enabledExtensionTools: mode === 'deployment' ? [job.name] : [] }),
+  });
+  const first = await approveAndCreateMr();
+  async function createTree(id: number) {
+    const project = await gitlab.getProject(id);
+    return repo.upsertWorktree({ sessionId: session.id, targetProjectId: id, targetProjectPath: project.path_with_namespace,
+      directoryName: 'project-' + id, repoHttpUrl: project.http_url_to_repo, branchName: 'main', baseBranch: 'main',
+      lastCommitSha: null, uncommittedDiff: null, status: 'ACTIVE' });
+  }
+  const firstTree = await createTree(2);
+  const nextTree = mode === 'shared worktree' ? firstTree : await createTree(3);
+  await repo.upsertMergeRequest({ ...first, worktreeId: firstTree.id });
+  await repo.upsertMergeRequest({ ...first, targetProjectId: nextTree.targetProjectId, targetProjectPath: nextTree.targetProjectPath,
+    mrIid: 6, mrWebUrl: 'https://git/org/other/-/merge_requests/6', worktreeId: nextTree.id });
+  const before = (await repo.getSession(session.id))!;
+  await post(merge);
+  await queue.drain();
+  expect(await repo.findMergeRequest(2, 5)).toMatchObject([{ mrState: 'merged' }]);
+  expect(await repo.findWorktree(session.id, 2, 'main')).toMatchObject({ status: mode === 'shared worktree' ? 'ACTIVE' : 'ARCHIVED' });
+  expect(await repo.listActiveWorktrees(session.id)).toMatchObject([{ id: nextTree.id }]);
+  expect(run).toHaveBeenCalledTimes(mode === 'deployment' ? 3 : 2);
+  if (mode !== 'deployment') {
+    expect(await repo.getSession(session.id)).toMatchObject({ activeNoteId: before.activeNoteId, lastMessageSeq: before.lastMessageSeq, lockedByPod: null });
+    expect(mergeNotes().at(-1)![2]).toContain('还有 1 个关联 MR 待合并');
+  }
+  await post({ ...merge, project: { id: nextTree.targetProjectId }, object_attributes: { ...merge.object_attributes, iid: 6 } });
+  await queue.drain();
+  expect(run).toHaveBeenCalledTimes(mode === 'deployment' ? 4 : 3);
+  expect(await repo.listActiveWorktrees(session.id)).toEqual([]);
+  expect(await repo.findMergeRequest(nextTree.targetProjectId, 6)).toMatchObject([{ mrState: 'merged' }]);
 });
 
 it('ignores a blank username and uses the stored MR URL when the webhook URL is unsafe', async () => {

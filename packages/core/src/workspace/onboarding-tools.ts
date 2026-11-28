@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { defineExtensionTool, type DetentCapabilityPack } from '../extensions.js';
 import { GitLabError, type GitLabClient } from '../gitlab/client.js';
-import { escapeTableCell } from '../gitlab/note-streamer.js';
+import { escapeTableCell, renderApprovalCard } from '../gitlab/note-streamer.js';
 
 interface TargetProject { id: number; path_with_namespace: string; default_branch?: string; web_url?: string }
 export interface OnboardingGitLab extends Pick<GitLabClient, 'getProjectMemberAccess' | 'getGroupMemberAccess' | 'createProject' | 'listProjectHooks' | 'upsertProjectHook'> {
@@ -25,6 +25,9 @@ const setupHint = '请配置 DETENT_PUBLIC_URL 与 GITLAB_WEBHOOK_SECRET 以启�
 
 export function createGitLabOnboardingTools({ gitlab, publicUrl, webhookSecret, sslVerify }: Options) {
   const webhookUrl = publicUrl + '/webhooks/gitlab';
+  const hookRows: [string, string][] = [['回调地址', escapeTableCell(webhookUrl, 'code')],
+    ['订阅事件', eventNames.map(name => escapeTableCell(name, 'code')).join('、')]];
+  const approverHint = '生产审批人（Maintainer 或指定负责人）';
   async function inspect({ project, group }: Targets) {
     if (!publicUrl || !webhookSecret) throw Error(setupHint);
     if (project === undefined && group === undefined) throw Error('请填写目标项目或群组的路径或 ID。');
@@ -105,7 +108,7 @@ export function createGitLabOnboardingTools({ gitlab, publicUrl, webhookSecret, 
     }),
     defineExtensionTool({
       name: 'detent_onboard_project', description: '经生产审批后为项目或群组中的活跃项目配置 GitLab Webhook',
-      policy: 'always_approve', schema,
+      policy: 'always_approve', directExecuteOnApproval: 'resume', schema,
       async guard(input) {
         try {
           await writable(input);
@@ -117,14 +120,10 @@ export function createGitLabOnboardingTools({ gitlab, publicUrl, webhookSecret, 
       async renderApprovalCard(id, input) {
         const { rows } = await writable(input);
         const paths = rows.slice(0, 12).map(p => escapeTableCell(p.path, 'code')).join('、');
-        return [
-          '### GitLab 仓库接入审批',
-          input.group !== undefined && '群组范围（含子群组，执行时复核活跃项目）：' + escapeTableCell(String(input.group), 'code'),
-          '目标项目：' + paths + (rows.length > 12 ? '…（共 ' + rows.length + ' 个）' : ''),
-          '回调地址：' + escapeTableCell(webhookUrl, 'code'),
-          '订阅事件：' + eventNames.map(name => escapeTableCell(name, 'code')).join('、'),
-          '> 👍 或 `/approve` 放行 · 👎 或 `/reject` 拒绝 · <sub>审批单 `' + id + '`</sub>',
-        ].filter(Boolean).join('\n\n');
+        const targets: [string, string][] = [];
+        if (input.group !== undefined) targets.push(['群组范围（含子群组）', escapeTableCell(String(input.group), 'code')]);
+        targets.push(['目标项目', paths + (rows.length > 12 ? '…（共 ' + rows.length + ' 个）' : '')]);
+        return renderApprovalCard({ icon: '🔗', title: 'GitLab 仓库接入审批', approvalId: id, approverHint, rows: [...targets, ...hookRows] });
       },
       async execute(input, ctx) {
         if (!ctx.approvalId) throw Error('仓库接入缺少审批单。');
@@ -147,7 +146,7 @@ export function createGitLabOnboardingTools({ gitlab, publicUrl, webhookSecret, 
     defineExtensionTool({
       name: 'detent_create_project',
       description: '经生产审批后在指定 GitLab 群组中创建新私有仓库（初始化默认分支 main）并自动配置 Detent Webhook',
-      policy: 'always_approve',
+      policy: 'always_approve', directExecuteOnApproval: 'resume',
       schema: {
         group: ref,
         path: z.string().trim().min(1).max(128).regex(/^[a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?$/)
@@ -167,15 +166,9 @@ export function createGitLabOnboardingTools({ gitlab, publicUrl, webhookSecret, 
       async renderApprovalCard(id, input) {
         const { groupPath, fullPath } = await prepareCreate(input);
         await requireAvailable(fullPath);
-        return [
-          '### GitLab 新建仓库审批',
-          '目标群组：' + escapeTableCell(groupPath, 'code'),
-          '新仓库路径：' + escapeTableCell(fullPath, 'code'),
-          '默认分支：`main`（私有仓库，初始化基础 `README.md`）',
-          '回调地址：' + escapeTableCell(webhookUrl, 'code'),
-          '订阅事件：' + eventNames.map(name => escapeTableCell(name, 'code')).join('、'),
-          '> 👍 或 `/approve` 放行 · 👎 或 `/reject` 拒绝 · <sub>审批单 `' + id + '`</sub>',
-        ].join('\n\n');
+        return renderApprovalCard({ icon: '📁', title: 'GitLab 新建仓库审批', approvalId: id, approverHint, rows: [
+          ['目标群组', escapeTableCell(groupPath, 'code')], ['新仓库路径', escapeTableCell(fullPath, 'code')],
+          ['默认分支', '`main`（私有仓库，初始化 `README.md`）'], ...hookRows] });
       },
       async execute(input, ctx) {
         if (!ctx.approvalId) throw Error('新建仓库缺少审批单。');

@@ -6,7 +6,7 @@ import type { DetentRepository } from '../db/repository.js';
 import type { AnyDetentExtensionTool, DetentCapabilityPack, ExtensionToolContext, SessionLifecycleHooks, TurnProfile } from '../extensions.js';
 import type { GitLabClient } from '../gitlab/client.js';
 import { configuredSecrets } from '../gitlab/redact.js';
-import { renderNote, renderStatus, renderToolApprovalCard } from '../gitlab/note-streamer.js';
+import { renderNote, renderToolApprovalCard } from '../gitlab/note-streamer.js';
 import type { ApprovalRequestRow, IssueSessionRow } from '../types.js';
 import { contained } from '../workspace/contained-path.js';
 import { validateLocalSandboxBash } from '../decision/bash-guard.js';
@@ -21,7 +21,8 @@ const deny = (message: string): PermissionResult => ({ behavior: 'deny', message
 export class ToolDenied extends Error {}
 export class ColdHold extends Error {
   constructor(pending: ApprovalRequestRow) {
-    super(renderStatus('WAITING_TOOL', pending));
+    super(pending.approvalType === 'ASK_USER' ? '💬 需要你的确认，请查看下方问题并直接回复。' :
+      '📋 已提交操作审批，请在下方的审批卡中点 👍 放行或 👎 拒绝。');
   }
 }
 const fileTools = new Set(['Read', 'Edit', 'Write', 'Glob', 'Grep']);
@@ -194,8 +195,10 @@ export class PermissionGate {
       input,
     );
     try {
+      const requireProd = this.ctx.profile?.workflow?.approverTier === 'prod' || !!extension &&
+        this.ctx.capabilities?.some(pack => pack.enabled && pack.approverTier === 'prod' && pack.tools.includes(extension));
       const card = await extension?.renderApprovalCard?.(a.id, input, { ...this.extensionContext })
-        ?? renderToolApprovalCard(a);
+        ?? renderToolApprovalCard(a, requireProd ? '生产审批人' : '项目成员');
       const note = await this.channel.createNote(renderNote(card, this.secrets));
       await repo.updateApprovalNoteId(a.id, note.id);
     } catch (error) {

@@ -318,8 +318,9 @@ export class HttpJumpServerClient implements JumpServerClient {
   private async resolveAccountGroups(assetIds: string[], account: string | undefined, auth: JumpServerAuth, signal: AbortSignal) {
     if (!assetIds.length) throw Error('必须指定目标资产');
     const groups = new Map<string, string[]>();
-    for (const id of new Set(assetIds)) {
-      const accounts = await this.listAssetAccounts(id, auth, signal);
+    const accountsByAsset = await Promise.all([...new Set(assetIds)].map(async id =>
+      [id, await this.listAssetAccounts(id, auth, signal)] as const));
+    for (const [id, accounts] of accountsByAsset) {
       if (!accounts.length) throw Error(`资产 ${id} 在 JumpServer 中未给当前 API Key 授权任何登录账号`);
       const selected = account ?? accounts[0];
       if (!accounts.includes(selected))

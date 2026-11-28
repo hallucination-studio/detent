@@ -25,6 +25,7 @@ export interface ExtensionToolContext {
   workspaceRoot: string;
   permissionMode: PermissionMode;
   approvalId?: string;
+  approvedBy?: string;
   profileName?: string;
 }
 
@@ -34,6 +35,8 @@ export interface DetentExtensionTool<S extends z.ZodRawShape = z.ZodRawShape> {
   description: string;
   schema: S;
   policy: ToolGovernancePolicy;
+  directExecuteOnApproval?: 'handoff' | 'resume';
+  formatDirectResult?: (result: unknown, input: ToolInput<S>, ctx: ExtensionToolContext) => string;
   guard?: (input: ToolInput<S>, ctx: ExtensionToolContext) => Promise<{ ok: true } | { ok: false; reason: string }>;
   renderApprovalCard?: (approvalId: string, input: ToolInput<S>, ctx: ExtensionToolContext) => string | Promise<string>;
   execute: (input: ToolInput<S>, ctx: ExtensionToolContext) => Promise<unknown>;

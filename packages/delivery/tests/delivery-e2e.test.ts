@@ -120,11 +120,6 @@ it('governs Issue #88 through inspection, Plan, MR !205, production approval, ex
       await gate.invokeExtension('mcp__detent__jms_job', job);
       throw Error('Expected production approval hold');
     })
-    .mockImplementationOnce(async ({ gate }) => {
-      const result = await gate.invokeExtension('mcp__detent__jms_job', job);
-      expect(result).toMatchObject({ jobId: 'job-88', status: 'PENDING', asyncCallback: true });
-      return 'Submitted https://jms.test/job-88';
-    })
     .mockImplementationOnce(async ({ gate, prompt }) => {
       expect(prompt).toContain('nginx reloaded');
       expect(await gate.invokeExtension('mcp__detent__jms_shell', inspect)).toMatchObject({ outputSummary: 'active' });
@@ -177,6 +172,8 @@ it('governs Issue #88 through inspection, Plan, MR !205, production approval, ex
   expect(client.runAnsibleJob).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ commitSha: job.commit_sha, playbookPath: playbook }));
   expect(await repo.getApproval(approval.id)).toMatchObject({ status: 'APPROVED', decidedBy: maintainer.username });
   expect(rows[0].status).toBe('PENDING');
+  expect(run).toHaveBeenCalledTimes(3);
+  expect(notes.at(-1)).toContain('https://jms.test/job-88');
   expect(client.getJobResult).not.toHaveBeenCalled();
   const poller = new DeliveryJobPoller({
     auditRepo: tracker, resolveClient: () => client, report,
@@ -198,7 +195,7 @@ it('governs Issue #88 through inspection, Plan, MR !205, production approval, ex
   for (const value of ['ops/ansible!205', 'merged @ ' + job.commit_sha.slice(0, 8), '### 交付执行记录',
     'env-change', 'SUCCESS', playbook, rows[0].jumpserverJobUrl, approval.id]) expect(notes.at(-1)).toContain(value);
   expect(report).not.toHaveBeenCalled();
-  expect(run).toHaveBeenCalledTimes(5);
+  expect(run).toHaveBeenCalledTimes(4);
   expect(await readdir(config.ephemeralRoot)).toEqual([]);
 }, 15000);
 
@@ -291,7 +288,9 @@ it.each(['success', 'failed'] as const)('delivers a two-owner release with a cro
   run.mockImplementationOnce(async t => { await invoke(t, 'detent_create_release', version); return ''; });
   await vote('Plan');
   run.mockImplementationOnce(async t => {
-    await invoke(t, 'detent_create_release', version);
+    expect(t.prompt).toContain('请勿重复调用');
+    expect(t.prompt).toContain('"commitSha":"' + sha + '"');
+    expect(releaseApi.createTag).toHaveBeenCalledExactlyOnceWith(2, { tag_name: tag, ref: sha });
     expect(await invoke(t, 'detent_await_pipeline', { project: 2, ref_or_pipeline_id: tag })).toMatchObject({ asyncCallback: true, watching: true });
     await expect(invoke(t, 'detent_close_issue', { summary: 'premature' })).rejects.toThrow('等待终态的流水线');
     return 'Waiting for image';
@@ -336,11 +335,11 @@ it.each(['success', 'failed'] as const)('delivers a two-owner release with a cro
       await vote('jms_job', developer, false);
       expect(submit).toHaveBeenCalledTimes(before);
     }
-    run.mockImplementationOnce(async t => {
-      expect(await invoke(t, 'jms_job', job)).toMatchObject({ asyncCallback: true, commitSha: merged });
-      return 'Waiting for execution';
-    });
+    const turns = run.mock.calls.length;
     const approval = await vote('jms_job', actor);
+    expect(run).toHaveBeenCalledTimes(turns);
+    expect(submit).toHaveBeenCalledTimes(before + 1);
+    expect(notes.at(-1)).toContain(rows.at(-1)!.jumpserverJobUrl);
     expect(rows.at(-1)).toMatchObject({ mrId: mr.id, commitSha: merged, targetAssets: [env], approvalId: approval.id, status: 'PENDING' });
     expect(await repo.getSession(session.id)).toMatchObject({ status: 'IDLE', lockedByPod: null });
   }

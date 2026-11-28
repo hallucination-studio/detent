@@ -294,7 +294,7 @@ it.each([
   const options = vi.mocked(query).mock.lastCall![0].options!;
   const command = 'git -C ' + workspaceRoot + '/projects/app status ' + workspaceRoot + ' ' + 'x'.repeat(100);
   expect(await options.canUseTool!('Bash', { command }, { signal: controller.signal })).toMatchObject({ behavior: 'deny' });
-  expect(progress).toHaveBeenCalledWith(expect.objectContaining({ name: 'Bash', input: JSON.stringify({ command }), result: expect.stringMatching(/^⛔ 已拦截：/) }));
+  expect(progress).toHaveBeenCalledWith(expect.objectContaining({ name: 'Bash', input: JSON.stringify({ command: 'git -C projects/app status . ' + 'x'.repeat(100) }), result: expect.stringMatching(/^⛔ 已拦截：/) }));
   expect(options).toMatchObject({
     permissionMode: readonly ? 'default' : 'plan', disallowedTools: expect.arrayContaining(readonly ? ['Edit', 'Write', 'Bash'] : ['Bash']),
   });

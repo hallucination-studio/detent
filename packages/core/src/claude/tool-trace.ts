@@ -1,4 +1,4 @@
-import { scrubJson } from '../gitlab/redact.js';
+import { scrubJson, workspacePathFilter } from '../gitlab/redact.js';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { ToolStep } from '../gitlab/note-streamer.js';
@@ -22,7 +22,12 @@ export class ToolTrace {
   private awaitingHandler = new Map<string, Invocation>();
   private awaitingId = new Map<string, Invocation>();
 
-  constructor(private progress: (step: ToolStep) => void, private redact: (text: string) => string) {}
+  private unfinished = new Map<string, ToolStep>();
+  readonly redact: (text: string) => string;
+  constructor(private progress: (step: ToolStep) => void, redact: (text: string) => string, workspaceRoot?: string) {
+    const relative = workspacePathFilter(workspaceRoot);
+    this.redact = text => relative(redact(text));
+  }
 
   private take(queue: Map<string, Invocation>, name: string, input: unknown) {
     for (const [id, call] of queue) {
@@ -62,12 +67,23 @@ export class ToolTrace {
   }
 
   pending(step: ToolStep) {
+    if (step.result !== pending) return;
+    this.unfinished.set(step.id, step);
     this.progress({ ...step });
   }
 
   update(step: ToolStep, value: unknown, prefix = '') {
     this.awaitingHandler.delete(step.id);
-    this.progress({ ...step, result: prefix + (preview(value, this.redact) || '""') });
+    this.unfinished.delete(step.id);
+    const content = value && typeof value === 'object' && 'content' in value ? value.content : value;
+    if (Array.isArray(content) && content.length && content.every(part => part?.type === 'text' && typeof part.text === 'string'))
+      value = content.map(part => part.text).join('\n');
+    step.result = prefix + (preview(value, this.redact) || '""');
+    this.progress({ ...step });
+  }
+
+  finish(waiting: boolean) {
+    for (const step of this.unfinished.values()) this.update(step, waiting ? '⏸️ 等待审批' : '⚠️ 轮次已中断');
   }
 
   lookup(id: string) {

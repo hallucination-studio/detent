@@ -459,7 +459,17 @@ async function sop3(h: Scenario) {
 
   h.trackNotes(iid);
   await h.gl.mergeMergeRequest(web.id, webMr.iid);
-  const firstMerge = await h.state(iid, 'IDLE', issue.last_message_seq);
+  const firstMerge = await h.until('first MR merged, worktree archived and Hub lease released', async () => {
+    const [row] = await h.rows(`SELECT s.status, s.last_message_seq, s.active_note_id FROM issue_sessions s
+      JOIN session_merge_requests m ON m.session_id=s.id JOIN session_worktrees t ON t.id=m.worktree_id
+      WHERE s.id=? AND m.target_project_id=? AND m.mr_iid=? AND m.mr_state='merged'
+        AND t.status='ARCHIVED' AND s.locked_by_pod IS NULL`, [issue.id, web.id, webMr.iid]);
+    return row;
+  });
+  assert.equal(firstMerge.status, 'IDLE');
+  assert.equal(firstMerge.last_message_seq, issue.last_message_seq, 'First merge started another Claude turn');
+  assert.equal(firstMerge.active_note_id, issue.active_note_id, 'First merge created a Hub working note');
+  console.log('  First MR merged with unchanged Hub transcript cursor and working note');
   const remaining = await h.rows("SELECT target_project_id FROM session_merge_requests WHERE session_id=? AND mr_state='opened'", [issue.id]);
   assert.deepEqual(remaining.map(m => m.target_project_id), [api.id]);
   assert.equal((await h.gl.getIssue(hub, iid)).state, 'opened');

@@ -1,4 +1,4 @@
-import { defineExtensionTool, escapeMarkdownCell, logError, neutralizeQuickActions, redactGitUrl, type AnyDetentExtensionTool, type ExtensionToolContext, type DecisionClient, type DetentCapabilityPack, type WorkflowApproverTier } from '@detent/core';
+import { defineExtensionTool, escapeMarkdownCell, logError, renderApprovalCard, type AnyDetentExtensionTool, type ExtensionToolContext, type DecisionClient, type DetentCapabilityPack, type WorkflowApproverTier } from '@detent/core';
 import { z } from 'zod';
 import { authSecrets, redactSecrets, type DeliveryConfig } from '../config.js';
 import type { JobResultResponse, JumpServerAsset, JumpServerClient } from './client.js';
@@ -141,6 +141,11 @@ export function createJumpServerTools(options: JumpServerOptions): AnyDetentExte
     defineExtensionTool({
       name: 'jms_job', description: '审批后在 JumpServer 异步执行当前会话已合并仓库的作业（Ansible 传 playbook_path，Helm 等仓库命令传 command），终态自动唤醒本会话', policy: 'always_approve',
       schema: jobSchema,
+      directExecuteOnApproval: 'handoff',
+      formatDirectResult(result, input, ctx) {
+        const { jobId, jobUrl } = z.object({ jobId: z.string(), jobUrl: z.string() }).parse(result);
+        return redactSecrets(`✅ @${ctx.approvedBy} 已批准${input.environment ? ' [' + escapeMarkdownCell(input.environment) + ']' : ''} 环境作业。项目 #${input.target_project_id} 的 MR !${input.mr_iid} · \`${input.commit_sha.slice(0, 8)}\`\n\n[查看 JumpServer 任务 ${escapeMarkdownCell(jobId)}](<${jobUrl}>) · 等待异步执行完成后自动核验。`, config);
+      },
       async guard(input, ctx) {
         if (!tracker) return deny('未配置交付执行追踪仓储');
         if (Boolean(input.playbook_path) === Boolean(input.command)) return deny('playbook_path 与 command 必须且只能提供一项');
@@ -181,24 +186,18 @@ export function createJumpServerTools(options: JumpServerOptions): AnyDetentExte
         }
         const ref = cell(mr.targetProjectPath + '!' + mr.mrIid);
         const mergedBy = mr.mergedBy ? '@' + mr.mergedBy.replace(/^@/, '') : '未知';
-        const table = [
-          '| 项目 | 内容 |', '| :--- | :--- |',
-          '| 已合并 MR | [' + ref + '](<' + url.href.replaceAll('|', '%7C') + '>)（由 ' + cell(mergedBy, 'code') + ' 合并） |',
-          '| 提交 SHA | ' + cell(input.commit_sha, 'code') + ' |',
-          '| 目标资产 | ' + targetCell + ' |',
-          '| 目标仓库 | ' + cell(mr.targetProjectPath, 'code') + ' |',
-          input.playbook_path ? '| Playbook | ' + cell(input.playbook_path, 'code') + ' |'
-            : '| 作业命令 | ' + input.command!.split('\n').map(line => cell(line, 'code')).join('<br>') + ' |',
-          input.extra_vars && '| 变更变量 | ' + cell(JSON.stringify(input.extra_vars), 'code') + ' |',
-          '| 变更原因 | ' + cell(input.reason ?? '未提供') + ' |',
-        ].filter(Boolean).join('\n');
+        const rows: [string, string][] = [
+          ['已合并 MR', '[' + ref + '](<' + url.href.replaceAll('|', '%7C') + '>)（由 ' + cell(mergedBy, 'code') + ' 合并）'],
+          ['提交 SHA', cell(input.commit_sha, 'code')], ['目标资产', targetCell], ['目标仓库', cell(mr.targetProjectPath, 'code')],
+          input.playbook_path ? ['Playbook', cell(input.playbook_path, 'code')] : ['作业命令', input.command!.split('\n').map(line => cell(line, 'code')).join('<br>')],
+        ];
+        if (input.extra_vars) rows.push(['变更变量', cell(JSON.stringify(input.extra_vars), 'code')]);
+        rows.push(['变更原因', cell(input.reason ?? '未提供')]);
         const production = ctx.workflow?.approverTier === 'prod' ||
           environmentConfig(config, input.environment)?.approverTier !== 'standard';
         const title = production ? '生产变更执行审批' : '环境变更执行审批';
-        return neutralizeQuickActions(redactSecrets(redactGitUrl([
-          '### 🚀 ' + title + (input.environment ? ' [' + cell(input.environment) + ']' : ''), table,
-          '> 请' + (production ? '运维负责人' : '项目成员') + '点 👍 或回复 `/approve` 放行 · 👎 或 `/reject <原因>` 拒绝 · <sub>审批单 `' + approvalId + '`</sub>',
-        ].join('\n\n')), config));
+        return redactSecrets(renderApprovalCard({ icon: '🚀', title, badge: input.environment, rows, approvalId,
+          approverHint: production ? '生产审批人' : '项目成员' }), config);
       },
       async execute(input, ctx) {
         const { approvalId } = ctx;

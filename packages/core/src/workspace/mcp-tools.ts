@@ -22,6 +22,15 @@ export const schemas = {
   detent_get_pipeline_job_log: { project, job_id: z.number().int().positive() },
 };
 export type ToolName = keyof typeof schemas;
+export const toolDescriptions: Record<ToolName, string> = {
+  detent_list_projects: '按关键词查找 Bot 可访问的 GitLab 项目。',
+  detent_checkout_worktree: '检出仓库并返回 projects/ 下的目录名。方案或只读阶段仅可检出已有远端分支（如 main）阅读代码；方案获批后才可创建新特性分支。',
+  detent_close_worktree: '保存工作区改动并归档指定工作树。',
+  detent_commit_and_push: '在指定工作树提交修改并推送到当前特性分支。',
+  detent_create_mr: '从已推送的源分支向目标分支创建 MR，并关联当前工单。',
+  detent_get_pipeline_status: '查询最新流水线与任务状态。MR 会话中的 ref_or_mr_iid 仅允许传当前 MR 的 IID 或源分支名。',
+  detent_get_pipeline_job_log: '读取指定项目中流水线任务的日志以定位失败原因。',
+};
 export const mrWorkspaceTools = ['detent_commit_and_push', 'detent_get_pipeline_status', 'detent_get_pipeline_job_log'] as const satisfies readonly ToolName[];
 export function isWorkspaceTool(name: string): name is ToolName {
   return Object.hasOwn(schemas, name);

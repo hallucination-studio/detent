@@ -1,4 +1,4 @@
-import { renderNote } from '../gitlab/note-streamer.js';
+import { renderApprovalCard } from '../gitlab/note-streamer.js';
 import { z } from 'zod';
 import { defineExtensionTool, type ExtensionToolContext, type TurnProfile } from '../extensions.js';
 
@@ -19,15 +19,14 @@ export function createCloseIssueTool(profile: TurnProfile, schedule: (request: {
   if (profile.closePolicy !== 'auto' && profile.closePolicy !== 'approve') return;
   return defineExtensionTool({
     name: 'detent_close_issue',
-    description: 'Schedule issue closure after all workflow acceptance criteria are met',
+    description: '全部验收条件满足后登记关单请求，轮末复核通过后关闭工单。',
     schema: { summary: z.string().trim().min(1).max(2000) },
     policy: profile.closePolicy === 'approve' ? 'always_approve' : 'readonly',
     guard: (_input, ctx) => checkIssueClosure(profile, ctx),
     renderApprovalCard(approvalId, { summary }) {
-      return renderNote([
-        '### ✅ 工单闭环关闭审批', summary,
-        '> 👍 或 `/approve` 确认关闭 · 👎 或 `/reject <原因>` 拒绝 · <sub>审批单 `' + approvalId + '`</sub>',
-      ].join('\n\n'));
+      return renderApprovalCard({ icon: '✅', title: '工单闭环关闭审批', approvalId,
+        rows: [['操作', '验收通过后关闭本工单']], body: summary,
+        approverHint: profile.workflow?.approverTier === 'prod' ? '生产审批人' : '项目成员' });
     },
     async execute({ summary }) {
       schedule({ summary });

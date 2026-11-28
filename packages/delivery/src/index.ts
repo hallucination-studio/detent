@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { releaseSettings, resolveJumpServerSettings } from './hub-config.js';
 import {
   createDecisionClient, createDetentApp, createGitLabOnboardingCapability, createGitLabReleaseCapability, GitLabClient, loadConfig, loadHubCapabilities,
@@ -34,7 +35,18 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
   config = { ...config, additionalSecrets: [...(config.additionalSecrets ?? []),
     ...authSecrets(deliveryConfig.jumpserverReadonlyAuth), ...authSecrets(deliveryConfig.jumpserverJobAuth)] };
   const decision = extensions.decisionClient ?? createDecisionClient(config);
-  const client = jumpserverClient ?? (deliveryConfig.jumpserverBaseUrl ? new HttpJumpServerClient(deliveryConfig, config) : undefined);
+  const clients = new Map<string, HttpJumpServerClient>();
+  function httpClient(settings: DeliveryConfig) {
+    const key = createHash('sha256').update(JSON.stringify([settings.jumpserverBaseUrl?.replace(/\/$/, ''), settings.jumpserverOrgId,
+      settings.jumpserverReadonlyAuth, settings.jumpserverJobAuth, settings.jumpserverTimeoutMs])).digest('hex');
+    const cached = clients.get(key);
+    if (cached) return cached;
+    const client = new HttpJumpServerClient(settings, config);
+    if (clients.size >= 16) clients.delete(clients.keys().next().value!);
+    clients.set(key, client);
+    return client;
+  }
+  const client = jumpserverClient ?? (deliveryConfig.jumpserverBaseUrl ? httpClient(deliveryConfig) : undefined);
   const auditRepo = new MySqlDeliveryAuditRepository();
   const tracker = executionTracker ?? auditRepo;
   let poller: DeliveryJobPoller | undefined;
@@ -76,12 +88,12 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
           const resolved = resolveJumpServerSettings(entry, ctx.config.secrets, deliveryConfig);
           dynamic.push('setupHint' in resolved ? { name, enabled: false, tools: [], setupHint: resolved.setupHint }
             : createJumpServerCapability(name, { config: resolved.config, tracker, decision, onTerminalResult, defaultAccount: resolved.defaultAccount,
-              client: new HttpJumpServerClient(resolved.config, ctx.config) }));
+              client: httpClient(resolved.config) }));
         } else if (entry.type === 'gitlab-release') {
           const parsed = releaseSettings.safeParse(entry);
           dynamic.push(entry.enabled === false || !parsed.success
             ? { name, enabled: false, tools: [], setupHint: '请检查 Hub capabilities.json 中的 gitlab-release 配置（approver_tier 支持 standard 或 prod）' }
-            : { ...createGitLabReleaseCapability({ gitlab: api, blockFailedPipeline: parsed.data.block_failed_pipeline ?? deliveryConfig.blockFailedPipeline }),
+            : { ...createGitLabReleaseCapability({ gitlab: api, approverTier: parsed.data.approver_tier, blockFailedPipeline: parsed.data.block_failed_pipeline ?? deliveryConfig.blockFailedPipeline }),
               name, approverTier: parsed.data.approver_tier });
         }
       }
@@ -119,7 +131,7 @@ export function createDeliveryApp(config: AppConfig = loadConfig(), options: Del
                 !row.jumpserverJobUrl.startsWith(entry.base_url.trim().replace(/\/$/, '') + '/')) continue;
             const resolved = resolveJumpServerSettings(entry, config.secrets, deliveryConfig);
             if ('setupHint' in resolved) throw Error(resolved.setupHint);
-            return new HttpJumpServerClient(resolved.config, config);
+            return httpClient(resolved.config);
           }
           if (client && !Object.keys(hub.entries).some(name => name.toLowerCase() === 'jumpserver') &&
               (jumpserverClient || row.jumpserverJobUrl.startsWith(deliveryConfig.jumpserverBaseUrl!.replace(/\/$/, '') + '/'))) return client;

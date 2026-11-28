@@ -145,7 +145,7 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
     hooks(id: number) {
       return api.all<{ url: string; merge_requests_events: boolean; note_events: boolean }>(project(id) + '/hooks');
     },
-    async auditNotes(id: number, check: (body: string, location: string) => void) {
+    async auditNotes(id: number, check: (body: string, location: string, note: Note) => void) {
       let count = 0;
       for (const resource of ['issues', 'merge_requests']) {
         const path = project(id) + '/' + resource;
@@ -155,7 +155,7 @@ export function projectActions(api: ReturnType<typeof gitlabApi>, tokens: Record
           const seen = new Set<number>();
           function inspect(note: Note) {
             if (seen.has(note.id)) return;
-            check(note.body, ref + ' note ' + note.id);
+            check(note.body, ref + ' note ' + note.id, note);
             seen.add(note.id);
             count++;
           }

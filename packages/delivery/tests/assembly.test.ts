@@ -2,7 +2,7 @@ import { expect, it, vi } from 'vitest';
 import { createDetentApp, defineExtensionTool, GitLabClient, loadConfig, SessionOrchestrator, type DetentExtensions } from '@detent/core';
 import { InMemoryDetentRepository } from '../../core/tests/memory-repository.js';
 import { mockMcpServer } from '../../core/tests/mock-mcp-server.js';
-import { createDeliveryApp, loadDeliveryConfig, type JumpServerClient } from '../src/index.js';
+import { createDeliveryApp, HttpJumpServerClient, loadDeliveryConfig, type JumpServerClient } from '../src/index.js';
 
 // Exercise real app composition and HTTP routing with only the external I/O replaced.
 const { pool, createPool } = vi.hoisted(() => {
@@ -306,6 +306,28 @@ it('rebuilds single-key capability packs from successive Hub revisions', async (
     expect((await resolve({ release: { ...release, approver_tier: 'owner' } }))[0]).toMatchObject({ enabled: false, tools: [], setupHint: expect.stringContaining('approver_tier') });
     expect((await resolve({ release: { ...release, enabled: false } }))[0]).toMatchObject({ enabled: false, tools: [] });
   } finally { await app.close(); }
+});
+
+it('reuses the HTTP client until its Hub credentials rotate', async () => {
+  const config = loadConfig({ GITLAB_WEBHOOK_SECRET: 'test', DETENT_SECRET_TOKEN: 'first' });
+  const app = createDeliveryApp(config, { deliveryConfig: loadDeliveryConfig({}) });
+  const assets = vi.spyOn(HttpJumpServerClient.prototype, 'listAssets').mockResolvedValue([]);
+  const repo = new InMemoryDetentRepository();
+  const session = await repo.getOrCreateSession(1, 7, 'lookup');
+  try {
+    const resolver = vi.mocked(createDetentApp).mock.lastCall![1]!.resolveCapabilities!;
+    const ops = { type: 'jumpserver', base_url: 'https://jms.test', auth: { token: '$secret:TOKEN' } };
+    async function currentClient() {
+      const [pack] = await resolver({ config, gitlab: {}, hubProjectId: 1, hubDefaultBranch: 'main',
+        document: { present: true, invalid: false, entries: { ops } } });
+      await pack.tools.find(t => t.name === 'jms_list_assets')!.execute({}, { session, repo, workspaceRoot: '', permissionMode: 'plan' });
+      return assets.mock.contexts.at(-1);
+    }
+    const first = await currentClient();
+    expect(await currentClient()).toBe(first);
+    config.secrets.TOKEN = 'rotated';
+    expect(await currentClient()).not.toBe(first);
+  } finally { assets.mockRestore(); await app.close(); }
 });
 
 it.each(['live Hub', 'static client', 'on-demand status'])('delivers one redacted callback through the %s and drains the poller on close', async mode => {

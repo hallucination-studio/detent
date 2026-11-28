@@ -2,7 +2,7 @@ import { createSseClient } from './mcp-sse.js';
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import { defineExtensionTool, type DetentCapabilityPack, type ToolGovernancePolicy } from '../extensions.js';
-import { escapeTableCell } from '../gitlab/note-streamer.js';
+import { escapeTableCell, renderApprovalCard } from '../gitlab/note-streamer.js';
 import { formatHttpError, logError, redactGitUrl, scrubJson } from '../gitlab/redact.js';
 import { normalizeHubValue } from '../workflows/hub-frontmatter.js';
 import type { WorkflowApproverTier } from '../workflows/hub-agents.js';
@@ -396,17 +396,13 @@ async function connect(cfg: McpCapabilityConfig, options: ConnectOptions): Promi
         name, policy, description: scrub(remote.description?.trim() || `调用 ${cfg.name} 扩展服务`),
         schema: jsonSchemaToZodShape(remote.inputSchema, scrub),
         ...(policy === 'always_approve' && {
-          renderApprovalCard(approvalId, input) {
+          renderApprovalCard(approvalId, input, ctx) {
             const json = JSON.stringify(scrubJson(input, scrub), null, 2);
             const preview = json.length > 4000 ? json.slice(0, 4000) + '\n…' : json;
-            return [
-              '### 🛡️ 外部 MCP 工具执行审批',
-              '**审批单** ' + escapeTableCell(scrub(approvalId), 'code'),
-              '**能力包** ' + escapeTableCell(scrub(cfg.name), 'code'),
-              '**工具** ' + escapeTableCell(scrub(remote.name), 'code'),
-              preview.replace(/^/gm, '    '),
-              '> 👍 或 `/approve` 放行 · 👎 或 `/reject <原因>` 拒绝',
-            ].join('\n\n');
+            return renderApprovalCard({ icon: '🛡️', title: '外部 MCP 工具执行审批', approvalId: scrub(approvalId),
+              approverHint: cfg.approverTier === 'prod' || ctx.workflow?.approverTier === 'prod' ? '生产审批人' : '项目成员',
+              rows: [['能力包', escapeTableCell(scrub(cfg.name), 'code')], ['工具', escapeTableCell(scrub(remote.name), 'code')]],
+              details: { summary: '调用参数', content: preview.replace(/^/gm, '    ') } });
           },
         }),
         async execute(input) {

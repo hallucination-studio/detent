@@ -16,7 +16,7 @@ export {
   parseHubAgentMarkdown, parseHubSkillMarkdown, loadHubAgents, matchHubAgent, resolveHubAgentCapabilities, renderAgentSystemPrompt,
   type HubAgent, type HubSkill,
 } from './workflows/hub-agents.js';
-export { escapeTableCell as escapeMarkdownCell, neutralizeQuickActions } from './gitlab/note-streamer.js';
+export { escapeTableCell as escapeMarkdownCell, neutralizeQuickActions, renderApprovalCard } from './gitlab/note-streamer.js';
 export { createWebhookApp, normalizeGitLabEvent } from './gitlab/webhook.js';
 export { SessionOrchestrator, SessionBusy } from './orchestrator/session-orchestrator.js';
 export type { DetentRepository } from './db/repository.js';

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { defineExtensionTool, type AnyDetentExtensionTool, type DetentCapabilityPack, type ExtensionToolContext } from '../extensions.js';
-import { escapeTableCell, renderNote } from '../gitlab/note-streamer.js';
+import { escapeTableCell, renderApprovalCard } from '../gitlab/note-streamer.js';
 import { isTerminalPipeline, redactGitUrl, type GitLabClient } from '../gitlab/client.js';
 import { logError } from '../gitlab/redact.js';
 
@@ -11,6 +11,7 @@ export type ReleaseGitLab = Pick<GitLabClient,
 interface ReleaseOptions {
   gitlab: ReleaseGitLab;
   blockFailedPipeline?: boolean;
+  approverTier?: DetentCapabilityPack['approverTier'];
 }
 
 const project = z.union([z.number().int().positive(), z.string().trim().min(1).max(255)]);
@@ -29,7 +30,7 @@ const releaseSchema = {
   tag_only: z.boolean().default(false),
 };
 
-export function createGitLabReleaseTools({ gitlab, blockFailedPipeline }: ReleaseOptions): AnyDetentExtensionTool[] {
+export function createGitLabReleaseTools({ gitlab, blockFailedPipeline, approverTier = 'prod' }: ReleaseOptions): AnyDetentExtensionTool[] {
   type Pipeline = Awaited<ReturnType<ReleaseGitLab['getPipeline']>>;
   async function watch(ctx: ExtensionToolContext, projectId: number, ref: string, pipeline: Pipeline | undefined, triggered: boolean) {
     const result = (p?: Pipeline) => ({ pipelineId: p?.id ?? null, status: p?.status ?? null, webUrl: p?.web_url ?? null, ref });
@@ -54,7 +55,7 @@ export function createGitLabReleaseTools({ gitlab, blockFailedPipeline }: Releas
   }
   return [
     defineExtensionTool({
-      name: 'detent_list_tags', description: 'List Git tags and their commit SHAs', policy: 'readonly',
+      name: 'detent_list_tags', description: '列出目标仓库的 Git Tag 和对应的提交 SHA。', policy: 'readonly',
       schema: { project, search: z.string().trim().max(128).optional(), limit: z.number().int().positive().max(100).optional() },
       async execute({ project, search, limit }) {
         const p = await gitlab.getProject(project);
@@ -63,8 +64,8 @@ export function createGitLabReleaseTools({ gitlab, blockFailedPipeline }: Releas
       },
     }),
     defineExtensionTool({
-      name: 'detent_create_release', description: 'Create a Git tag or GitLab release at an approved commit',
-      policy: 'always_approve', schema: releaseSchema,
+      name: 'detent_create_release', description: '申请在完整提交 SHA 上创建 Git Tag 或 GitLab Release。',
+      policy: 'always_approve', directExecuteOnApproval: 'resume', schema: releaseSchema,
       async guard(input) {
         if (!tagName.safeParse(input.tag_name).success) return { ok: false, reason: '无效的 Tag 名称' };
         const sha = commitSha.safeParse(input.commit_sha);
@@ -79,24 +80,20 @@ export function createGitLabReleaseTools({ gitlab, blockFailedPipeline }: Releas
         }
         return { ok: true };
       },
-      async renderApprovalCard(approvalId, input) {
-        const p = await gitlab.getProject(input.project);
+      async renderApprovalCard(approvalId, input, ctx) {
+        const project = await gitlab.getProject(input.project);
         const notes = Array.from(redactGitUrl(input.release_notes ?? '').trim());
         const preview = notes.slice(0, 512).join('') + (notes.length > 512 ? '…' : '');
         const mode = input.tag_only ? '仅创建 Git Tag' : '创建 Git Tag + GitLab Release';
         const name = input.release_name;
-        const table = [
-          '| 项目 | 内容 |', '| :--- | :--- |',
-          '| 目标仓库 | ' + escapeTableCell(p.path_with_namespace, 'code') + ' |',
-          '| Tag / 模式 | ' + escapeTableCell(input.tag_name, 'code') + '（' + mode + '） |',
-          '| 锁定提交 | ' + escapeTableCell(input.commit_sha.toLowerCase(), 'code') + ' |',
-          !input.tag_only && name && name !== input.tag_name && '| Release 名称 | ' + escapeTableCell(name) + ' |',
-        ].filter(Boolean).join('\n');
-        return renderNote([
-          '### 🚀 GitLab 发布审批', table,
-          preview && '<details><summary>Release Notes 预览</summary>\n\n' + preview + '\n\n</details>',
-          '> 👍 或 `/approve` 放行 · 👎 或 `/reject <原因>` 拒绝 · <sub>审批单 `' + approvalId + '`</sub>',
-        ].filter(Boolean).join('\n\n'));
+        const rows: [string, string][] = [
+          ['目标仓库', escapeTableCell(project.path_with_namespace, 'code')], ['Tag / 模式', escapeTableCell(input.tag_name, 'code') + '（' + mode + '）'],
+          ['锁定提交', escapeTableCell(input.commit_sha.toLowerCase(), 'code')],
+        ];
+        if (!input.tag_only && name && name !== input.tag_name) rows.push(['Release 名称', escapeTableCell(name)]);
+        return renderApprovalCard({ icon: '🚀', title: 'GitLab 发布审批', rows, approvalId,
+          approverHint: approverTier === 'prod' || ctx.workflow?.approverTier === 'prod' ? '生产审批人' : '项目成员',
+          details: preview ? { summary: 'Release Notes 预览', content: preview } : undefined });
       },
       async execute(input, ctx) {
         if (!ctx.approvalId) throw Error('发布缺少审批单');
@@ -145,5 +142,5 @@ export function createGitLabReleaseTools({ gitlab, blockFailedPipeline }: Releas
 }
 
 export function createGitLabReleaseCapability(options: ReleaseOptions): DetentCapabilityPack {
-  return { name: 'gitlab-release', enabled: true, tools: createGitLabReleaseTools(options) };
+  return { name: 'gitlab-release', enabled: true, approverTier: options.approverTier ?? 'prod', tools: createGitLabReleaseTools(options) };
 }

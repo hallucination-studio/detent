@@ -4,7 +4,8 @@ import type { AppConfig } from '../config.js';
 import type { DetentRepository } from '../db/repository.js';
 import type { ApprovalRequestRow, IssueSessionRow, ParsedUserIntent, SessionInboxRow } from '../types.js';
 import type { SessionLifecycleHooks } from '../extensions.js';
-import { configuredSecrets, redactGitUrl } from '../gitlab/redact.js';
+import { configuredSecrets, logError, redactGitUrl } from '../gitlab/redact.js';
+import { escapeTableCell, renderNote } from '../gitlab/note-streamer.js';
 import { resolveApproval } from './lifecycle.js';
 
 import type { SessionChannel } from './channel.js';
@@ -83,8 +84,9 @@ export class TurnRuntime {
     await this.repo.updateSessionState(s.id, { recoveryAttempts: s.recoveryAttempts });
     return true;
   }
-  protected async applyApproval(s: IssueSessionRow, pending: ApprovalRequestRow, intent: ParsedUserIntent,
-    run: (session: IssueSessionRow, active: Active, prompt: string, previous?: ApprovalRequestRow) => Promise<void>) {
+  protected async applyApproval(s: IssueSessionRow, pending: ApprovalRequestRow, intent: ParsedUserIntent, channel: SessionChannel,
+    run: (session: IssueSessionRow, active: Active, prompt: string, previous?: ApprovalRequestRow) => Promise<void>,
+    direct?: (session: IssueSessionRow, active: Active, decision: ApprovalRequestRow) => Promise<void>) {
     const status = intent.type === 'APPROVE' ? 'APPROVED' : 'REJECTED';
     const comment = intent.comment && redactGitUrl(intent.comment, this.secrets);
     if (!(await resolveApproval(
@@ -94,6 +96,17 @@ export class TurnRuntime {
     const currentCard = async () => (await this.repo.getLatestApproval(s.id))?.id === pending.id;
     await this.withLease(s, async (session, active) => {
       if (session.status !== expected || !await currentCard()) return;
+      if (pending.approvalType !== 'ASK_USER' && pending.gitlabNoteId && channel.getNote) {
+        try {
+          const note = await channel.getNote(pending.gitlabNoteId);
+          const user = '@' + escapeTableCell(intent.username);
+          const badge = status === 'APPROVED' ? '✅ **已批准** · 由 ' + user + ' 确认' :
+            '❌ **已拒绝** · 由 ' + user + ' 拒绝' + (comment ? '（' + escapeTableCell(comment) + '）' : '');
+          await channel.updateNote(pending.gitlabNoteId, renderNote(note.body + '\n\n> ' + badge, this.secrets));
+        } catch (error) {
+          logError('approval-note', error, this.secrets);
+        }
+      }
       if (pending.approvalType === 'PLAN') {
         const approved = status === 'APPROVED';
         session.permissionMode = approved ? 'default' : 'plan';
@@ -102,6 +115,7 @@ export class TurnRuntime {
         await run(session, active, comment ? instruction + '\n' + feedback + comment : instruction);
       } else {
         const decision = (await this.repo.getApproval(pending.id))!;
+        if (direct && decision.status === 'APPROVED' && decision.approvalType === 'TOOL_USE') return direct(session, active, decision);
         const replay = status === 'APPROVED' && decision.approvalType === 'TOOL_USE'
           ? '\n上次工具调用在执行前暂停。现在按上述原始参数调用该工具一次，依据工具实际返回的结果继续已批准的流程。还有可执行步骤时在本轮继续，遇到人工审批、评审或已登记的异步回调时再交接。' : '';
         const prompt = `GitLab 审批结果 ${status}，工具 ${decision.toolName}，参数 ${JSON.stringify(decision.toolInput)}。审批说明：${comment ?? ''}${replay}`;

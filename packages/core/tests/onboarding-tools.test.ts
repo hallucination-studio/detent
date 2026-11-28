@@ -149,7 +149,7 @@ it('creates an approved private main repository and retries webhook installation
     tools: expect.arrayContaining([expect.objectContaining({ name: 'detent_create_project', policy: 'always_approve' })]) });
   expect(await create.guard!(target, ctx)).toEqual({ ok: true });
   const card = await create.renderApprovalCard!(ctx.approvalId, target, ctx);
-  for (const field of ['### GitLab 新建仓库审批', '目标群组：`apps`', 'apps/new.repo-1', 'main', '私有', 'README.md', url,
+  for (const field of ['### 📁 GitLab 新建仓库审批', '| 目标群组 | `apps` |', '请生产审批人（Maintainer 或指定负责人）', 'apps/new.repo-1', 'main', '私有', 'README.md', url,
     'note_events', 'emoji_events', 'merge_requests_events', 'pipeline_events', 'deployment_events', '/approve', '/reject', ctx.approvalId])
     expect(card).toContain(field);
   await expect(create.execute(target, { ...ctx, approvalId: undefined })).rejects.toThrow('新建仓库缺少审批单。');

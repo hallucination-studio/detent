@@ -186,12 +186,13 @@ export class EphemeralSandbox {
     try {
       await fs.mkdir(s.claudeHome);
       await fs.mkdir(path.join(s.workspaceRoot, 'projects'), { recursive: true });
-      if (session.sessionKind === 'issue') await this.copyHub(s, session.hubProjectId, scope);
-      if (session.sessionKind === 'mr' && this.config.gitlabHubProjectId > 0)
-        await this.copyHub(s, this.config.gitlabHubProjectId, { mrSharedOnly: true });
-      for (const t of await this.repo.listActiveWorktrees(session.id)) {
-        await this.restoreTree(s, t);
-      }
+      const trees = await this.repo.listActiveWorktrees(session.id);
+      const hydration = trees.map(tree => this.restoreTree(s, tree));
+      if (session.sessionKind === 'issue') hydration.push(this.copyHub(s, session.hubProjectId, scope));
+      else if (this.config.gitlabHubProjectId > 0) hydration.push(this.copyHub(s, this.config.gitlabHubProjectId, { mrSharedOnly: true }));
+      // Join every clone before cleanup, including when a sibling clone has failed.
+      const results = await Promise.allSettled(hydration);
+      for (const result of results) if (result.status === 'rejected') throw result.reason;
       return s;
     } catch (error) {
       await this.destroy(s);

@@ -1,3 +1,5 @@
+import { existsSync, realpathSync } from 'node:fs';
+import path from 'node:path';
 import { inspect } from 'node:util';
 import type { AppConfig } from '../config.js';
 
@@ -5,6 +7,20 @@ export function redactGitUrl(text: string, secret?: string | readonly string[]) 
   for (const value of typeof secret === 'string' ? [secret] : secret ?? [])
     if (value) text = text.replaceAll(value, '***');
   return text.replace(/(https?:\/\/oauth2:)[^\s/@]+@/gi, '$1***@');
+}
+
+// Resumed transcripts may mention an earlier turn on the same host.
+export function workspacePathFilter(workspaceRoot?: string): (text: string) => string {
+  if (!workspaceRoot) return text => text;
+  const roots = new Set([path.resolve(workspaceRoot)]);
+  if (existsSync(workspaceRoot)) roots.add(realpathSync(workspaceRoot));
+  if (process.platform === 'darwin') {
+    for (const root of [...roots]) roots.add(root.replace(/^\/private(?=\/var\/|\/tmp\/)/, ''));
+  }
+  const patterns = [...roots].sort((a, b) => b.length - a.length).map(root =>
+    root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\/turn-[0-9a-f-]{36}\/workspace$/, '/turn-[0-9a-f-]{36}/workspace'));
+  const prefix = new RegExp('(?:' + patterns.join('|') + ')(/|(?![\\w-]))', 'g');
+  return text => text.replace(prefix, (_match, slash: string) => slash ? '' : '.');
 }
 
 type Secrets = string | readonly string[];

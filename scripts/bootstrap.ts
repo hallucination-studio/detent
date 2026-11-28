@@ -165,9 +165,12 @@ async function main() {
     await json(file, exists ? 'PUT' : 'POST', { branch: hub.default_branch, content, encoding: 'base64', commit_message: 'Seed ' + path }, token);
   }
   const labels = await all<{ name: string }>(root + '/labels', token);
-  for (const name of ['claude::planning', 'claude::waiting-approval', 'claude::coding', 'claude::idle',
-    'claude::failed', 'claude::done', 'delivery::audit', 'delivery::env-change', 'delivery::code', 'delivery::release', 'agent::image-sync', 'agent::onboarding']) {
-    if (!labels.some(l => l.name === name)) await json(root + '/labels', 'POST', { name, color: '#356288' }, token);
+  const palette: Record<string, string> = {
+    'claude::planning': '#428BCA', 'claude::waiting-approval': '#E67E22', 'claude::coding': '#1F75CB',
+    'claude::idle': '#7F8C8D', 'claude::failed': '#D9534F', 'claude::done': '#1AAA55',
+  };
+  for (const name of [...Object.keys(palette), 'delivery::audit', 'delivery::env-change', 'delivery::code', 'delivery::release', 'agent::image-sync', 'agent::onboarding']) {
+    if (!labels.some(l => l.name === name)) await json(root + '/labels', 'POST', { name, color: palette[name] ?? '#6B4FBB' }, token);
   }
   for (const entry of list(env.DETENT_HUB_MEMBERS)) {
     const match = /^([^:]+):(10|15|20|30|40|50)$/.exec(entry);
@@ -238,6 +241,12 @@ async function main() {
       const names = [...projects.values()].filter(p => targets.has(p.id)).map(p => '- `' + p.path_with_namespace + '`');
       const description = [
         '你好，我是 @' + bot.username + '！在 [Hub 工单入口](' + hub.web_url + '/-/issues/new) 新建 Issue，选择模板，写下目标仓库和任务。',
+        ['| 场景 | 模板或标签 | 适用说明 |', '| --- | --- | --- |',
+          '| 巡检 | `audit` | 排查主机、进程或端口，获取诊断证据 |',
+          '| 代码交付 | `code-delivery` | 修改一个或多个仓库，提交 MR 评审 |',
+          '| 环境变更 | `env-change` | 调参、部署或回退指定环境 |',
+          '| 发布 | `release` | 锁定提交打 Tag，按需逐环境发布 |',
+          '| 仓库接入 | `onboarding` | 检查权限，接入已有项目或新建仓库 |'].join('\n'),
         '在任务工单中发送 `/help` 请求帮助，使用 `/status` 查看进度。在审批卡上点 👍 同意或 👎 拒绝。',
         '需要评审代码时，把目标项目的 MR 分配给 @' + bot.username + '。',
         '**已接入的目标项目**\n' + (names.join('\n') || '尚未配置目标项目。'),

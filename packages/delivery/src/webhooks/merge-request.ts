@@ -1,4 +1,4 @@
-import type { WebhookExtension } from '@detent/core';
+import { redactGitUrl, type WebhookExtension } from '@detent/core';
 import { z } from 'zod';
 
 const id = z.number().int().positive();
@@ -37,16 +37,21 @@ export const matchMergeRequestWebhook: WebhookExtension = (event) => {
         await orchestrator.resumeSession(mr.sessionId, prompt, {
           permissionMode: 'default',
           async beforeRun(session) {
-            if (!(await repo.markMergeRequestMerged(mr.id, sha, user.username))) return false;
-            if (session.status === 'DONE') return false;
+            const opened = (await repo.listSessionMergeRequests(session.id)).filter(other => other.id !== mr.id && other.mrState === 'opened');
             const waiting = session.status === 'WAITING_PLAN' || session.status === 'WAITING_TOOL';
-            const status = waiting ? '会话正在等待审批，审批后将继续。' : '正在自动恢复变更会话…';
+            const defer = session.status !== 'DONE' && !waiting && opened.length > 0 &&
+              !await orchestrator.isExtensionToolEnabled(session, 'jms_job');
+            if (!(await repo.markMergeRequestMerged(mr.id, sha, user.username))) return false;
+            if (mr.worktreeId && !opened.some(other => other.worktreeId === mr.worktreeId)) await repo.archiveWorktree(mr.worktreeId);
+            if (session.status === 'DONE') return false;
+            const status = waiting ? '会话正在等待审批，审批后将继续。' : defer ?
+              `当前还有 ${opened.length} 个关联 MR 待合并，全部合并后将自动核验收尾。` : '正在自动恢复变更会话…';
             const commit = sha ? ` (commit ${sha.slice(0, 8)})` : '';
             await gitlab.createIssueNote(
               session.hubProjectId, session.hubIssueIid,
-              `✅ 关联 MR [${ref}](<${url}>) 已由 @${user.username} 合并${commit}，${status}`,
+              redactGitUrl(`✅ 关联 MR [${ref}](<${url}>) 已由 @${user.username} 合并${commit}。${status}`),
             );
-            return !waiting;
+            return !waiting && !defer;
           },
         });
       }

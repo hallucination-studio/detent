@@ -10,7 +10,7 @@ export function createMrTools(gitlab: Pick<GitLabClient, 'listMergeRequestDiffs'
   const redact = (text: string) => redactGitUrl(text, configuredSecrets(host.config));
   return [
     defineExtensionTool({
-      name: 'detent_get_mr_diff', description: 'Read the current merge request diff', policy: 'readonly', schema: {},
+      name: 'detent_get_mr_diff', description: '读取当前 MR 的文件差异。', policy: 'readonly', schema: {},
       async execute() {
         const diffs = await gitlab.listMergeRequestDiffs(project, mr.iid);
         const chunks: string[] = [];
@@ -28,7 +28,7 @@ export function createMrTools(gitlab: Pick<GitLabClient, 'listMergeRequestDiffs'
       },
     }),
     defineExtensionTool({
-      name: 'detent_list_mr_discussions', description: 'Read review threads and inline positions', policy: 'readonly', schema: {},
+      name: 'detent_list_mr_discussions', description: '读取当前 MR 的评审讨论和行内位置。', policy: 'readonly', schema: {},
       async execute() {
         const threads = await gitlab.listMergeRequestDiscussions(project, mr.iid);
         return threads.map(({ id, notes }) => ({ id, notes: notes.map(note => ({
@@ -40,7 +40,7 @@ export function createMrTools(gitlab: Pick<GitLabClient, 'listMergeRequestDiffs'
       },
     }),
     defineExtensionTool({
-      name: 'detent_sync_target_branch', description: 'Merge the current target branch into the local MR source branch',
+      name: 'detent_sync_target_branch', description: '将目标分支合入当前 MR 的本地源分支并报告冲突。',
       policy: 'coding_auto', schema: {},
       execute: () => host.serialize(async () => {
         const dir = await host.projectDir(sandbox, tree.directoryName);

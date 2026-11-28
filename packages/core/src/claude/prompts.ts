@@ -1,6 +1,5 @@
 import type { LiveMr, MergeRequestDiscussion, MergeRequestNote } from '../gitlab/client.js';
 import type { IssueSessionRow, SessionWorktreeRow, SessionMergeRequestRow } from '../types.js';
-import { schemas } from '../workspace/mcp-tools.js';
 import { renderSummary } from '../gitlab/note-streamer.js';
 
 function permissionPrompt(readonly: boolean, mode: IssueSessionRow['permissionMode']) {
@@ -25,8 +24,7 @@ export function buildSystemPrompt(
     '每个 Issue 对应一个会话，可关联多个项目和 MR。',
     permissionPrompt(readonly, session.permissionMode),
     '输出要求：面向研发/运维工程师，结论先行、精炼干练（方案 15–25 行内，汇报 10–20 行内，善用短列表或短表格）。不要向用户提及内部工具名、“已排期关闭”、“自动关单关键词”或沙箱路径等系统细节。',
-    ...Object.entries(schemas).map(([name, shape]) => name + ' (' + Object.keys(shape).join(', ') + ')'),
-    renderSummary(trees, mrs),
+    renderSummary(trees, mrs, { includeWorktrees: true }),
   ].filter(Boolean).join('\n');
 }
 
@@ -35,18 +33,16 @@ export function buildMrSystemPrompt(mr: LiveMr, tree: SessionWorktreeRow, readon
   targetProjectPath = tree.targetProjectPath) {
   return [
     `GitLab MR ${targetProjectPath} (#${mr.target_project_id})!${mr.iid} · ${mr.title}`, mr.description,
-    `${mr.source_branch} -> ${mr.target_branch} · draft=${!!mr.draft} · has_conflicts=${mr.has_conflicts ?? 'unknown'} · ${mr.detailed_merge_status ?? ''}`,
-    `When calling GitLab tools that take a project argument, pass project: ${mr.target_project_id}.`,
-    `Prefer Read/Glob/Grep inside projects/${tree.directoryName} over shell cat/ls.`,
-    'If CLAUDE.md or skills/ exist in the workspace root, read relevant conventions before reviewing or modifying code.',
-    pipeline ? `Pipeline #${pipeline.id} ${pipeline.status}. Failed jobs: ${failedJobs.join(', ') || 'none'}` : 'No pipeline.',
+    `${mr.source_branch} → ${mr.target_branch} · 草稿：${mr.draft ? '是' : '否'} · 合并冲突：${mr.has_conflicts == null ? '未知' : mr.has_conflicts ? '是' : '否'} · ${mr.detailed_merge_status ?? ''}`,
+    `GitLab 工具的目标项目参数为 project: ${mr.target_project_id}。优先用 Read、Glob、Grep 查看 projects/${tree.directoryName}。`,
+    '评审或修改前读取工作区 CLAUDE.md 和相关 Skill。',
+    pipeline ? `流水线 #${pipeline.id} ${pipeline.status}，失败任务：${failedJobs.join('、') || '无'}` : '当前没有流水线。',
     ...discussions.flatMap(thread => thread.notes.filter(n => n.resolvable && !n.resolved && !n.system)
-      .map(n => `Unresolved review: ${inlinePosition(n)}${n.body}`)),
-    readonly && 'Read-only fork. Post suggested fixes in the MR comments. You have no push permission.',
+      .map(n => `待处理评审：${inlinePosition(n)}${n.body}`)),
+    readonly && '此 Fork 只读，请在 MR 讨论串给出修改建议。',
     plan && '当前为方案阶段（只读）。输出精炼方案供 GitLab 用户审批。',
-    'Diagnose the root cause of failed CI, review requests or merge conflicts. On assignment investigate even without a specific request.',
-    'For casual teammate discussion acknowledge briefly or explain without making changes. Test requested fixes and push only to the MR source branch.',
-    'Keep replies concise and actionable. Never disclose internal tool names or credentials.',
+    '接单后主动检查 CI、评审意见与冲突。有人请求修改时，定位原因、修复并测试，只向 MR 源分支推送。',
+    '普通讨论简要回答。回复说明结论、依据和待办，隐去内部工具名、沙箱路径与凭证。',
   ].filter(Boolean).join('\n');
 }
 

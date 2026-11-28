@@ -1,11 +1,15 @@
+import { mkdtemp, mkdir, realpath, rm, symlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { it, expect, onTestFinished, vi } from 'vitest';
 import { ToolTrace } from '../src/claude/tool-trace.js';
 import { configuredSecrets, redactGitUrl } from '../src/gitlab/redact.js';
-import { it, expect, vi } from 'vitest';
 import { createMrChannel } from '../src/orchestrator/channel.js';
 import { stripBotMention, hasBotMention, parseNoteIntent, parseEmojiIntent } from '../src/gitlab/command-parser.js';
 import { GitLabClient } from '../src/gitlab/client.js';
 import {
   escapeTableCell,
+  formatUserError,
   NoteStreamer,
   renderSummary,
   renderPlanApprovalCard,
@@ -153,7 +157,7 @@ it('coalesces 20 events, serializes final flush and redacts approval cards and t
       expect(body).toContain(fragment);
     expect(body).not.toMatch(/secret|活跃 Worktrees|Merge Requests/);
     expect(renderSummary([], [])).toBe('');
-    expect(renderPlanApprovalCard(url)).not.toContain('secret');
+    expect(renderPlanApprovalCard(url, 'plan-id')).not.toContain('secret');
     expect(
       renderToolApprovalCard({
         id: 'a',
@@ -167,29 +171,46 @@ it('coalesces 20 events, serializes final flush and redacts approval cards and t
   }
 });
 
-it('renders every invocation separately with its raw paths and redacted arguments and results', async () => {
+it('renders separate invocations with relative sandbox paths, redacted MCP text and final statuses', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'detent-trace-'));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const workspace = path.join(root, 'turn-11111111-2222-3333-4444-555555555555', 'workspace');
+  const alias = path.join(root, 'alias');
+  await mkdir(workspace, { recursive: true });
+  await symlink(workspace, alias);
   const credentials = { GITLAB_TOKEN: 'git-secret', ANTHROPIC_API_KEY: 'model-secret', JEV_API_KEY: 'jev-secret',
     GITLAB_WEBHOOK_SECRET: 'hook-secret', MYSQL_PASSWORD: 'sql-secret' };
   const config = { ...loadConfig(credentials), additionalSecrets: ['extra-"secret'] };
   const secrets = configuredSecrets(config);
   const sensitive = [...Object.values(credentials), ...config.additionalSecrets].join(' ');
   const stream = new NoteStreamer(200, vi.fn(), async () => sensitive, secrets);
-  const trace = new ToolTrace(step => stream.push(step), text => redactGitUrl(text, secrets));
-  const path = '/turn/./Hub  Workspace/CLAUDE.md';
-  const names = ['Glob', 'Grep', 'Read', 'Read', 'Edit', 'Write', 'Bash', 'mcp__detent__detent_list_projects', 'mcp__remote__scan'];
+  stream.scopeWorkspace(alias);
+  const previous = path.join(await realpath(root), 'turn-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', 'workspace');
+  stream.appendText('正在检查 ' + previous + '/projects/app');
+  const trace = new ToolTrace(step => stream.push(step), text => redactGitUrl(text, secrets), alias);
+  const file = 'Hub  Workspace/CLAUDE.md';
+  const result = { content: [{ type: 'text', text: (await realpath(workspace)) + '/report ' + sensitive }] };
+  const names = ['Read', 'Read', 'mcp__detent__detent_list_projects', 'mcp__remote__scan'];
   for (const [index, name] of names.entries()) {
-    const step = trace.sdkCall(String(index), name, { path, value: sensitive });
+    const step = trace.sdkCall(String(index), name, { path: alias + '/' + file, value: sensitive });
     trace.pending(step);
-    trace.update(step, { output: [sensitive] });
+    trace.update(step, result);
   }
-  const body = await stream.flush('finished');
+  trace.pending(trace.handler('Write', {}));
+  trace.finish(true);
+  trace.pending(trace.handler('Glob', {}));
+  trace.finish(false);
+
+  const body = await stream.flush();
   const masked = '*** *** *** *** *** ***';
-  expect(body).toContain('🔍 工具调用轨迹（9 步）');
-  for (const [index, name] of names.entries()) {
-    expect(body).toContain(`${index + 1}. **\`${name.replace(/^mcp__detent__/, '')}\`** \`${JSON.stringify({ path, value: masked })}\`  \n   ↳ \`${JSON.stringify({ output: [masked] })}\``);
-  }
-  expect(body).not.toContain('secret');
-  expect(body).not.toContain('执行中');
+  for (const [index, name] of names.entries())
+    expect(body).toContain((index + 1) + '. **`' + name.replace(/^mcp__detent__/, '') + '`**');
+  expect(body).toContain('正在检查 projects/app');
+  expect(body).toContain(JSON.stringify({ path: file, value: masked }));
+  expect(body).toContain('↳ `report ' + masked + '`');
+  expect(body).toContain('⏸️ 等待审批');
+  expect(body).toContain('⚠️ 轮次已中断');
+  expect(body).not.toMatch(/detent-trace-|secret|⏳ 执行中/);
 });
 
 it('limits long previews before fencing and keeps the first and last 30 numbered invocations', async () => {
@@ -213,7 +234,7 @@ it('publishes a text-only result without empty sections or executable quick acti
   const stream = new NoteStreamer(200, update, async () => '');
   await stream.flush('结果\r\n /close\r/label ~done\n\t/approve\n// keep comment\n/* keep block */');
   expect(update).toHaveBeenCalledExactlyOnceWith('结果\n \\/close\n\\/label ~done\n\t\\/approve\n// keep comment\n/* keep block */');
-  expect(renderPlanApprovalCard('/close')).toContain('### 📋 实施方案审批\n\n\\/close\n\n---');
+  expect(renderPlanApprovalCard('/close', 'plan-id')).toContain('\\/close');
 });
 
 it('renders numbered questions and escaped fallback tool inputs', () => {
@@ -334,4 +355,12 @@ it('normalizes public callback bases and rejects credential-bearing or ambiguous
     expect(loadConfig({ DETENT_PUBLIC_URL: ' https://example.com/detent' + suffix + ' ' }).detentPublicUrl).toBe('https://example.com/detent');
   for (const url of ['file:///tmp', 'https://user:key@example.com', 'https://host/?', 'https://host/#', 'bad'])
     expect(() => loadConfig({ DETENT_PUBLIC_URL: url })).toThrow();
+});
+
+it('explains the turn limit and missing result, and redacts technical error details', () => {
+  expect(formatUserError(Error('Claude run failed: error_max_turns'))).toContain('单轮步数上限');
+  expect(formatUserError(Error('Claude ended without a result'))).toContain('回复“继续”重试');
+  const formatted = formatUserError(Error('private-value\n    at task(a:2)'), ['private-value']);
+  expect(formatted).toMatch(/<details>[\s\S]*\*\*\*/);
+  expect(formatted).not.toContain('private-value');
 });
